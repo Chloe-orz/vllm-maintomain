@@ -15,7 +15,7 @@ from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.engine import EngineCoreRequestType, FinishReason
-from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc
 from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
     LwdControlPublisher,
 )
@@ -62,8 +62,10 @@ LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
 _LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
 
 
-class LwdCloudEngineCore(EngineCoreProc):
-    """云 PO 引擎:覆写 socket IO 线程入口,其余全走原生。"""
+class LwdCloudEngineCoreMixin:
+    """云 PO 引擎的 LWD 接缝集合(调度器注入/PRE_OUT 接收/c2e 通告),
+    不含基座;具体类按部署形态选基座:dp=1 用 EngineCoreProc,
+    MoE DP>1 用 DPEngineCoreProc(wave/dummy-run/stats 上报语义必须保留)。"""
 
     def __init__(self, *args, **kwargs) -> None:
         # 调度器自注入须赶在 super() 之前(与边侧 LwdEdgeEngineCore 同款):
@@ -98,8 +100,12 @@ class LwdCloudEngineCore(EngineCoreProc):
         """介入 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载首拍
         HELLO 通告与步内元数据。建站失败走 EXECUTOR_FAILED 升级。"""
         config = LwdConfig.from_env_and_config(self.vllm_config)
+        # 多 DP:每 engine 的 PRE_OUT 端口按 dp_rank 派生,避免同机 bind
+        # 冲突;HELLO 通告派生后的真值,边侧据此建 per-engine 端点表。
+        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+        pre_out_port = config.pre_out_port + dp_rank
         self._lwd_subscriber = LwdControlSubscriber(
-            config.lwd_pre_out_endpoint(), bind=True
+            f"tcp://{config.pre_out_host}:{pre_out_port}", bind=True
         )
         master_addr = self.vllm_config.parallel_config.master_addr
         self._lwd_post_out = LwdControlPublisher(
@@ -111,7 +117,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         spec_config = getattr(self.vllm_config, "speculative_config", None)
         self._lwd_hello = LwdHelloNotify(
             pre_out_host=config.pre_out_host,
-            pre_out_port=config.pre_out_port,
+            pre_out_port=pre_out_port,
             # 调度三元组供边侧互校(cap/preflight 公式的同源输入)
             max_num_batched_tokens=sched_config.max_num_batched_tokens,
             max_num_seqs=sched_config.max_num_seqs,
@@ -159,9 +165,9 @@ class LwdCloudEngineCore(EngineCoreProc):
         logger.info(
             "[Lwd] cloud engine assembled: PRE_OUT bind %s, POST_OUT announce -> "
             "%s:%s via master %s",
-            config.lwd_pre_out_endpoint(),
+            f"tcp://{config.pre_out_host}:{pre_out_port}",
             config.pre_out_host,
-            config.pre_out_port,
+            pre_out_port,
             master_addr,
         )
 
@@ -612,3 +618,17 @@ class LwdCloudEngineCore(EngineCoreProc):
                 )
                 return
             time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)
+
+
+class LwdCloudEngineCore(LwdCloudEngineCoreMixin, EngineCoreProc):
+    """云 PO 引擎(dp=1):EngineCoreProc 基座,行为与 mixin 拆分前一致。"""
+
+
+class LwdCloudDPEngineCore(LwdCloudEngineCoreMixin, DPEngineCoreProc):
+    """云 PO 引擎(MoE DP>1):DPEngineCoreProc 基座。
+
+    MRO 上 mixin 在前:LWD 接缝(调度器注入/PRE_OUT 线程/c2e 通告)覆写
+    原生同名方法;wave 状态机、dummy batch、`_maybe_publish_request_counts`、
+    START_DP_WAVE 处理等 DP 语义不经 mixin,原样取自 DPEngineCoreProc。
+    由 `lwd_resolve_engine_cls` 在 cloud 角色且 data_parallel_size>1 时
+    选中(core.py 的 MoE DP 分支)。"""

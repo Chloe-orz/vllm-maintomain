@@ -487,6 +487,7 @@ class EngineArgs:
     enable_elastic_ep: bool = ParallelConfig.enable_elastic_ep
     edge_npu_count: int = 0
     cloud_npu_count: int = 0
+    cloud_dp_size: int = 1
     enable_dbo: bool = ParallelConfig.enable_dbo
     ubatch_size: int = ParallelConfig.ubatch_size
     dbo_decode_token_threshold: int = ParallelConfig.dbo_decode_token_threshold
@@ -1083,11 +1084,18 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--edge-npu-count", type=int, default=0,
-            help="Total number of edge NPUs across all DP instances (LWD mode).",
+            help="Number of edge NPUs (LWD mode). The edge is a single "
+            "shared instance across all cloud DP engines.",
         )
         parallel_group.add_argument(
             "--cloud-npu-count", type=int, default=0,
-            help="Total number of cloud NPUs across all DP instances (LWD mode).",
+            help="Per-engine cloud NPU count, i.e. the TP size of each "
+            "cloud engine (LWD mode).",
+        )
+        parallel_group.add_argument(
+            "--cloud-dp-size", type=int, default=1,
+            help="Number of cloud data-parallel engines (LWD mode). Must "
+            "match --data-parallel-size on the cloud side.",
         )
         parallel_group.add_argument(
             "--dbo-decode-token-threshold",
@@ -2001,7 +2009,7 @@ class EngineArgs:
             enable_ep_weight_filter=self.enable_ep_weight_filter,
             all2all_backend=self.all2all_backend,
             enable_elastic_ep=self.enable_elastic_ep,
-            lwd_config=LwdParallelConfig(edge_npu_count=self.edge_npu_count, cloud_npu_count=self.cloud_npu_count),
+            lwd_config=LwdParallelConfig(edge_npu_count=self.edge_npu_count, cloud_npu_count=self.cloud_npu_count, cloud_dp_size=self.cloud_dp_size),
             enable_dbo=self.enable_dbo,
             ubatch_size=self.ubatch_size,
             dbo_decode_token_threshold=self.dbo_decode_token_threshold,

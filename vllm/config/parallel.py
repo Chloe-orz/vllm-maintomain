@@ -123,22 +123,44 @@ class LwdParallelConfig:
     """Whether this process is the edge side of the LWD deployment
     (mirror of ``LwdConfig.role == "edge"``)."""
     edge_npu_count: int = Field(default=0, ge=0)
-    """Total number of edge NPUs across all DP instances (LWD mode)."""
+    """Number of edge NPUs (LWD mode). The edge is a single shared
+    instance across all cloud DP engines, so this is also the total."""
     cloud_npu_count: int = Field(default=0, ge=0)
-    """Total number of cloud NPUs across all DP instances (LWD mode)."""
+    """Per-engine cloud NPU count (LWD mode), i.e. the TP size of each
+    cloud engine. The cloud runs ``cloud_dp_size`` such engines."""
+    cloud_dp_size: int = Field(default=1, ge=1)
+    """Number of cloud data-parallel engines (LWD mode). Must equal
+    ``data_parallel_size`` on the cloud side; on the edge it is the only
+    source of the cloud topology and must match the cloud's
+    ``--data-parallel-size``."""
+
+    def cloud_engine_rank_base(self, dp_rank: int) -> int:
+        """Global (LWD world) rank of cloud engine ``dp_rank``'s first
+        worker. Layout: edge [0, E), engine i [E + i*C, E + (i+1)*C)."""
+        return self.edge_npu_count + dp_rank * self.cloud_npu_count
+
+    @property
+    def lwd_world_size(self) -> int:
+        """Shared torch world size: edge + all cloud engines."""
+        return self.edge_npu_count + self.cloud_npu_count * self.cloud_dp_size
 
     def edge_npu_count_per_dp(self, data_parallel_size: int) -> int:
-        """Per-DP-instance edge NPU count."""
-        return self.edge_npu_count // data_parallel_size
+        """Edge NPUs attributed to each cloud DP engine. The edge is a
+        single shared instance, so this stays ``edge_npu_count``
+        regardless of ``data_parallel_size`` (kept for callers that
+        iterate per-DP)."""
+        return self.edge_npu_count
 
     def cloud_npu_count_per_dp(self, data_parallel_size: int) -> int:
-        """Per-DP-instance cloud NPU count."""
-        return self.cloud_npu_count // data_parallel_size
+        """Per-DP-instance (per-engine) cloud NPU count — the field is
+        already per-engine, so no division applies."""
+        return self.cloud_npu_count
 
     def is_shared_model_edge(self, data_parallel_size: int) -> bool:
         """True when the LWD edge is a single shared rank across all DP
         instances (one NPU shared by the virtual DP workers)."""
-        return (self.enable_lwd and self.edge_npu_count_per_dp(data_parallel_size) == 1 and data_parallel_size > 1)
+        return (self.enable_lwd and self.edge_npu_count == 1
+                and self.cloud_dp_size > 1)
 
 
 @config
@@ -830,8 +852,8 @@ class ParallelConfig:
             * self.prefill_context_parallel_size
         )
 
-        # LWD edge-cloud mode: ``world_size`` spans both sides of the
-        # deployment (per DP instance) so that per-rank bookkeeping (e.g.
+        # LWD edge-cloud mode: ``world_size`` spans the shared edge plus all
+        # cloud DP engines so that per-rank bookkeeping (e.g.
         # ``WorkerProc.all_kwargs``) has a slot for every edge/cloud rank.
         # NOTE: ``lwd_config.enable_lwd`` is only back-filled later in
         # ``VllmConfig.__post_init__``, so gate on the CLI-provided NPU
@@ -840,9 +862,7 @@ class ParallelConfig:
             self.lwd_config.edge_npu_count > 0
             and self.lwd_config.cloud_npu_count > 0
         ):
-            self.world_size = (
-                self.lwd_config.edge_npu_count + self.lwd_config.cloud_npu_count
-            )
+            self.world_size = self.lwd_config.lwd_world_size
 
         if self.distributed_executor_backend == "external_launcher":
             logger.info("Using external launcher for distributed inference.")
