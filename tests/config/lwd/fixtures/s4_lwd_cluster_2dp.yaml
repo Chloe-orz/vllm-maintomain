@@ -1,0 +1,56 @@
+deployment:
+  mode: 0
+  scene: lwd_cluster
+  hccl_world_size: 18
+  edges_num: 2
+  clouds_num: 2
+
+feature_ctrl:
+  enable_early_recv: false
+  enable_scramble: false
+
+edges:
+  - id: 0
+    dp:
+      - dp_idx: 0
+        addr: 10.0.0.1
+        ranks: [0]
+      - dp_idx: 1
+        addr: 10.0.0.1
+        ranks: [0]
+  - id: 1
+    dp:
+      - dp_idx: 0
+        addr: 10.0.0.2
+        ranks: [1]
+      - dp_idx: 1
+        addr: 10.0.0.2
+        ranks: [1]
+
+clouds:
+  - id: 0
+    dp:
+      - dp_idx: 0
+        addr: 10.1.0.1
+        ranks: [2, 3, 4, 5]
+        ctrl_port: 5550
+      - dp_idx: 1
+        addr: 10.1.0.1
+        ranks: [6, 7, 8, 9]
+        ctrl_port: 5551
+  - id: 1
+    dp:
+      - dp_idx: 0
+        addr: 10.1.0.2
+        ranks: [10, 11, 12, 13]
+        ctrl_port: 5550
+      - dp_idx: 1
+        addr: 10.1.0.2
+        ranks: [14, 15, 16, 17]
+        ctrl_port: 5551
+
+instance_links:
+  - {edge: 0, cloud: 0}
+  - {edge: 0, cloud: 1}
+  - {edge: 1, cloud: 0}
+  - {edge: 1, cloud: 1}
