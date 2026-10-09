@@ -87,12 +87,14 @@ Reserved fields with no launch-example use are not added.
 
 ## Verification
 
+For deployment, generate the YAML and start vLLM with its path in
+`--additional-config`. Startup validates the configuration and reports the
+selected role, instance, DP ranks and topology digest in `[LWD][config]` logs.
+
 Run device-independent checks in the uv-managed development environment:
 
 ```bash
 .venv/bin/python -m pytest --confcutdir=tests/config/lwd tests/config/lwd -q
-.venv/bin/python tools/lwd/check_config.py --additional-config \
-  '{"lwd_config":{"path":"etc/lwd/2e1c/topology_2dp.yaml","role":"edge","instance_id":1}}'
 ```
 
 Tests and purposes for human review:
