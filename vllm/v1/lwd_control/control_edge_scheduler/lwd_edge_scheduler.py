@@ -97,7 +97,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             self.vllm_config.parallel_config.lwd_config.cloud_dp_size
         )
         self._lwd_route: dict[str, int] = {}
-        # 轮转锚点:目标 engine 选择(_lwd_pick_target_engine)与路由
+        # 轮转锚点:目标 engine 选择(_lwd_pick_serving_engine)与路由
         # 并列打散共用
         self._lwd_last_engine = -1
         # seqno 流按 engine 独立:UP 通道的无空洞配对契约是 per-channel
@@ -136,8 +136,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 多云 DP:键为 (engine_index, seqno)——seqno 流 per-engine,
         # 单靠 seqno 会跨 engine 撞号。
         self._lwd_batch_requests: dict[tuple[int, int], list[str]] = {}
-        # pending 闸门状态(仅作开/关转换日志用)
-        self._lwd_prefill_gate_held: bool = False
+        # pending 闸门状态(per-engine,仅作开/关转换日志用)
+        self._lwd_gate_held: dict[int, bool] = {}
         # MTP 预算系数:decode 每请求每步消耗 1+k 个 token(草稿 token
         # 同样占预算与 KV);k = num_speculative_tokens(配置解析期已
         # 求值,缺省 None 按 0),无 spec 配置即 1。
@@ -198,38 +198,25 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         EMBED 批的 LwdBatch(seqno/token 片段)由 lwd_edge_notify 在
         发布成功后挂批——seqno 必须与发布成功绑定。
 
-        开新准入:云侧在途满员(lwd_edge_max_num_seqs_check 为 False)
-        时本步空排、新开请求留 waiting 等云侧排水;running 尚有未发完
-        embed 的续传不受闸门约束(先收尾再开新,亦防上限=1 时自锁)。"""
+        开新准入(per-engine):目标 engine 云侧在途满员
+        (lwd_edge_max_num_seqs_check 为 False)或 pending chunk 超上限
+        时该 engine 本步跳过,其他有活且过闸的 engine 照常服务——
+        单 engine 堵塞不拖累全局;续传收尾不受闸门约束(先收尾再开新,
+        亦防上限=1 时自锁)。全部被闸按住才空排一轮(云侧排水后自开)。"""
         LwdControlLog.flight(len(self.running), len(self._lwd_awaiting))
-        if (
-            not self.lwd_edge_max_num_seqs_check()
-            and not self._lwd_has_prefill_chunk_inflight()
-        ):
-            return SchedulerOutput.make_empty()
-        # 云侧 pending 闸门(组批的产生机制):awaiting 中尚未收到首个
-        # token 的请求数 = 云侧尚未消费到的 prefill(notify 积压的边侧
-        # 本地估计,免协议改动)。超过上限即停止新开 prefill,请求在边
-        # 侧 waiting 攒批(picker FCFS 前缀天然组多请求批),云侧
-        # pending 排空后闸门自开。续传豁免(先收尾再开新)。
-        if self._lwd_mixed and not self._lwd_has_prefill_chunk_inflight():
-            pending_chunks = len(self._lwd_batch_requests)
-            if pending_chunks >= _LWD_MAX_PENDING_CHUNKS:
-                if not self._lwd_prefill_gate_held:
-                    self._lwd_prefill_gate_held = True
-                    logger.info(
-                        "[Lwd][edge-sched] prefill gate HOLD: "
-                        "pending_chunks=%d >= %d",
-                        pending_chunks, _LWD_MAX_PENDING_CHUNKS,
-                    )
+        engine = self._lwd_pick_serving_engine()
+        if engine is None:
+            if self._lwd_any_busy():
+                # 有活但全被闸按住:空排一轮等云侧排水(与旧全局闸门
+                # 同语义,has_requests 保真,引擎 1ms 节拍轮询)
                 return SchedulerOutput.make_empty()
-            if self._lwd_prefill_gate_held:
-                self._lwd_prefill_gate_held = False
-                logger.info(
-                    "[Lwd][edge-sched] prefill gate OPEN: pending_chunks=%d",
-                    pending_chunks,
-                )
-        return self._lwd_schedule_batch()
+            # 完全无活也要走原生空调度排水 finished_req_ids,
+            # 否则引擎空闲期空转(见 a62caf791)
+            return self._lwd_schedule_for_visible_reqs([])
+        return self._lwd_schedule_batch(engine)
+
+    def _lwd_any_busy(self) -> bool:
+        return bool(self.running or self.waiting or self.skipped_waiting)
 
     def _lwd_pick_prefill_batch(
         self, engine: int = 0
@@ -274,11 +261,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             ]
             picked = [candidates[0].request_id] if candidates else []
             return picked, {}, self.max_num_scheduled_tokens
-        # cap 语义:批 Σchunk ≤ 预算 − 在途数 × spec 系数(云混排步里
-        # decode 每请求占 1+k token,MTP 下 k = num_spec_tokens;在途数
-        # 是 decode 人口的恒成立上界,设计 §2.2)。边云预算部署对齐,
-        # 本地 max_num_scheduled_tokens 即云侧预算
-        inflight = len(self.running) + len(self._lwd_awaiting)
+        # cap 语义(per-engine):批 Σchunk ≤ 预算 − 本 engine 在途数 ×
+        # spec 系数(云混排步里 decode 每请求占 1+k token,MTP 下
+        # k = num_spec_tokens;在途数是该 engine decode 人口的恒成立
+        # 上界,设计 §2.2/§5.3)。边云预算部署对齐,本地
+        # max_num_scheduled_tokens 即云侧单 engine 预算
+        prefill_cnt, decode_cnt = self._lwd_engine_load(engine)
+        inflight = prefill_cnt + decode_cnt
         cap = self.max_num_scheduled_tokens - inflight * self._lwd_spec_factor
         free_seq = self.max_num_running_reqs - inflight
         picked: list[str] = []
@@ -365,9 +354,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
         return picked, expected, cap
 
-    def _lwd_schedule_batch(self) -> SchedulerOutput:
-        """chunk 组批:picker 选批,预算钳制后经基类可见集机制调度 +
-        逐 chunk 核验。
+    def _lwd_schedule_batch(self, engine: int) -> SchedulerOutput:
+        """chunk 组批:picker 选批(仅本 engine),预算钳制后经基类可见集
+        机制调度 + 逐 chunk 核验。
 
         选择规则见 _lwd_pick_prefill_batch;队列剔除/隔离/拼回复用基类
         _lwd_schedule_for_visible_reqs(waiting/skipped 来源走原生准入
@@ -380,17 +369,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         抢占的请求回 waiting 尾部、被跳过的回 skipped 队首,均取基类
         统一语义,不再做队首回插。
 
-        多 DP:每次 schedule 只为一个目标 engine 组批
-        (_lwd_pick_target_engine 轮转挑有活的 engine,picker 按路由
-        过滤),引擎步内的多次 schedule 调用(批队列深度循环)天然
-        产出 per-engine 子批。"""
-        engine = self._lwd_pick_target_engine()
-        if engine is None:
-            # 无活可排也必须走原生空调度:finished_req_ids 只经原生
-            # schedule() 排水进 SchedulerOutput,跳过则
-            # has_finished_requests() 恒真 → has_work 恒真,引擎在
-            # 空闲期永不阻塞(空转刷屏)
-            return self._lwd_schedule_for_visible_reqs([])
+        多 DP:每次 schedule 只为一个目标 engine 组批(schedule() 已
+        经 _lwd_pick_serving_engine 选定并过闸),引擎步内的多次
+        schedule 调用(批队列深度循环)天然产出 per-engine 子批。"""
         req_ids, expected, cap = self._lwd_pick_prefill_batch(engine)
         if req_ids:
             logger.info(
@@ -443,27 +424,27 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         侧承担;encode/dec cache 簿记恒空,finish 时 free() 为空操作。"""
         return [], num_new_tokens, encoder_compute_budget, []
 
-    def lwd_edge_max_num_seqs_check(self) -> bool:
-        """max_num_seqs 适配检查:云侧在途水位(running + awaiting)是否
-        还有名额,True=可开新请求。
+    def lwd_edge_max_num_seqs_check(self, engine: int = 0) -> bool:
+        """max_num_seqs 适配检查(per-engine):该 engine 云侧在途水位
+        (running + awaiting 中路由到它的)是否还有名额,True=可开新。
 
         awaiting 请求已清出调度器,原生准入只数 running(边侧恒在飞批
-        深度以内)永远拦不住;以 running+awaiting 对账云侧在途数,达到
-        max_num_running_reqs(边云部署对齐,即云侧名额)即满员。续传
-        豁免不在本判断(schedule 闸门经 _lwd_has_prefill_chunk_inflight
-        放行收尾);请求到达时的 announce 亦不受约束(云只登记不计算)。"""
-        return (
-            len(self.running) + len(self._lwd_awaiting)
-            < self.max_num_running_reqs
-        )
+        深度以内)永远拦不住;以 running+awaiting 对账该 engine 的云侧
+        在途数,达到 max_num_running_reqs(边云部署对齐,即云侧单
+        engine 名额)即满员。续传豁免不在本判断(闸门经
+        _lwd_has_prefill_chunk_inflight 放行收尾);请求到达时的
+        announce 亦不受约束(云只登记不计算)。"""
+        prefill, decode = self._lwd_engine_load(engine)
+        return prefill + decode < self.max_num_running_reqs
 
-    def _lwd_has_prefill_chunk_inflight(self) -> bool:
-        """running 中是否存在未发完的 embed 请求(续传收尾中)。
+    def _lwd_has_prefill_chunk_inflight(self, engine: int = 0) -> bool:
+        """该 engine 是否有未发完 embed 的续传请求(收尾中)。
 
         与 _lwd_pick_prefill_batch 的续传分支同判据,两处需保持一致:
         闸门放行收尾的前提是 picker 必然挑中该续传请求而非开新。"""
         return any(
             req.num_computed_tokens < req.num_prompt_tokens
+            and self._lwd_route.get(req.request_id, 0) == engine
             for req in self.running
         )
 
@@ -506,15 +487,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
         return best
 
-    def _lwd_pick_target_engine(self) -> int | None:
-        """选本次 schedule() 的目标 engine:只在有活的 engine 里挑
-        (续传与开新都算活),多个有活则自上次服务位置轮转。批的 engine
-        单一性由 picker 过滤保证——一条 RangeNotify/一个 seqno/一条
-        UP 通道只能属于一个 engine;per-engine 内部仍是续传优先 +
-        FCFS(过滤不改变相对序)。"""
+    def _lwd_pick_serving_engine(self) -> int | None:
+        """挑本次 schedule() 服务的 engine:有活(续传或开新)且过闸
+        (per-engine 名额/pending 闸门),多个候选自上次服务位置轮转。
+        全部有活的 engine 都被闸按住时返回 None(空排等云侧排水);
+        完全无活也返回 None(调用方走原生空调度排水 finished_req_ids)。
+
+        批的 engine 单一性由 picker 过滤保证——一条 RangeNotify/一个
+        seqno/一条 UP 通道只能属于一个 engine;per-engine 内部仍是续传
+        优先 + FCFS(过滤不改变相对序)。"""
         M = self._lwd_cloud_dp
-        if M == 1:
-            return 0
         route = self._lwd_route
         busy = {
             route.get(r.request_id, 0)
@@ -528,10 +510,53 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return None
         for k in range(M):
             eng = (self._lwd_last_engine + 1 + k) % M
-            if eng in busy:
+            if eng in busy and not self._lwd_engine_gated(eng):
                 self._lwd_last_engine = eng
                 return eng
         return None
+
+    def _lwd_engine_load(self, engine: int) -> tuple[int, int]:
+        """该 engine 的 (prefill 中, decode 中) 请求数:running 中路由到
+        它的 + awaiting 中路由到它的。是 cap 公式与名额检查的同源输入
+        (设计 §5.3:云_i.decode ⊆ 边.running_i ∪ awaiting_i)。"""
+        prefill = sum(
+            1
+            for req in self.running
+            if self._lwd_route.get(req.request_id, 0) == engine
+        )
+        decode = sum(
+            1
+            for rid in self._lwd_awaiting
+            if self._lwd_route.get(rid, 0) == engine
+        )
+        return prefill, decode
+
+    def _lwd_engine_gated(self, engine: int) -> bool:
+        """per-engine 闸门:续传收尾豁免(先收尾再开新,防上限=1 自锁);
+        否则名额(running+awaiting < max_seqs)与 pending chunk 上限
+        (mixed)任一不过即按住。"""
+        if self._lwd_has_prefill_chunk_inflight(engine):
+            return False
+        if not self.lwd_edge_max_num_seqs_check(engine):
+            return True
+        if self._lwd_mixed:
+            # 云侧 pending 闸门:该 engine 已发未消费的 chunk 数达上限即
+            # 停止对它新开 prefill(请求在边 waiting 攒批,云侧排空自开)
+            pending = sum(
+                1 for (e, _) in self._lwd_batch_requests if e == engine
+            )
+            held = pending >= _LWD_MAX_PENDING_CHUNKS
+            prev = self._lwd_gate_held.get(engine, False)
+            if held != prev:
+                self._lwd_gate_held[engine] = held
+                logger.info(
+                    "[Lwd][edge-sched] prefill gate %s: engine=%d "
+                    "pending_chunks=%d",
+                    "HOLD" if held else "OPEN", engine, pending,
+                )
+            if held:
+                return True
+        return False
 
     def lwd_edge_add_request(self, request: Request) -> None:
         """请求入口:边界校验 -> 云预告 -> 本地入队。
