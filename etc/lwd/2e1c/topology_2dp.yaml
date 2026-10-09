@@ -1,0 +1,54 @@
+deployment:
+  mode: 0
+  scene: cloud_share
+  hccl_world_size: 10
+  edges_num: 2
+  clouds_num: 1
+feature_ctrl:
+  enable_early_recv: false
+  enable_scramble: false
+edges:
+- id: 0
+  dp:
+  - dp_idx: 0
+    addr: 76.76.26.17
+    ranks:
+    - 0
+  - dp_idx: 1
+    addr: 76.76.26.17
+    ranks:
+    - 0
+- id: 1
+  dp:
+  - dp_idx: 0
+    addr: 76.76.26.17
+    ranks:
+    - 1
+  - dp_idx: 1
+    addr: 76.76.26.17
+    ranks:
+    - 1
+clouds:
+- id: 0
+  dp:
+  - dp_idx: 0
+    addr: 76.76.26.232
+    ranks:
+    - 2
+    - 3
+    - 4
+    - 5
+    ctrl_port: 15783
+  - dp_idx: 1
+    addr: 76.76.26.232
+    ranks:
+    - 6
+    - 7
+    - 8
+    - 9
+    ctrl_port: 15784
+instance_links:
+- edge: 0
+  cloud: 0
+- edge: 1
+  cloud: 0
