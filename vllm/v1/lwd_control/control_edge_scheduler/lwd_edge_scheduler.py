@@ -386,7 +386,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         产出 per-engine 子批。"""
         engine = self._lwd_pick_target_engine()
         if engine is None:
-            return SchedulerOutput.make_empty()
+            # 无活可排也必须走原生空调度:finished_req_ids 只经原生
+            # schedule() 排水进 SchedulerOutput,跳过则
+            # has_finished_requests() 恒真 → has_work 恒真,引擎在
+            # 空闲期永不阻塞(空转刷屏)
+            return self._lwd_schedule_for_visible_reqs([])
         req_ids, expected, cap = self._lwd_pick_prefill_batch(engine)
         if req_ids:
             logger.info(
