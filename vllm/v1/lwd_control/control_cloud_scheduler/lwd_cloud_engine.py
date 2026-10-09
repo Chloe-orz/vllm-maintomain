@@ -126,6 +126,12 @@ class LwdCloudEngineCoreMixin:
             ),
             # 控制面协议版本互校(mrope 直传;边侧构造期 fail-fast)
             wire_version=LWD_WIRE_VERSION,
+            # 多 DP 身份与 coordinator stats 地址(边侧建端点表/路由账/
+            # 唤醒通道用);dp=1 时 engine_index=0、无 coordinator 为空
+            engine_index=dp_rank,
+            coord_stats_addr=self._lwd_coord_stats_addr(
+                config, self.frontend_stats_publish_address
+            ),
         )
         # 首拍即通告(边侧可能已 bind 等待)
         self._lwd_announce()
@@ -202,6 +208,18 @@ class LwdCloudEngineCoreMixin:
                     break
                 continue
             self._lwd_dispatch(msg)
+
+    @staticmethod
+    def _lwd_coord_stats_addr(config, frontend_stats_publish_address) -> str:
+        """HELLO 通告的 coordinator stats 地址:host 改写为本机可路由 IP
+        (pre_out_host)——coordinator 与云 engine 同机,其 front XPUB 在
+        LWD 下绑 0.0.0.0,通告值必须是边可路由地址;无 coordinator
+        (dp=1)时为空。"""
+        addr = frontend_stats_publish_address
+        if not addr or not str(addr).startswith("tcp://"):
+            return ""
+        _, _, port = str(addr).rpartition(":")
+        return f"tcp://{config.pre_out_host}:{port}"
 
     def _lwd_announce(self) -> None:
         """首拍 HELLO 通告一次;队满不重试,由边侧等待超时 fail-fast 兜底。"""
@@ -605,6 +623,8 @@ class LwdCloudEngineCoreMixin:
             finish_reasons=finish_reasons,
             down_seqno=meta.down_seqno,
             token_ids=token_ids or [],
+            # POST_OUT fan-in 下供边侧归账到本 engine 的 seqno 流/路由账
+            engine_index=self.vllm_config.parallel_config.data_parallel_rank,
         )
         while not self._lwd_post_out.closed:
             if self._lwd_post_out.publish(notify):
