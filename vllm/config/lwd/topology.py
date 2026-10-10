@@ -214,7 +214,6 @@ class LwdTopology:
         rank_addresses: dict[int, str] = {}
         edge_ranks: set[int] = set()
         cloud_ranks: set[int] = set()
-        endpoints: set[tuple[str, int | None]] = set()
         role_addresses: dict[str, set[str]] = {"edges": set(), "clouds": set()}
         for role, instances in (("edges", self.edges), ("clouds", self.clouds)):
             for instance in instances:
@@ -237,13 +236,6 @@ class LwdTopology:
                         edge_ranks.update(dp.ranks)
                     else:
                         cloud_ranks.update(dp.ranks)
-                        endpoint = (dp.addr, dp.ctrl_port)
-                        if endpoint in endpoints:
-                            raise ValueError(
-                                "[LWD] Cloud DPs on the same address must use "
-                                "different ctrl_port values"
-                            )
-                        endpoints.add(endpoint)
         if edge_ranks & cloud_ranks:
             raise ValueError("[LWD] Edge and cloud ranks must not overlap")
         if mixed := role_addresses["edges"] & role_addresses["clouds"]:
@@ -280,7 +272,64 @@ class LwdTopology:
                 )
         if self.deployment.scene in ("cloud_share", "lwd_cluster"):
             self._validate_cloud_reuse_layout()
+        elif self.deployment.scene == "edge_share":
+            self._validate_edge_share_layout()
+        self._validate_control_ports()
         self._warn_layout_recommendations()
+
+    def _validate_control_ports(self) -> None:
+        if self.deployment.scene == "edge_share":
+            # These are shared per-DP channel references, not cloud bind addresses.
+            ports: dict[int, int | None] = {}
+            for cloud in self.clouds:
+                for dp in cloud.dp:
+                    if ports.setdefault(dp.dp_idx, dp.ctrl_port) != dp.ctrl_port:
+                        raise ValueError(
+                            "[LWD] edge_share requires the same ctrl_port for "
+                            "the same DP across all cloud instances"
+                        )
+            if len(set(ports.values())) != len(ports):
+                raise ValueError(
+                    "[LWD] edge_share requires different ctrl_port values per DP"
+                )
+            return
+        endpoints: set[tuple[str, int | None]] = set()
+        for cloud in self.clouds:
+            for dp in cloud.dp:
+                endpoint = (dp.addr, dp.ctrl_port)
+                if endpoint in endpoints:
+                    raise ValueError(
+                        "[LWD] Cloud DPs on the same address must use "
+                        "different ctrl_port values"
+                    )
+                endpoints.add(endpoint)
+
+    def _validate_edge_share_layout(self) -> None:
+        if len({len(cloud.dp) for cloud in self.clouds}) != 1:
+            raise ValueError(
+                "[LWD] edge_share cloud instances must use the same DP count"
+            )
+        machines: dict[str, list[LwdDP]] = {}
+        for cloud in self.clouds:
+            if len({dp.addr for dp in cloud.dp}) != 1:
+                raise ValueError("[LWD] Cloud instance DPs must share one address")
+            machines.setdefault(cloud.dp[0].addr, []).extend(cloud.dp)
+        for machine_index, (addr, dps) in enumerate(machines.items()):
+            if CLOUD_CARDS % len(dps) or any(
+                len(dp.ranks) != CLOUD_CARDS // len(dps) for dp in dps
+            ):
+                raise ValueError(
+                    f"[LWD] Cloud machine {addr} must split eight ranks equally "
+                    "among its instances and DPs"
+                )
+            start = 1 + machine_index * CLOUD_CARDS
+            # Instance-major blocks match separate VISIBLE device sets in scripts.
+            ranks = [rank for dp in dps for rank in dp.ranks]
+            if ranks != list(range(start, start + CLOUD_CARDS)):
+                raise ValueError(
+                    f"[LWD] Cloud machine {addr} requires contiguous ranks in "
+                    "machine, instance and DP order"
+                )
 
     def _validate_scene(self) -> None:
         """Validate logical instance shape, independently of physical host count."""

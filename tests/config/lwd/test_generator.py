@@ -114,3 +114,91 @@ def test_invalid_inputs_do_not_overwrite_existing_yaml(
     )
     assert result.returncode != 0
     assert output.read_text() == "preserve this file\n"
+
+
+@pytest.mark.parametrize(
+    "clouds,dp,expected_ranks,world",
+    [
+        ("1@10.1.0.1,0@10.1.0.1", 1, [[[1, 2, 3, 4]], [[5, 6, 7, 8]]], 9),
+        ("0@10.1.0.1,1@10.1.0.1", 2, [[[1, 2], [3, 4]], [[5, 6], [7, 8]]], 9),
+        ("10.1.0.1,10.1.0.2", 1, [[list(range(1, 9))], [list(range(9, 17))]], 17),
+        (
+            "0@10.1.0.1,1@10.1.0.2",
+            2,
+            [[[1, 2, 3, 4], [5, 6, 7, 8]], [[9, 10, 11, 12], [13, 14, 15, 16]]],
+            17,
+        ),
+    ],
+)
+def test_edge_share_allocates_per_physical_cloud(
+    tmp_path: Path, clouds: str, dp: int, expected_ranks: list, world: int
+) -> None:
+    output = tmp_path / "topology.yaml"
+    subprocess.run(
+        [
+            sys.executable,
+            str(GENERATOR),
+            "--scene",
+            "edge_share",
+            "--edge-machines",
+            "10.0.0.1",
+            "--cloud-machines",
+            clouds,
+            "--dp",
+            str(dp),
+            "--port-base",
+            "6020",
+            "-o",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    raw = yaml.safe_load(output.read_text())
+    assert raw["deployment"]["hccl_world_size"] == world
+    assert [[d["ranks"] for d in c["dp"]] for c in raw["clouds"]] == expected_ranks
+    assert [[d["ctrl_port"] for d in c["dp"]] for c in raw["clouds"]] == [
+        list(range(6020, 6020 + dp))
+    ] * 2
+    assert {tuple(d["ranks"]) for e in raw["edges"] for d in e["dp"]} == {(0,)}
+    assert raw["instance_links"] == [{"edge": 0, "cloud": 0}, {"edge": 1, "cloud": 1}]
+
+
+@pytest.mark.parametrize(
+    "clouds,dp,port",
+    [
+        ("0@10.1.0.1,0@10.1.0.2", "1", "6020"),
+        ("0@10.1.0.1,2@10.1.0.2", "1", "6020"),
+        ("0@10.1.0.1,10.1.0.2", "1", "6020"),
+        ("10.1.0.1,10.1.0.1", "1", "6020"),
+        ("0@10.1.0.1,1@10.1.0.1,2@10.1.0.1", "1", "6020"),
+        ("0@10.1.0.1,1@10.1.0.1", "8", "6020"),
+        ("10.1.0.1,10.1.0.2", "2", "65535"),
+    ],
+)
+def test_invalid_cloud_allocation_preserves_output(
+    tmp_path: Path, clouds: str, dp: str, port: str
+) -> None:
+    output = tmp_path / "topology.yaml"
+    output.write_text("preserve this file\n")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(GENERATOR),
+            "--scene",
+            "edge_share",
+            "--edge-machines",
+            "10.0.0.1",
+            "--cloud-machines",
+            clouds,
+            "--dp",
+            dp,
+            "--port-base",
+            port,
+            "-o",
+            str(output),
+        ],
+        capture_output=True,
+    )
+    assert result.returncode != 0
+    assert output.read_text() == "preserve this file\n"

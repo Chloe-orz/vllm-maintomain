@@ -5,6 +5,7 @@
 import argparse
 import importlib.util
 import sys
+from collections import Counter
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,7 @@ def _addresses(value: str) -> list[str]:
     return addresses
 
 
-def _edge_instances(scene: str, value: str, cloud_count: int) -> list[tuple[int, str]]:
+def _instances(value: str) -> list[tuple[int, str]]:
     items = [item.strip() for item in value.split(",")]
     if any("@" in item for item in items):
         if not all(item.count("@") == 1 for item in items):
@@ -33,12 +34,18 @@ def _edge_instances(scene: str, value: str, cloud_count: int) -> list[tuple[int,
         for item in items:
             identity, address = item.split("@")
             if not identity.isdecimal():
-                raise ValueError("Edge instance IDs must be non-negative integers")
+                raise ValueError("Instance IDs must be non-negative integers")
             instances.append((int(identity), str(ip_address(address))))
         instances.sort()
         if [identity for identity, _ in instances] != list(range(len(instances))):
-            raise ValueError("Edge instance IDs must be unique and contiguous from 0")
+            raise ValueError("Instance IDs must be unique and contiguous from 0")
         return instances
+    return list(enumerate(_addresses(value)))
+
+
+def _edge_instances(scene: str, value: str, cloud_count: int) -> list[tuple[int, str]]:
+    if "@" in value:
+        return _instances(value)
     addresses = _addresses(value)
     if scene == "edge_share":
         if len(addresses) != 1:
@@ -47,36 +54,24 @@ def _edge_instances(scene: str, value: str, cloud_count: int) -> list[tuple[int,
     return list(enumerate(addresses))
 
 
-def build_topology(
-    scene: str, edge_machines: str, cloud_machines: str, dp: int, port_base: int
-) -> dict[str, Any]:
-    """Allocate global ranks; host-local physical devices remain launch settings."""
-    if scene not in SCENES:
-        raise ValueError(f"Unknown scene: {scene}")
-    if dp not in (1, 2, 4, 8):
-        raise ValueError("DP must be one integer in 1, 2, 4, 8")
-    if not 1 <= port_base <= 65535 - dp + 1:
-        raise ValueError("All generated control ports must be within 1..65535")
-    cloud_addresses = _addresses(cloud_machines)
-    instances = _edge_instances(scene, edge_machines, len(cloud_addresses))
-    edges = []
-    for identity, address in instances:
-        rank = 0 if scene == "edge_share" else identity
-        edges.append(
-            {
-                "id": identity,
-                "dp": [
-                    {"dp_idx": index, "addr": address, "ranks": [rank]}
-                    for index in range(dp)
-                ],
-            }
-        )
-    # Distinct cloud-reuse instances retain distinct ranks on the same host.
-    edge_rank_count = 1 if scene == "edge_share" else len(edges)
+def _cloud_layout(
+    instances: list[tuple[int, str]], dp: int, edge_rank_count: int, port_base: int
+) -> list[dict[str, Any]]:
+    counts = Counter(address for _, address in instances)
+    machines = list(counts)
+    offsets: Counter[str] = Counter()
     clouds = []
-    for identity, address in enumerate(cloud_addresses):
-        base = edge_rank_count + identity * CLOUD_CARDS
-        per_dp = CLOUD_CARDS // dp
+    for identity, address in instances:
+        divisions = counts[address] * dp
+        if CLOUD_CARDS % divisions:
+            raise ValueError(
+                "Eight cloud cards must divide evenly among instances * DP"
+            )
+        per_dp = CLOUD_CARDS // divisions
+        # Each host owns one rank block; colocated instances partition that block.
+        base = (
+            edge_rank_count + machines.index(address) * CLOUD_CARDS + offsets[address]
+        )
         clouds.append(
             {
                 "id": identity,
@@ -93,6 +88,40 @@ def build_topology(
                 ],
             }
         )
+        offsets[address] += per_dp * dp
+    return clouds
+
+
+def build_topology(
+    scene: str, edge_machines: str, cloud_machines: str, dp: int, port_base: int
+) -> dict[str, Any]:
+    """Allocate global ranks; host-local physical devices remain launch settings."""
+    if scene not in SCENES:
+        raise ValueError(f"Unknown scene: {scene}")
+    if dp not in (1, 2, 4, 8):
+        raise ValueError("DP must be one integer in 1, 2, 4, 8")
+    if not 1 <= port_base <= 65535 - dp + 1:
+        raise ValueError("All generated control ports must be within 1..65535")
+    cloud_instances = _instances(cloud_machines)
+    cloud_addresses = {address for _, address in cloud_instances}
+    if scene != "edge_share" and len(cloud_addresses) != len(cloud_instances):
+        raise ValueError("Colocated cloud instances require scene=edge_share")
+    instances = _edge_instances(scene, edge_machines, len(cloud_instances))
+    edges = []
+    for identity, address in instances:
+        rank = 0 if scene == "edge_share" else identity
+        edges.append(
+            {
+                "id": identity,
+                "dp": [
+                    {"dp_idx": index, "addr": address, "ranks": [rank]}
+                    for index in range(dp)
+                ],
+            }
+        )
+    # Distinct cloud-reuse instances retain distinct ranks on the same host.
+    edge_rank_count = 1 if scene == "edge_share" else len(edges)
+    clouds = _cloud_layout(cloud_instances, dp, edge_rank_count, port_base)
     links = (
         [{"edge": edge["id"], "cloud": edge["id"]} for edge in edges]
         if scene == "edge_share"
@@ -106,7 +135,7 @@ def build_topology(
         "deployment": {
             "mode": 0,
             "scene": scene,
-            "hccl_world_size": edge_rank_count + CLOUD_CARDS * len(clouds),
+            "hccl_world_size": edge_rank_count + CLOUD_CARDS * len(cloud_addresses),
             "edges_num": len(edges),
             "clouds_num": len(clouds),
         },
@@ -137,7 +166,9 @@ def main() -> None:
         help="Comma-separated IPs or ID@IP entries; never physical NPU IDs",
     )
     parser.add_argument(
-        "--cloud-machines", required=True, help="Comma-separated cloud IPs"
+        "--cloud-machines",
+        required=True,
+        help="Comma-separated IPs or ID@IP entries; edge_share permits repeated hosts",
     )
     parser.add_argument("--dp", type=int, choices=(1, 2, 4, 8), default=1)
     parser.add_argument("--port-base", type=int, default=5550)

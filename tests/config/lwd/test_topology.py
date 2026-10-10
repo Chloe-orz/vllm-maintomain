@@ -94,3 +94,39 @@ def test_role_and_instance_lookup_does_not_fall_back() -> None:
         topology.instance("edge", 2)
     with pytest.raises(ValueError, match="DP not found"):
         topology.dp("cloud", 0, 2)
+
+
+@pytest.mark.parametrize(
+    "fault,match",
+    [
+        ("different_channel", "same ctrl_port"),
+        ("dp_port_alias", "different ctrl_port"),
+        ("unequal_partition", "split eight ranks equally"),
+        ("rank_order", "contiguous ranks"),
+        ("split_instance", "share one address"),
+        ("mixed_dp_counts", "same DP count"),
+    ],
+)
+def test_edge_share_rejects_ambiguous_channels_and_card_layouts(
+    fault: str, match: str
+) -> None:
+    raw = yaml.safe_load((FIXTURES / "s2_edge_share_2dp.yaml").read_text())
+    if fault == "different_channel":
+        raw["clouds"][1]["dp"][0]["ctrl_port"] += 10
+    elif fault == "dp_port_alias":
+        for cloud in raw["clouds"]:
+            cloud["dp"][1]["ctrl_port"] = cloud["dp"][0]["ctrl_port"]
+    elif fault == "unequal_partition":
+        first, second = raw["clouds"][0]["dp"]
+        second["ranks"].insert(0, first["ranks"].pop())
+    elif fault == "rank_order":
+        first, second = raw["clouds"][0]["dp"]
+        first["ranks"], second["ranks"] = second["ranks"], first["ranks"]
+    elif fault == "split_instance":
+        raw["clouds"][0]["dp"][1]["addr"] = "10.1.0.3"
+    elif fault == "mixed_dp_counts":
+        cloud_dps = raw["clouds"][1]["dp"]
+        cloud_dps[0]["ranks"].extend(cloud_dps.pop()["ranks"])
+        raw["edges"][1]["dp"].pop()
+    with pytest.raises(ValueError, match=match):
+        LwdTopology.from_dict(raw)
