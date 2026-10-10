@@ -8,6 +8,18 @@ from typing import Any
 from .topology import LwdDPConnection, LwdInstance, LwdTopology, _integer, _mapping
 
 
+def lwd_entry_from_dict(raw: Any) -> tuple[str, str, int]:
+    """Validate the entry without reading YAML during early CLI checks."""
+    raw = _mapping(raw, "lwd_config", {"path", "role", "instance_id"})
+    path = raw["path"]
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("[LWD] lwd_config.path must be a non-empty string")
+    if raw["role"] not in ("edge", "cloud"):
+        raise ValueError("[LWD] lwd_config.role must be 'edge' or 'cloud'")
+    identity = _integer(raw["instance_id"], "lwd_config.instance_id")
+    return path, raw["role"], identity
+
+
 @dataclass(frozen=True)
 class LwdConfig:
     path: str
@@ -17,16 +29,10 @@ class LwdConfig:
 
     @classmethod
     def from_dict(cls, raw: Any) -> "LwdConfig":
-        raw = _mapping(raw, "lwd_config", {"path", "role", "instance_id"})
-        path = raw["path"]
-        if not isinstance(path, str) or not path.strip():
-            raise ValueError("[LWD] lwd_config.path must be a non-empty string")
-        if raw["role"] not in ("edge", "cloud"):
-            raise ValueError("[LWD] lwd_config.role must be 'edge' or 'cloud'")
-        identity = _integer(raw["instance_id"], "lwd_config.instance_id")
+        path, role, identity = lwd_entry_from_dict(raw)
         topology = LwdTopology.from_file(path)
-        topology.instance(raw["role"], identity)
-        return cls(path, raw["role"], identity, topology)
+        topology.instance(role, identity)
+        return cls(path, role, identity, topology)
 
     @property
     def instance(self) -> LwdInstance:

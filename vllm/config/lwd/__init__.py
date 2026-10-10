@@ -4,11 +4,18 @@
 
 from typing import Any
 
+from .api import LwdAPIConfig
 from .coordination import LwdCoordinationConfig
 from .entry import LwdConfig
 from .topology import LwdTopology
 
-__all__ = ["LwdConfig", "LwdCoordinationConfig", "LwdTopology", "resolve_lwd_config"]
+__all__ = [
+    "LwdAPIConfig",
+    "LwdConfig",
+    "LwdCoordinationConfig",
+    "LwdTopology",
+    "resolve_lwd_config",
+]
 
 
 def resolve_lwd_config(

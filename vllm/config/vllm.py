@@ -40,7 +40,7 @@ from .kv_events import KVEventsConfig
 from .kv_transfer import KVTransferConfig
 from .load import LoadConfig
 from .lora import LoRAConfig
-from .lwd import LwdConfig, LwdCoordinationConfig, resolve_lwd_config
+from .lwd import LwdAPIConfig, LwdConfig, LwdCoordinationConfig, resolve_lwd_config
 from .mamba import MambaBackendEnum, MambaConfig
 from .model import ModelConfig
 from .observability import ObservabilityConfig
@@ -440,6 +440,8 @@ class VllmConfig:
     """Parsed LWD topology snapshot. Configuration only; does not enable execution."""
     lwd_coordination: LwdCoordinationConfig | None = Field(default=None, init=False)
     """Parsed coordination metadata; does not start clients or listeners."""
+    lwd_api_config: LwdAPIConfig = Field(default_factory=LwdAPIConfig)
+    """API attachment metadata; does not start or attach frontend processes."""
     instance_id: str = ""
     """The ID of the vLLM instance."""
     optimization_level: OptimizationLevel = OptimizationLevel.O2
@@ -1266,6 +1268,7 @@ class VllmConfig:
         self.lwd_config, self.lwd_coordination = resolve_lwd_config(
             self.additional_config
         )
+        self.lwd_api_config.validate_topology(self.lwd_config)
         if self.lwd_config is not None:
             logger.info(
                 "[LWD][config] metadata_only=True role=%s instance_id=%d "
@@ -1276,6 +1279,13 @@ class VllmConfig:
                 [(dp.dp_idx, dp.ranks) for dp in self.lwd_config.instance.dp],
                 self.lwd_config.topology.digest,
             )
+            if self.lwd_api_config.requested:
+                logger.info(
+                    "[LWD][config] metadata_only=True api_server_rpc_port=%s "
+                    "api_server_attach=%s; API attachment is not enabled",
+                    self.lwd_api_config.api_server_rpc_port,
+                    self.lwd_api_config.api_server_attach,
+                )
 
         self._resolve_mm_encoder_only()
 

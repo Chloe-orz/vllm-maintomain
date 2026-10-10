@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import argparse
 import copy
 import pickle
 from pathlib import Path
 
 import pytest
-from lwd_config_under_test import resolve_lwd_config
+from lwd_config_under_test import LwdAPIConfig, LwdConfig, resolve_lwd_config
 
 FIXTURE = Path(__file__).parent / "fixtures/s3_cloud_share_2dp.yaml"
 
@@ -71,3 +72,30 @@ def test_invalid_entry_fails_during_configuration(change: dict, match: str) -> N
 def test_invalid_coordination_is_not_silently_forwarded(coordination: dict) -> None:
     with pytest.raises(ValueError):
         resolve_lwd_config({"lwd_coordination": coordination})
+
+
+@pytest.mark.parametrize(
+    "identity,flag", [(0, "--api-server-rpc-port"), (1, "--api-server-attach")]
+)
+def test_api_cli_metadata_survives_snapshot_handoff(
+    tmp_path: Path, identity: int, flag: str
+) -> None:
+    parser = argparse.ArgumentParser()
+    LwdAPIConfig.add_cli_args(parser)
+    args = parser.parse_args([flag, "10.0.0.1:25100"])
+    path = tmp_path / "topology.yaml"
+    args.additional_config = {
+        "lwd_config": {"path": str(path), "role": "edge", "instance_id": identity}
+    }
+    # CLI identity checks do not read a YAML file; the snapshot owns that read.
+    api = LwdAPIConfig.from_namespace(args)
+    path.write_bytes((FIXTURE.parent / "s2_edge_share_2dp.yaml").read_bytes())
+    entry = LwdConfig.from_dict(args.additional_config["lwd_config"])
+    api.validate_topology(entry)
+    path.unlink()
+    # Only round-trip our own objects, never externally supplied pickle data.
+    received_api, received_entry = pickle.loads(pickle.dumps((api, entry)))
+    received_api.validate_topology(received_entry)
+    assert received_api == api
+    assert [c.dp_idx for c in received_entry.connections] == [0, 1]
+    assert received_entry.instance_id == identity
