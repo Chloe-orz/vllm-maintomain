@@ -26,16 +26,15 @@ def resolve_lwd_config(
         return None, None
     if "edge_cloud_config" in additional_config:
         raise ValueError("[LWD] edge_cloud_config is retired; use lwd_config.path")
+    if "lwd_coordination" in additional_config:
+        raise ValueError(
+            "[LWD] Top-level lwd_coordination is retired; "
+            "move it into lwd_config.coordination"
+        )
     lwd = (
         LwdConfig.from_dict(additional_config["lwd_config"])
         if "lwd_config" in additional_config
         else None
     )
-    coordination = (
-        LwdCoordinationConfig.from_dict(additional_config["lwd_coordination"])
-        if "lwd_coordination" in additional_config
-        else None
-    )
-    if coordination is not None:
-        coordination.validate_role(lwd.role if lwd is not None else None)
-    return lwd, coordination
+    # Keep the downstream VllmConfig alias pointing at the one parsed snapshot.
+    return lwd, lwd.coordination if lwd is not None else None

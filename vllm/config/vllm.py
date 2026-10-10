@@ -1272,12 +1272,14 @@ class VllmConfig:
         if self.lwd_config is not None:
             logger.info(
                 "[LWD][config] metadata_only=True role=%s instance_id=%d "
-                "scene=%s dps=%s topology_digest=%s; execution is unchanged",
+                "scene=%s dps=%s topology_digest=%s coordination_enabled=%s; "
+                "execution is unchanged",
                 self.lwd_config.role,
                 self.lwd_config.instance_id,
                 self.lwd_config.topology.deployment.scene,
                 [(dp.dp_idx, dp.ranks) for dp in self.lwd_config.instance.dp],
                 self.lwd_config.topology.digest,
+                bool(self.lwd_coordination and self.lwd_coordination.enabled),
             )
             if self.lwd_api_config.requested:
                 logger.info(

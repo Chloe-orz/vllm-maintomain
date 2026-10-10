@@ -22,28 +22,31 @@ class LwdCoordinationConfig:
     connect_timeout: float = 10.0
 
     @classmethod
-    def from_dict(cls, raw: Any) -> "LwdCoordinationConfig":
+    def from_dict(
+        cls, raw: Any, *, cloud_id: int | None = None
+    ) -> "LwdCoordinationConfig":
         raw = _mapping(
-            raw, "lwd_coordination", set(), tuple(f.name for f in fields(cls))
+            raw, "lwd_config.coordination", set(), tuple(f.name for f in fields(cls))
         )
-        config = cls(**raw)
+        defaults = {} if cloud_id is None else {"instance_id": f"cloud-{cloud_id}"}
+        config = cls(**(defaults | raw))
         if type(config.enabled) is not bool:
-            raise ValueError("[LWD] lwd_coordination.enabled must be a boolean")
+            raise ValueError("[LWD] lwd_config.coordination.enabled must be a boolean")
         for name in ("control_url", "tenant_key_file", "consumer_id"):
             value = getattr(config, name)
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise ValueError(
-                    f"[LWD] lwd_coordination.{name} must be a non-empty string"
+                    f"[LWD] lwd_config.coordination.{name} must be a non-empty string"
                 )
         for name in ("listen_host", "instance_id"):
             value = getattr(config, name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(
-                    f"[LWD] lwd_coordination.{name} must be a non-empty string"
+                    f"[LWD] lwd_config.coordination.{name} must be a non-empty string"
                 )
         if type(config.listen_port) is not int or not 1 <= config.listen_port <= 65535:
             raise ValueError(
-                "[LWD] lwd_coordination.listen_port must be within 1..65535"
+                "[LWD] lwd_config.coordination.listen_port must be within 1..65535"
             )
         if (
             type(config.connect_timeout) not in (int, float)
