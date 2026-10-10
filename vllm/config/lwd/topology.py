@@ -17,8 +17,6 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-CLOUD_CARDS = 8
-
 
 def _mapping(
     value: Any, field: str, required: set[str], optional: tuple[str, ...] = ()
@@ -270,10 +268,16 @@ class LwdTopology:
                     f"[LWD] Linked edge={link.edge}, cloud={link.cloud} "
                     "must have matching DP indices"
                 )
-        if self.deployment.scene in ("cloud_share", "lwd_cluster"):
+        if self.deployment.scene in ("single_instance", "cloud_share", "lwd_cluster"):
             self._validate_cloud_reuse_layout()
-        elif self.deployment.scene == "edge_share":
-            self._validate_edge_share_layout()
+        elif (
+            self.deployment.scene == "edge_share"
+            and len({len(cloud.dp) for cloud in self.clouds}) != 1
+        ):
+            raise ValueError(
+                "[LWD] edge_share cloud instances must use the same DP count"
+            )
+        self._validate_cloud_layout()
         self._validate_control_ports()
         self._warn_layout_recommendations()
 
@@ -304,32 +308,30 @@ class LwdTopology:
                     )
                 endpoints.add(endpoint)
 
-    def _validate_edge_share_layout(self) -> None:
-        if len({len(cloud.dp) for cloud in self.clouds}) != 1:
-            raise ValueError(
-                "[LWD] edge_share cloud instances must use the same DP count"
-            )
-        machines: dict[str, list[LwdDP]] = {}
+    def _validate_cloud_layout(self) -> None:
+        machines: dict[str, list[LwdInstance]] = {}
         for cloud in self.clouds:
             if len({dp.addr for dp in cloud.dp}) != 1:
                 raise ValueError("[LWD] Cloud instance DPs must share one address")
-            machines.setdefault(cloud.dp[0].addr, []).extend(cloud.dp)
-        for machine_index, (addr, dps) in enumerate(machines.items()):
-            if CLOUD_CARDS % len(dps) or any(
-                len(dp.ranks) != CLOUD_CARDS // len(dps) for dp in dps
-            ):
-                raise ValueError(
-                    f"[LWD] Cloud machine {addr} must split eight ranks equally "
-                    "among its instances and DPs"
-                )
-            start = 1 + machine_index * CLOUD_CARDS
-            # Instance-major blocks match separate VISIBLE device sets in scripts.
-            ranks = [rank for dp in dps for rank in dp.ranks]
-            if ranks != list(range(start, start + CLOUD_CARDS)):
-                raise ValueError(
-                    f"[LWD] Cloud machine {addr} requires contiguous ranks in "
-                    "machine, instance and DP order"
-                )
+            machines.setdefault(cloud.dp[0].addr, []).append(cloud)
+        start = len(
+            {rank for edge in self.edges for dp in edge.dp for rank in dp.ranks}
+        )
+        for addr, clouds in machines.items():
+            for cloud in clouds:
+                if len({len(dp.ranks) for dp in cloud.dp}) != 1:
+                    raise ValueError(
+                        f"[LWD] Cloud instance {cloud.id} must split its ranks equally "
+                        "among its DPs"
+                    )
+                # Ranks describe assigned cards, not host capacity or device IDs.
+                ranks = [rank for dp in cloud.dp for rank in dp.ranks]
+                if ranks != list(range(start, start + len(ranks))):
+                    raise ValueError(
+                        f"[LWD] Cloud machine {addr} requires contiguous ranks in "
+                        "machine, instance and DP order"
+                    )
+                start += len(ranks)
 
     def _validate_scene(self) -> None:
         """Validate logical instance shape, independently of physical host count."""
@@ -402,48 +404,6 @@ class LwdTopology:
                 )
             if len({dp.addr for dp in edge.dp}) != 1:
                 raise ValueError("[LWD] Edge instance DPs must share one address")
-
-        cloud_machines: dict[str, list[LwdDP]] = {}
-        for cloud in self.clouds:
-            for dp in cloud.dp:
-                cloud_machines.setdefault(dp.addr, []).append(dp)
-        cloud_cards = CLOUD_CARDS
-        for machine_index, (addr, dps) in enumerate(cloud_machines.items()):
-            ranks = sorted(rank for dp in dps for rank in dp.ranks)
-            if len(ranks) != cloud_cards or ranks != list(
-                range(ranks[0], ranks[0] + cloud_cards)
-            ):
-                raise ValueError(
-                    f"[LWD] Cloud machine {addr} must own eight contiguous ranks"
-                )
-            expected_start = len(self.edges) + machine_index * cloud_cards
-            if ranks[0] != expected_start:
-                raise ValueError(
-                    f"[LWD] Cloud machine {addr} ranks must follow machine "
-                    f"declaration order: expected start {expected_start}, "
-                    f"got {ranks[0]}"
-                )
-            if cloud_cards % len(dps) or any(
-                len(dp.ranks) != cloud_cards // len(dps) for dp in dps
-            ):
-                raise ValueError(
-                    f"[LWD] Cloud machine {addr} must split eight ranks "
-                    "equally among its DPs"
-                )
-            # Stable sorting preserves instance declaration order for ties.
-            for index, dp in enumerate(sorted(dps, key=lambda item: item.dp_idx)):
-                start = ranks[0] + index * (cloud_cards // len(dps))
-                if dp.ranks != tuple(range(start, start + len(dp.ranks))):
-                    raise ValueError(
-                        f"[LWD] Cloud machine {addr} DP ranks must be ordered "
-                        "contiguous blocks in DP-index order"
-                    )
-        expected_world = len(self.edges) + cloud_cards * len(cloud_machines)
-        if self.deployment.hccl_world_size != expected_world:
-            raise ValueError(
-                "[LWD] Cloud reuse hccl_world_size must equal "
-                "edge instance count + 8 * cloud machine count"
-            )
 
     def downstream_clouds(self, edge_id: int) -> tuple[LwdInstance, ...]:
         """Return only clouds explicitly linked to this edge instance."""

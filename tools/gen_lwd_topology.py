@@ -5,14 +5,12 @@
 import argparse
 import importlib.util
 import sys
-from collections import Counter
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-CLOUD_CARDS = 8
 SCENES = ("single_instance", "edge_share", "cloud_share", "lwd_cluster")
 
 
@@ -55,23 +53,19 @@ def _edge_instances(scene: str, value: str, cloud_count: int) -> list[tuple[int,
 
 
 def _cloud_layout(
-    instances: list[tuple[int, str]], dp: int, edge_rank_count: int, port_base: int
+    instances: list[tuple[int, str, int]], dp: int, edge_rank_count: int, port_base: int
 ) -> list[dict[str, Any]]:
-    counts = Counter(address for _, address in instances)
-    machines = list(counts)
-    offsets: Counter[str] = Counter()
+    machines = dict.fromkeys(address for _, address, _ in instances)
+    starts = {}
+    next_rank = edge_rank_count
+    for address in machines:
+        starts[address] = next_rank
+        next_rank += sum(cards for _, host, cards in instances if host == address)
     clouds = []
-    for identity, address in instances:
-        divisions = counts[address] * dp
-        if CLOUD_CARDS % divisions:
-            raise ValueError(
-                "Eight cloud cards must divide evenly among instances * DP"
-            )
-        per_dp = CLOUD_CARDS // divisions
-        # Each host owns one rank block; colocated instances partition that block.
-        base = (
-            edge_rank_count + machines.index(address) * CLOUD_CARDS + offsets[address]
-        )
+    for identity, address, cards in instances:
+        per_dp = cards // dp
+        # Host blocks contain only the cards explicitly assigned to instances.
+        base = starts[address]
         clouds.append(
             {
                 "id": identity,
@@ -88,22 +82,52 @@ def _cloud_layout(
                 ],
             }
         )
-        offsets[address] += per_dp * dp
+        starts[address] += cards
     return clouds
 
 
+def _cloud_instances(machines: str, cards: str, dp: int) -> list[tuple[int, str, int]]:
+    instances = _instances(machines)
+    allocations: dict[int, int] = {}
+    for item in cards.split(","):
+        parts = [part.strip() for part in item.split(":")]
+        if len(parts) != 2 or not all(
+            part.isascii() and part.isdecimal() for part in parts
+        ):
+            raise ValueError("--cloud-cards requires ID:count entries")
+        identity, count = map(int, parts)
+        if identity in allocations:
+            raise ValueError("--cloud-cards contains a duplicate instance ID")
+        if count < 1 or count % dp:
+            raise ValueError(
+                "Each cloud card count must be positive and divisible by DP"
+            )
+        allocations[identity] = count
+    if set(allocations) != {identity for identity, _ in instances}:
+        raise ValueError("--cloud-cards must specify every cloud instance exactly once")
+    return [
+        (identity, address, allocations[identity]) for identity, address in instances
+    ]
+
+
 def build_topology(
-    scene: str, edge_machines: str, cloud_machines: str, dp: int, port_base: int
+    scene: str,
+    edge_machines: str,
+    cloud_machines: str,
+    dp: int,
+    port_base: int,
+    *,
+    cloud_cards: str,
 ) -> dict[str, Any]:
     """Allocate global ranks; host-local physical devices remain launch settings."""
     if scene not in SCENES:
         raise ValueError(f"Unknown scene: {scene}")
-    if dp not in (1, 2, 4, 8):
-        raise ValueError("DP must be one integer in 1, 2, 4, 8")
+    if type(dp) is not int or dp < 1:
+        raise ValueError("DP must be one positive integer")
     if not 1 <= port_base <= 65535 - dp + 1:
         raise ValueError("All generated control ports must be within 1..65535")
-    cloud_instances = _instances(cloud_machines)
-    cloud_addresses = {address for _, address in cloud_instances}
+    cloud_instances = _cloud_instances(cloud_machines, cloud_cards, dp)
+    cloud_addresses = {address for _, address, _ in cloud_instances}
     if scene != "edge_share" and len(cloud_addresses) != len(cloud_instances):
         raise ValueError("Colocated cloud instances require scene=edge_share")
     instances = _edge_instances(scene, edge_machines, len(cloud_instances))
@@ -135,7 +159,7 @@ def build_topology(
         "deployment": {
             "mode": 0,
             "scene": scene,
-            "hccl_world_size": edge_rank_count + CLOUD_CARDS * len(cloud_addresses),
+            "hccl_world_size": edge_rank_count + sum(c for _, _, c in cloud_instances),
             "edges_num": len(edges),
             "clouds_num": len(clouds),
         },
@@ -170,7 +194,14 @@ def main() -> None:
         required=True,
         help="Comma-separated IPs or ID@IP entries; edge_share permits repeated hosts",
     )
-    parser.add_argument("--dp", type=int, choices=(1, 2, 4, 8), default=1)
+    parser.add_argument(
+        "--cloud-cards",
+        required=True,
+        help="Cards per logical cloud instance, e.g. 0:4,1:8; not physical NPU IDs",
+    )
+    parser.add_argument(
+        "--dp", type=int, default=1, help="Must divide each cloud card count"
+    )
     parser.add_argument("--port-base", type=int, default=5550)
     parser.add_argument("--enable-early-recv", action="store_true")
     parser.add_argument("--enable-scramble", action="store_true")
@@ -180,7 +211,12 @@ def main() -> None:
     args = parser.parse_args()
     try:
         raw = build_topology(
-            args.scene, args.edge_machines, args.cloud_machines, args.dp, args.port_base
+            args.scene,
+            args.edge_machines,
+            args.cloud_machines,
+            args.dp,
+            args.port_base,
+            cloud_cards=args.cloud_cards,
         )
         raw["feature_ctrl"] = {
             "enable_early_recv": args.enable_early_recv,

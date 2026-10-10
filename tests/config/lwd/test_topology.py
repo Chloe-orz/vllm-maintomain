@@ -101,7 +101,7 @@ def test_role_and_instance_lookup_does_not_fall_back() -> None:
     [
         ("different_channel", "same ctrl_port"),
         ("dp_port_alias", "different ctrl_port"),
-        ("unequal_partition", "split eight ranks equally"),
+        ("unequal_partition", "split its ranks equally"),
         ("rank_order", "contiguous ranks"),
         ("split_instance", "share one address"),
         ("mixed_dp_counts", "same DP count"),

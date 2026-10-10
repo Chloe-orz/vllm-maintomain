@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from lwd_config_under_test import LwdTopology
 
 ROOT = Path(__file__).resolve().parents[3]
 GENERATOR = ROOT / "tools/gen_lwd_topology.py"
@@ -23,7 +24,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
     ],
 )
 @pytest.mark.parametrize("dp", [1, 2])
-def test_legacy_commands_reproduce_original_payloads(
+def test_explicit_card_counts_reproduce_original_payloads(
     tmp_path: Path, scene: str, edges: str, clouds: str, prefix: str, dp: int
 ) -> None:
     output = tmp_path / "topology.yaml"
@@ -37,6 +38,8 @@ def test_legacy_commands_reproduce_original_payloads(
             edges,
             "--cloud-machines",
             clouds,
+            "--cloud-cards",
+            "0:8" if prefix in ("s1", "s3") else "0:8,1:8",
             "--dp",
             str(dp),
             "-o",
@@ -62,6 +65,8 @@ def test_explicit_colocated_ids_generate_independent_ranks(tmp_path: Path) -> No
             "1@76.76.26.17,0@76.76.26.17",
             "--cloud-machines",
             "76.76.26.232",
+            "--cloud-cards",
+            "0:8",
             "--dp",
             "2",
             "--port-base",
@@ -105,6 +110,8 @@ def test_invalid_inputs_do_not_overwrite_existing_yaml(
             edges,
             "--cloud-machines",
             "10.1.0.1",
+            "--cloud-cards",
+            "0:8",
             "--dp",
             dp,
             "-o",
@@ -117,21 +124,36 @@ def test_invalid_inputs_do_not_overwrite_existing_yaml(
 
 
 @pytest.mark.parametrize(
-    "clouds,dp,expected_ranks,world",
+    "clouds,cards,dp,expected_ranks,world",
     [
-        ("1@10.1.0.1,0@10.1.0.1", 1, [[[1, 2, 3, 4]], [[5, 6, 7, 8]]], 9),
-        ("0@10.1.0.1,1@10.1.0.1", 2, [[[1, 2], [3, 4]], [[5, 6], [7, 8]]], 9),
-        ("10.1.0.1,10.1.0.2", 1, [[list(range(1, 9))], [list(range(9, 17))]], 17),
+        ("0@10.1.0.1,1@10.1.0.1", "0:2,1:4", 2, [[[1], [2]], [[3, 4], [5, 6]]], 7),
+        ("0@10.1.0.1,1@10.1.0.2", "0:4,1:2", 1, [[[1, 2, 3, 4]], [[5, 6]]], 7),
+        ("1@10.1.0.1,0@10.1.0.1", "1:4,0:4", 1, [[[1, 2, 3, 4]], [[5, 6, 7, 8]]], 9),
+        (
+            "0@10.1.0.1,1@10.1.0.1",
+            "0:4,1:4",
+            2,
+            [[[1, 2], [3, 4]], [[5, 6], [7, 8]]],
+            9,
+        ),
+        (
+            "10.1.0.1,10.1.0.2",
+            "0:8,1:8",
+            1,
+            [[list(range(1, 9))], [list(range(9, 17))]],
+            17,
+        ),
         (
             "0@10.1.0.1,1@10.1.0.2",
+            "0:8,1:8",
             2,
             [[[1, 2, 3, 4], [5, 6, 7, 8]], [[9, 10, 11, 12], [13, 14, 15, 16]]],
             17,
         ),
     ],
 )
-def test_edge_share_allocates_per_physical_cloud(
-    tmp_path: Path, clouds: str, dp: int, expected_ranks: list, world: int
+def test_edge_share_allocates_explicit_cards_per_instance(
+    tmp_path: Path, clouds: str, cards: str, dp: int, expected_ranks: list, world: int
 ) -> None:
     output = tmp_path / "topology.yaml"
     subprocess.run(
@@ -144,6 +166,8 @@ def test_edge_share_allocates_per_physical_cloud(
             "10.0.0.1",
             "--cloud-machines",
             clouds,
+            "--cloud-cards",
+            cards,
             "--dp",
             str(dp),
             "--port-base",
@@ -191,6 +215,8 @@ def test_invalid_cloud_allocation_preserves_output(
             "10.0.0.1",
             "--cloud-machines",
             clouds,
+            "--cloud-cards",
+            "0:4,1:4",
             "--dp",
             dp,
             "--port-base",
@@ -202,3 +228,82 @@ def test_invalid_cloud_allocation_preserves_output(
     )
     assert result.returncode != 0
     assert output.read_text() == "preserve this file\n"
+
+
+@pytest.mark.parametrize(
+    "scene,edges",
+    [
+        ("single_instance", "10.0.0.1"),
+        ("cloud_share", "0@10.0.0.1,1@10.0.0.1"),
+    ],
+)
+@pytest.mark.parametrize("cards,dp", [(4, 1), (4, 2), (16, 2)])
+def test_cloud_size_is_not_inferred_from_host_address(
+    tmp_path: Path, scene: str, edges: str, cards: int, dp: int
+) -> None:
+    output = tmp_path / "topology.yaml"
+    subprocess.run(
+        [
+            sys.executable,
+            str(GENERATOR),
+            "--scene",
+            scene,
+            "--edge-machines",
+            edges,
+            "--cloud-machines",
+            "10.1.0.1",
+            "--cloud-cards",
+            f"0:{cards}",
+            "--dp",
+            str(dp),
+            "-o",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    topology = LwdTopology.from_file(str(output))
+    edge_count = 1 if scene == "single_instance" else 2
+    assert topology.deployment.hccl_world_size == edge_count + cards
+    assert [len(d.ranks) for d in topology.clouds[0].dp] == [cards // dp] * dp
+
+
+@pytest.mark.parametrize(
+    "cards,dp,match",
+    [
+        (None, "1", "required"),
+        ("0:0", "1", "positive"),
+        ("0:-1", "1", "ID:count"),
+        ("0:3", "2", "divisible"),
+        ("0:4,0:4", "1", "duplicate"),
+        ("1:4", "1", "every cloud instance"),
+        ("0:4,1:4", "1", "every cloud instance"),
+        ("4", "1", "ID:count"),
+        ("0:4", "0", "positive integer"),
+    ],
+)
+def test_invalid_card_counts_preserve_existing_yaml(
+    tmp_path: Path, cards: str | None, dp: str, match: str
+) -> None:
+    output = tmp_path / "topology.yaml"
+    output.write_text("keep existing yaml\n")
+    command = [
+        sys.executable,
+        str(GENERATOR),
+        "--scene",
+        "single_instance",
+        "--edge-machines",
+        "10.0.0.1",
+        "--cloud-machines",
+        "10.1.0.1",
+        "--dp",
+        dp,
+        "-o",
+        str(output),
+    ]
+    if cards is not None:
+        command.extend(["--cloud-cards", cards])
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert match in result.stderr
+    assert output.read_text() == "keep existing yaml\n"
