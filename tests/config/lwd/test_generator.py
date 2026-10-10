@@ -18,8 +18,8 @@ FIXTURES = Path(__file__).parent / "fixtures"
     "scene,edges,clouds,prefix",
     [
         ("single_instance", "10.0.0.1", "10.1.0.1", "s1"),
-        ("edge_share", "10.0.0.1", "10.1.0.1,10.1.0.2", "s2"),
-        ("cloud_share", "10.0.0.1,10.0.0.2", "10.1.0.1", "s3"),
+        ("edge_share", "10.0.0.1", "0@10.1.0.1,1@10.1.0.2", "s2"),
+        ("cloud_share", "0@10.0.0.1,1@10.0.0.2", "10.1.0.1", "s3"),
         ("lwd_cluster", "10.0.0.1,10.0.0.2", "10.1.0.1,10.1.0.2", "s4"),
     ],
 )
@@ -92,7 +92,7 @@ def test_explicit_colocated_ids_generate_independent_ranks(tmp_path: Path) -> No
         ("0@10.0.0.1,0@10.0.0.2", "1"),
         ("0@10.0.0.1,2@10.0.0.2", "1"),
         ("0@10.0.0.1,10.0.0.2", "1"),
-        ("10.0.0.1,10.0.0.2", "1,2"),
+        ("0@10.0.0.1,1@10.0.0.2", "1,2"),
     ],
 )
 def test_invalid_inputs_do_not_overwrite_existing_yaml(
@@ -137,7 +137,7 @@ def test_invalid_inputs_do_not_overwrite_existing_yaml(
             9,
         ),
         (
-            "10.1.0.1,10.1.0.2",
+            "0@10.1.0.1,1@10.1.0.2",
             "0:8,1:8",
             1,
             [[list(range(1, 9))], [list(range(9, 17))]],
@@ -197,7 +197,7 @@ def test_edge_share_allocates_explicit_cards_per_instance(
         ("10.1.0.1,10.1.0.1", "1", "6020"),
         ("0@10.1.0.1,1@10.1.0.1,2@10.1.0.1", "1", "6020"),
         ("0@10.1.0.1,1@10.1.0.1", "8", "6020"),
-        ("10.1.0.1,10.1.0.2", "2", "65535"),
+        ("0@10.1.0.1,1@10.1.0.2", "2", "65535"),
     ],
 )
 def test_invalid_cloud_allocation_preserves_output(
@@ -304,6 +304,60 @@ def test_invalid_card_counts_preserve_existing_yaml(
     if cards is not None:
         command.extend(["--cloud-cards", cards])
     result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert match in result.stderr
+    assert output.read_text() == "keep existing yaml\n"
+
+
+@pytest.mark.parametrize(
+    "scene,edges,clouds,cards,match",
+    [
+        (
+            "edge_share",
+            "10.0.0.1",
+            "10.1.0.1,10.1.0.2",
+            "0:4,1:4",
+            "--cloud-machines ID@IP",
+        ),
+        (
+            "edge_share",
+            "0@10.0.0.1,1@10.0.0.1",
+            "0@10.1.0.1,1@10.1.0.1",
+            "0:4,1:4",
+            "one plain edge IP",
+        ),
+        (
+            "cloud_share",
+            "10.0.0.1,10.0.0.2",
+            "10.1.0.1",
+            "0:8",
+            "--edge-machines ID@IP",
+        ),
+    ],
+)
+def test_scene_requires_ids_only_where_instances_are_listed(
+    tmp_path: Path, scene: str, edges: str, clouds: str, cards: str, match: str
+) -> None:
+    output = tmp_path / "topology.yaml"
+    output.write_text("keep existing yaml\n")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(GENERATOR),
+            "--scene",
+            scene,
+            "--edge-machines",
+            edges,
+            "--cloud-machines",
+            clouds,
+            "--cloud-cards",
+            cards,
+            "-o",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+    )
     assert result.returncode != 0
     assert match in result.stderr
     assert output.read_text() == "keep existing yaml\n"

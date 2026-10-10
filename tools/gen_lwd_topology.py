@@ -42,14 +42,16 @@ def _instances(value: str) -> list[tuple[int, str]]:
 
 
 def _edge_instances(scene: str, value: str, cloud_count: int) -> list[tuple[int, str]]:
-    if "@" in value:
-        return _instances(value)
-    addresses = _addresses(value)
     if scene == "edge_share":
-        if len(addresses) != 1:
-            raise ValueError("edge_share requires one edge machine")
-        addresses *= cloud_count
-    return list(enumerate(addresses))
+        if "@" in value or "," in value:
+            raise ValueError(
+                "edge_share requires one plain edge IP; edge IDs follow cloud IDs"
+            )
+        address = _addresses(value)[0]
+        return [(identity, address) for identity in range(cloud_count)]
+    if scene == "cloud_share" and "@" not in value:
+        raise ValueError("cloud_share requires --edge-machines ID@IP entries")
+    return _instances(value)
 
 
 def _cloud_layout(
@@ -126,6 +128,8 @@ def build_topology(
         raise ValueError("DP must be one positive integer")
     if not 1 <= port_base <= 65535 - dp + 1:
         raise ValueError("All generated control ports must be within 1..65535")
+    if scene == "edge_share" and "@" not in cloud_machines:
+        raise ValueError("edge_share requires --cloud-machines ID@IP entries")
     cloud_instances = _cloud_instances(cloud_machines, cloud_cards, dp)
     cloud_addresses = {address for _, address, _ in cloud_instances}
     if scene != "edge_share" and len(cloud_addresses) != len(cloud_instances):
@@ -187,12 +191,12 @@ def main() -> None:
     parser.add_argument(
         "--edge-machines",
         required=True,
-        help="Comma-separated IPs or ID@IP entries; never physical NPU IDs",
+        help="S1: one IP; S2: one shared edge IP; S3: explicit ID@IP per edge",
     )
     parser.add_argument(
         "--cloud-machines",
         required=True,
-        help="Comma-separated IPs or ID@IP entries; edge_share permits repeated hosts",
+        help="S1/S3: one IP; S2: explicit ID@IP per cloud, including repeated hosts",
     )
     parser.add_argument(
         "--cloud-cards",
