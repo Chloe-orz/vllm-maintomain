@@ -40,7 +40,13 @@ from .kv_events import KVEventsConfig
 from .kv_transfer import KVTransferConfig
 from .load import LoadConfig
 from .lora import LoRAConfig
-from .lwd import LwdAPIConfig, LwdConfig, LwdCoordinationConfig, resolve_lwd_config
+from .lwd import (
+    LwdAPIConfig,
+    LwdConfig,
+    LwdCoordinationConfig,
+    log_lwd_config,
+    resolve_lwd_config,
+)
 from .mamba import MambaBackendEnum, MambaConfig
 from .model import ModelConfig
 from .observability import ObservabilityConfig
@@ -1288,6 +1294,7 @@ class VllmConfig:
                     self.lwd_api_config.api_server_rpc_port,
                     self.lwd_api_config.api_server_attach,
                 )
+            log_lwd_config(logger, self.lwd_config, self.lwd_api_config)
 
         self._resolve_mm_encoder_only()
 
