@@ -7,8 +7,6 @@ from pathlib import Path
 import pytest
 from lwd_config_under_test import LwdAPIConfig, LwdConfig
 
-FIXTURES = Path(__file__).parent / "fixtures"
-
 
 @pytest.mark.parametrize(
     "value",
@@ -66,7 +64,9 @@ def test_api_launch_rejects_incompatible_identity_and_frontend(
         LwdAPIConfig.from_namespace(args)
 
 
-def test_api_requires_edge_share_topology_but_is_optional_for_centralized() -> None:
+def test_api_requires_edge_share_topology_but_is_optional_for_centralized(
+    lwd_yaml_dir: Path,
+) -> None:
     LwdAPIConfig().validate_topology(None)
     assert not LwdAPIConfig.from_namespace(argparse.Namespace()).requested
     api = LwdAPIConfig(api_server_rpc_port="10.0.0.1:25100")
@@ -78,7 +78,7 @@ def test_api_requires_edge_share_topology_but_is_optional_for_centralized() -> N
         api.validate_topology(None)
     entry = LwdConfig.from_dict(
         {
-            "path": str(FIXTURES / "s3_cloud_share_1dp.yaml"),
+            "path": str(lwd_yaml_dir / "s3_cloud_share_1dp.yaml"),
             "role": "edge",
             "instance_id": 0,
         }

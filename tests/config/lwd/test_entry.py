@@ -9,12 +9,14 @@ from pathlib import Path
 import pytest
 from lwd_config_under_test import LwdAPIConfig, LwdConfig, resolve_lwd_config
 
-FIXTURE = Path(__file__).parent / "fixtures/s3_cloud_share_2dp.yaml"
+FIXTURE_NAME = "s3_cloud_share_2dp.yaml"
 
 
-def test_snapshot_survives_handoff_without_yaml_or_key_access(tmp_path: Path) -> None:
+def test_snapshot_survives_handoff_without_yaml_or_key_access(
+    tmp_path: Path, lwd_yaml_dir: Path
+) -> None:
     path = tmp_path / "topology.yaml"
-    path.write_bytes(FIXTURE.read_bytes())
+    path.write_bytes((lwd_yaml_dir / FIXTURE_NAME).read_bytes())
     raw = {
         "lwd_config": {
             "path": str(path),
@@ -56,8 +58,15 @@ def test_absent_lwd_leaves_centralized_configuration_empty(raw: object) -> None:
         ({"scheduler": "mixed"}, "unknown fields"),
     ],
 )
-def test_invalid_entry_fails_during_configuration(change: dict, match: str) -> None:
-    entry = {"path": str(FIXTURE), "role": "edge", "instance_id": 0, **change}
+def test_invalid_entry_fails_during_configuration(
+    change: dict, match: str, lwd_yaml_dir: Path
+) -> None:
+    entry = {
+        "path": str(lwd_yaml_dir / FIXTURE_NAME),
+        "role": "edge",
+        "instance_id": 0,
+        **change,
+    }
     with pytest.raises(ValueError, match=match):
         resolve_lwd_config({"lwd_config": entry})
 
@@ -76,12 +85,14 @@ def test_invalid_entry_fails_during_configuration(change: dict, match: str) -> N
         {"unknown": 1},
     ],
 )
-def test_invalid_coordination_is_not_silently_forwarded(coordination: object) -> None:
+def test_invalid_coordination_is_not_silently_forwarded(
+    coordination: object, lwd_yaml_dir: Path
+) -> None:
     with pytest.raises(ValueError):
         resolve_lwd_config(
             {
                 "lwd_config": {
-                    "path": str(FIXTURE),
+                    "path": str(lwd_yaml_dir / FIXTURE_NAME),
                     "role": "edge",
                     "instance_id": 0,
                     "coordination": coordination,
@@ -93,11 +104,12 @@ def test_invalid_coordination_is_not_silently_forwarded(coordination: object) ->
 @pytest.mark.parametrize("with_entry", [False, True])
 def test_legacy_coordination_cannot_shadow_nested_configuration(
     with_entry: bool,
+    lwd_yaml_dir: Path,
 ) -> None:
     raw: dict[str, object] = {"lwd_coordination": {"enabled": False}}
     if with_entry:
         raw["lwd_config"] = {
-            "path": str(FIXTURE),
+            "path": str(lwd_yaml_dir / FIXTURE_NAME),
             "role": "edge",
             "instance_id": 0,
             "coordination": {"enabled": False},
@@ -107,10 +119,12 @@ def test_legacy_coordination_cannot_shadow_nested_configuration(
 
 
 @pytest.mark.parametrize("cloud_id", [0, 1])
-def test_cloud_coordination_name_defaults_to_selected_cloud(cloud_id: int) -> None:
+def test_cloud_coordination_name_defaults_to_selected_cloud(
+    cloud_id: int, lwd_yaml_dir: Path
+) -> None:
     supplied = {"enabled": True, "listen_port": 9133}
     entry = {
-        "path": str(FIXTURE.parent / "s2_edge_share_1dp.yaml"),
+        "path": str(lwd_yaml_dir / "s2_edge_share_1dp.yaml"),
         "role": "cloud",
         "instance_id": cloud_id,
         "coordination": supplied,
@@ -121,11 +135,11 @@ def test_cloud_coordination_name_defaults_to_selected_cloud(cloud_id: int) -> No
     assert "instance_id" not in supplied
 
 
-def test_absent_coordination_stays_disabled() -> None:
+def test_absent_coordination_stays_disabled(lwd_yaml_dir: Path) -> None:
     selected, coordination = resolve_lwd_config(
         {
             "lwd_config": {
-                "path": str(FIXTURE),
+                "path": str(lwd_yaml_dir / FIXTURE_NAME),
                 "role": "cloud",
                 "instance_id": 0,
             }
@@ -138,7 +152,7 @@ def test_absent_coordination_stays_disabled() -> None:
     "identity,flag", [(0, "--api-server-rpc-port"), (1, "--api-server-attach")]
 )
 def test_api_cli_metadata_survives_snapshot_handoff(
-    tmp_path: Path, identity: int, flag: str
+    tmp_path: Path, identity: int, flag: str, lwd_yaml_dir: Path
 ) -> None:
     parser = argparse.ArgumentParser()
     LwdAPIConfig.add_cli_args(parser)
@@ -154,7 +168,7 @@ def test_api_cli_metadata_survives_snapshot_handoff(
     }
     # CLI identity checks do not read a YAML file; the snapshot owns that read.
     api = LwdAPIConfig.from_namespace(args)
-    path.write_bytes((FIXTURE.parent / "s2_edge_share_2dp.yaml").read_bytes())
+    path.write_bytes((lwd_yaml_dir / "s2_edge_share_2dp.yaml").read_bytes())
     entry = LwdConfig.from_dict(args.additional_config["lwd_config"])
     api.validate_topology(entry)
     path.unlink()

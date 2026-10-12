@@ -4,19 +4,19 @@
 from pathlib import Path
 
 import pytest
-import yaml
 from lwd_config_under_test import LwdTopology
-
-FIXTURES = Path(__file__).parent / "fixtures"
+from sample_topologies import PAYLOADS, topology_payload
 
 
 def cloud_reuse(dp: int = 2) -> dict:
-    return yaml.safe_load((FIXTURES / f"s3_cloud_share_{dp}dp.yaml").read_text())
+    return topology_payload(f"s3_cloud_share_{dp}dp.yaml")
 
 
-@pytest.mark.parametrize("path", sorted(FIXTURES.glob("*.yaml")), ids=lambda p: p.stem)
-def test_original_eight_layouts_keep_rank_and_link_contract(path: Path) -> None:
-    topology = LwdTopology.from_file(str(path))
+@pytest.mark.parametrize("name", sorted(PAYLOADS))
+def test_original_eight_layouts_keep_rank_and_link_contract(
+    name: str, lwd_yaml_dir: Path
+) -> None:
+    topology = LwdTopology.from_file(str(lwd_yaml_dir / name))
     expected = {
         "single_instance": (9, 1),
         "edge_share": (17, 2),
@@ -110,7 +110,7 @@ def test_role_and_instance_lookup_does_not_fall_back() -> None:
 def test_edge_share_rejects_ambiguous_channels_and_card_layouts(
     fault: str, match: str
 ) -> None:
-    raw = yaml.safe_load((FIXTURES / "s2_edge_share_2dp.yaml").read_text())
+    raw = topology_payload("s2_edge_share_2dp.yaml")
     if fault == "different_channel":
         raw["clouds"][1]["dp"][0]["ctrl_port"] += 10
     elif fault == "dp_port_alias":

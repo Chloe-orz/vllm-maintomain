@@ -8,10 +8,10 @@ from pathlib import Path
 import pytest
 import yaml
 from lwd_config_under_test import LwdTopology
+from sample_topologies import topology_payload
 
 ROOT = Path(__file__).resolve().parents[3]
 GENERATOR = ROOT / "tools/gen_lwd_topology.py"
-FIXTURES = Path(__file__).parent / "fixtures"
 
 
 @pytest.mark.parametrize(
@@ -48,7 +48,7 @@ def test_explicit_card_counts_reproduce_original_payloads(
         check=True,
         capture_output=True,
     )
-    expected = yaml.safe_load((FIXTURES / f"{prefix}_{scene}_{dp}dp.yaml").read_text())
+    expected = topology_payload(f"{prefix}_{scene}_{dp}dp.yaml")
     assert yaml.safe_load(output.read_text()) == expected
     assert list(tmp_path.iterdir()) == [output]
 
