@@ -40,6 +40,11 @@ from .kv_events import KVEventsConfig
 from .kv_transfer import KVTransferConfig
 from .load import LoadConfig
 from .lora import LoRAConfig
+from .lwd import (
+    LwdConfig,
+    log_lwd_config,
+    resolve_lwd_config,
+)
 from .mamba import MambaBackendEnum, MambaConfig
 from .model import ModelConfig
 from .observability import ObservabilityConfig
@@ -435,6 +440,8 @@ class VllmConfig:
     """Additional config for specified platform. Different platforms may
     support different configs. Make sure the configs are valid for the platform
     you are using. Contents must be hashable."""
+    lwd_config: LwdConfig | None = None
+    """Parsed LWD topology, coordination and API metadata; does not enable execution."""
     instance_id: str = ""
     """The ID of the vLLM instance."""
     optimization_level: OptimizationLevel = OptimizationLevel.O2
@@ -1256,6 +1263,33 @@ class VllmConfig:
 
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
+
+        # EngineArgs supplies a complete snapshot; direct callers can use raw input.
+        if self.lwd_config is None:
+            self.lwd_config = resolve_lwd_config(self.additional_config)
+        if self.lwd_config is not None:
+            logger.info(
+                "[LWD][config] metadata_only=True role=%s instance_id=%d "
+                "scene=%s dps=%s topology_digest=%s coordination_enabled=%s; "
+                "execution is unchanged",
+                self.lwd_config.role,
+                self.lwd_config.instance_id,
+                self.lwd_config.topology.deployment.scene,
+                [(dp.dp_idx, dp.ranks) for dp in self.lwd_config.instance.dp],
+                self.lwd_config.topology.digest,
+                bool(
+                    self.lwd_config.coordination
+                    and self.lwd_config.coordination.enabled
+                ),
+            )
+            if self.lwd_config.api.requested:
+                logger.info(
+                    "[LWD][config] metadata_only=True api_server_rpc_port=%s "
+                    "api_server_attach=%s; API attachment is not enabled",
+                    self.lwd_config.api.api_server_rpc_port,
+                    self.lwd_config.api.api_server_attach,
+                )
+            log_lwd_config(logger, self.lwd_config)
 
         self._resolve_mm_encoder_only()
 
