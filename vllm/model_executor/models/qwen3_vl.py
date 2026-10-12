@@ -134,6 +134,7 @@ from .utils import (
     PPMissingLayer,
     WeightsMapper,
     _merge_multimodal_embeddings,
+    lwd_skips_module,
     maybe_prefix,
 )
 from .vision import (
@@ -1669,15 +1670,21 @@ class Qwen3VLForConditionalGeneration(
         self.multiscale_dim = self.visual_dim * self.deepstack_num_level
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.visual = Qwen3_VisionTransformer(
-                config.vision_config,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "visual"),
-            )
+            if lwd_skips_module(vllm_config, maybe_prefix(prefix, "visual")):
+                # LWD cloud: the tower never runs (embeddings are computed by the
+                # edge), so only a placeholder is installed to keep the name in
+                # the module tree for weight loading.
+                self.visual = PPMissingLayer()
+            else:
+                self.visual = Qwen3_VisionTransformer(
+                    config.vision_config,
+                    norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "visual"),
+                )
 
             # register buffer for deepstack
-            if self.use_deepstack:
+            if self.use_deepstack and not isinstance(self.visual, PPMissingLayer):
                 self.deepstack_input_embeds = [
                     torch.zeros(
                         vllm_config.scheduler_config.max_num_batched_tokens,

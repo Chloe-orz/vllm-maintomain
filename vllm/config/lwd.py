@@ -26,6 +26,17 @@ from typing import Any, Sequence
 _VALID_LWD_ROLES = ("edge", "cloud")
 _VALID_LWD_MODES = ("head_tail", "embedding_only", "prefill_only")
 
+# Modules a role must never build, expressed as dotted-path suffixes rather than
+# bare attribute names, so that a same-named child elsewhere -- e.g. Qwen3-VL's
+# ``visual.merger.norm`` -- is not caught by the edge rule:
+#   edge : the language model's trailing norm. The edge only embeds and
+#          unembeds; the hidden states it receives are already post-norm and
+#          its ``compute_logits`` only applies ``lm_head``.
+#   cloud: the multimodal tower. The cloud is fed edge-computed embeddings, so
+#          ``embed_multimodal`` is never called.
+_EDGE_UNUSED_MODULE_SUFFIXES = ("model.norm",)
+_CLOUD_UNUSED_MODULE_SUFFIXES = ("visual",)
+
 
 def _parse_lwd_layer_split(value: Any) -> tuple[int, int]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
@@ -94,6 +105,33 @@ class LwdConfig:
                 return set()
             return (set(range(head_k)) | set(range(num_hidden_layers - tail_k, num_hidden_layers)))
         return set(range(head_k, num_hidden_layers - tail_k))
+
+    def skips_module(self, path: str) -> bool:
+        """Whether this role must not build the module at dotted *path*.
+
+        Not building the module keeps it out of device memory and out of
+        ``named_parameters()``, which is what lets each side of an LWD
+        deployment start from only its own slice of a checkpoint:
+        ``DefaultModelLoader.track_weights_loading`` rejects parameters whose
+        weights are not in the checkpoint.
+
+        Args:
+            path: Dotted module path relative to the model root, e.g.
+                ``model.language_model.model.norm``.
+
+        Returns:
+            ``True`` when the module must not be built on this role.
+        """
+        if not self.enabled or self.mode != "prefill_only":
+            # ``head_tail``/``embedding_only`` keep the tail on the edge, so the
+            # trailing norm stays live there.
+            return False
+        suffixes = (
+            _EDGE_UNUSED_MODULE_SUFFIXES
+            if self.is_edge
+            else _CLOUD_UNUSED_MODULE_SUFFIXES
+        )
+        return any(path == suffix or path.endswith("." + suffix) for suffix in suffixes)
 
     def __repr__(self) -> str:
         return (f"[LWD] config(enabled={self.enabled}, role={self.role!r}, "

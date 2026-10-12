@@ -914,6 +914,25 @@ class VllmConfig:
                 else parallel_lwd.cloud_npu_count
             )
 
+            # The LWD cloud never tokenizes and never encodes media: requests are
+            # tokenized by the edge and reach the cloud as token ids / prompt
+            # embeddings. Neither the tokenizer nor the multimodal processor
+            # (which loads a tokenizer) is needed here, and skipping both lets
+            # the cloud be deployed with only its own slice of a checkpoint.
+            if self.lwd_config.mode == "prefill_only" and not self.lwd_config.is_edge:
+                if self.model_config is not None:
+                    self.model_config.skip_tokenizer_init = True
+                    multimodal_config = getattr(
+                        self.model_config, "multimodal_config", None
+                    )
+                    if multimodal_config is not None:
+                        multimodal_config.skip_mm_profiling = True
+                        multimodal_config.mm_encoder_remote = True
+                logger.info_once(
+                    "[LWD] cloud: tokenizer and multimodal encoder are not "
+                    "initialized (the edge owns both)"
+                )
+
         if self.performance_mode != "balanced":
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
 
