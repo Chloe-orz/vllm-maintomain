@@ -1063,6 +1063,11 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens = padded_num_tokens
                             pad_spec_decode = True
 
+                    logger.info(
+                        "sched dbg: num_new=%s computed=%s num_tokens=%s prompt=%s status=%s",
+                        num_new_tokens, num_computed_tokens, request.num_tokens,
+                        request.num_prompt_tokens, request.status,
+                    )
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold

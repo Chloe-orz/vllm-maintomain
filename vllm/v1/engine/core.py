@@ -1325,7 +1325,24 @@ class EngineCoreProc(EngineCore):
                 # Note that parallel_config.data_parallel_index will still reflect
                 # the original DP rank.
                 parallel_config.reconfigure_for_independent_dp_rank()
-                engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+                # Lwd prefill-only engine selection (edge/cloud): no-op
+                # unless the mode is enabled (vanilla EngineCoreProc).
+                lwd = vllm_config.lwd_config
+                engine_cls = EngineCoreProc
+                if lwd.enabled and lwd.mode == "prefill_only":
+                    if lwd.is_edge:
+                        from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
+                            LwdEdgeEngineCore,
+                        )
+
+                        engine_cls = LwdEdgeEngineCore
+                    else:
+                        from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
+                            LwdCloudEngineCore,
+                        )
+
+                        engine_cls = LwdCloudEngineCore
+                engine_core = engine_cls(*args, engine_index=dp_rank, **kwargs)
 
             assert engine_core is not None
 
@@ -1389,11 +1406,18 @@ class EngineCoreProc(EngineCore):
 
     def has_work(self) -> bool:
         """Returns true if the engine should be stepped."""
-        return (
-            self.engines_running
-            or self.scheduler.has_requests()
-            or bool(self.batch_queue)
+        state = (
+            self.engines_running,
+            self.scheduler.has_requests(),
+            bool(self.batch_queue),
         )
+        if state != getattr(self, "_last_has_work_state", None):
+            logger.info(
+                "[has_work] engines_running=%s has_requests=%s batch_queue=%s",
+                *state,
+            )
+            self._last_has_work_state = state
+        return state[0] or state[1] or state[2]
 
     def is_running(self) -> bool:
         """Returns true if shutdown has not been requested."""
