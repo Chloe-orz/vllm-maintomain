@@ -7,7 +7,7 @@ import pickle
 from pathlib import Path
 
 import pytest
-from lwd_config_under_test import LwdAPIConfig, LwdConfig, resolve_lwd_config
+from lwd_config_under_test import LwdAPIConfig, resolve_lwd_config
 
 FIXTURE_NAME = "s3_cloud_share_2dp.yaml"
 
@@ -34,19 +34,22 @@ def test_snapshot_survives_handoff_without_yaml_or_key_access(
     original = copy.deepcopy(raw)
     snapshot = resolve_lwd_config(raw)
     path.unlink()
-    received, coordination = pickle.loads(pickle.dumps(snapshot))
+    received = pickle.loads(pickle.dumps(snapshot))
     assert received.instance.id == 1
     assert [link.dp_idx for link in received.connections] == [0, 1]
     assert received.topology.digest
-    assert received.coordination is coordination
-    assert coordination.consumer_id == "enterprise-a-edge1"
-    assert coordination.connect_timeout == 5.0
+    assert received.coordination.consumer_id == "enterprise-a-edge1"
+    assert received.coordination.connect_timeout == 5.0
+    assert not received.api.requested
     assert raw == original
 
 
 @pytest.mark.parametrize("raw", [{}, {"enable_cpu_binding": True}, None])
 def test_absent_lwd_leaves_centralized_configuration_empty(raw: object) -> None:
-    assert resolve_lwd_config(raw) == (None, None)
+    assert resolve_lwd_config(raw) is None
+    assert resolve_lwd_config(raw, api=LwdAPIConfig()) is None
+    with pytest.raises(ValueError, match="require lwd_config.path"):
+        resolve_lwd_config(raw, api=LwdAPIConfig(api_server_rpc_port="10.0.0.1:25100"))
 
 
 @pytest.mark.parametrize(
@@ -129,14 +132,13 @@ def test_cloud_coordination_name_defaults_to_selected_cloud(
         "instance_id": cloud_id,
         "coordination": supplied,
     }
-    selected, coordination = resolve_lwd_config({"lwd_config": entry})
-    assert selected.coordination is coordination
-    assert coordination.instance_id == f"cloud-{cloud_id}"
+    selected = resolve_lwd_config({"lwd_config": entry})
+    assert selected.coordination.instance_id == f"cloud-{cloud_id}"
     assert "instance_id" not in supplied
 
 
 def test_absent_coordination_stays_disabled(lwd_yaml_dir: Path) -> None:
-    selected, coordination = resolve_lwd_config(
+    selected = resolve_lwd_config(
         {
             "lwd_config": {
                 "path": str(lwd_yaml_dir / FIXTURE_NAME),
@@ -145,7 +147,7 @@ def test_absent_coordination_stays_disabled(lwd_yaml_dir: Path) -> None:
             }
         }
     )
-    assert selected.coordination is coordination is None
+    assert selected.coordination is None
 
 
 @pytest.mark.parametrize(
@@ -169,12 +171,13 @@ def test_api_cli_metadata_survives_snapshot_handoff(
     # CLI identity checks do not read a YAML file; the snapshot owns that read.
     api = LwdAPIConfig.from_namespace(args)
     path.write_bytes((lwd_yaml_dir / "s2_edge_share_2dp.yaml").read_bytes())
-    entry = LwdConfig.from_dict(args.additional_config["lwd_config"])
-    api.validate_topology(entry)
+    original = copy.deepcopy(args.additional_config)
+    entry = resolve_lwd_config(args.additional_config, api=api)
     path.unlink()
     # Only round-trip our own objects, never externally supplied pickle data.
-    received_api, received_entry = pickle.loads(pickle.dumps((api, entry)))
-    received_api.validate_topology(received_entry)
-    assert received_api == api
+    received_entry = pickle.loads(pickle.dumps(entry))
+    assert received_entry.api == api
+    assert received_entry.coordination.enabled is False
     assert [c.dp_idx for c in received_entry.connections] == [0, 1]
     assert received_entry.instance_id == identity
+    assert args.additional_config == original

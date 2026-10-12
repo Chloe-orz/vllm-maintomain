@@ -41,9 +41,7 @@ from .kv_transfer import KVTransferConfig
 from .load import LoadConfig
 from .lora import LoRAConfig
 from .lwd import (
-    LwdAPIConfig,
     LwdConfig,
-    LwdCoordinationConfig,
     log_lwd_config,
     resolve_lwd_config,
 )
@@ -442,12 +440,8 @@ class VllmConfig:
     """Additional config for specified platform. Different platforms may
     support different configs. Make sure the configs are valid for the platform
     you are using. Contents must be hashable."""
-    lwd_config: LwdConfig | None = Field(default=None, init=False)
-    """Parsed LWD topology snapshot. Configuration only; does not enable execution."""
-    lwd_coordination: LwdCoordinationConfig | None = Field(default=None, init=False)
-    """Parsed coordination metadata; does not start clients or listeners."""
-    lwd_api_config: LwdAPIConfig = Field(default_factory=LwdAPIConfig)
-    """API attachment metadata; does not start or attach frontend processes."""
+    lwd_config: LwdConfig | None = None
+    """Parsed LWD topology, coordination and API metadata; does not enable execution."""
     instance_id: str = ""
     """The ID of the vLLM instance."""
     optimization_level: OptimizationLevel = OptimizationLevel.O2
@@ -1270,11 +1264,9 @@ class VllmConfig:
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
 
-        # Preserve the source configuration handoff, without runtime projection.
-        self.lwd_config, self.lwd_coordination = resolve_lwd_config(
-            self.additional_config
-        )
-        self.lwd_api_config.validate_topology(self.lwd_config)
+        # EngineArgs supplies a complete snapshot; direct callers can use raw input.
+        if self.lwd_config is None:
+            self.lwd_config = resolve_lwd_config(self.additional_config)
         if self.lwd_config is not None:
             logger.info(
                 "[LWD][config] metadata_only=True role=%s instance_id=%d "
@@ -1285,16 +1277,19 @@ class VllmConfig:
                 self.lwd_config.topology.deployment.scene,
                 [(dp.dp_idx, dp.ranks) for dp in self.lwd_config.instance.dp],
                 self.lwd_config.topology.digest,
-                bool(self.lwd_coordination and self.lwd_coordination.enabled),
+                bool(
+                    self.lwd_config.coordination
+                    and self.lwd_config.coordination.enabled
+                ),
             )
-            if self.lwd_api_config.requested:
+            if self.lwd_config.api.requested:
                 logger.info(
                     "[LWD][config] metadata_only=True api_server_rpc_port=%s "
                     "api_server_attach=%s; API attachment is not enabled",
-                    self.lwd_api_config.api_server_rpc_port,
-                    self.lwd_api_config.api_server_attach,
+                    self.lwd_config.api.api_server_rpc_port,
+                    self.lwd_config.api.api_server_attach,
                 )
-            log_lwd_config(logger, self.lwd_config, self.lwd_api_config)
+            log_lwd_config(logger, self.lwd_config)
 
         self._resolve_mm_encoder_only()
 

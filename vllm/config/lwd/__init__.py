@@ -22,10 +22,12 @@ __all__ = [
 
 def resolve_lwd_config(
     additional_config: Any,
-) -> tuple[LwdConfig | None, LwdCoordinationConfig | None]:
+    *,
+    api: LwdAPIConfig | None = None,
+) -> LwdConfig | None:
     """Parse once into the VllmConfig snapshot forwarded to engines/workers."""
     if not isinstance(additional_config, dict):
-        return None, None
+        additional_config = {}
     if "edge_cloud_config" in additional_config:
         raise ValueError("[LWD] edge_cloud_config is retired; use lwd_config.path")
     if "lwd_coordination" in additional_config:
@@ -34,9 +36,10 @@ def resolve_lwd_config(
             "move it into lwd_config.coordination"
         )
     lwd = (
-        LwdConfig.from_dict(additional_config["lwd_config"])
+        LwdConfig.from_dict(additional_config["lwd_config"], api=api)
         if "lwd_config" in additional_config
         else None
     )
-    # Keep the downstream VllmConfig alias pointing at the one parsed snapshot.
-    return lwd, lwd.coordination if lwd is not None else None
+    if lwd is None and api is not None:
+        api.validate_topology(None)
+    return lwd

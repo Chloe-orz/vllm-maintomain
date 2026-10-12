@@ -6,18 +6,14 @@ import json
 import logging
 from dataclasses import asdict
 
-from .api import LwdAPIConfig
 from .entry import LwdConfig
 
 
-def log_lwd_config(
-    logger: logging.Logger, config: LwdConfig, api: LwdAPIConfig
-) -> None:
+def log_lwd_config(logger: logging.Logger, config: LwdConfig) -> None:
     """Include all parsed fields and defaults, plus the selected connections."""
     snapshot = {
         "metadata_only": True,
         "lwd_config": asdict(config),
-        "lwd_api_config": asdict(api),
         "selected_instance": asdict(config.instance),
         "connections": [
             {**asdict(link), "cloud_leader_rank": link.cloud_leader_rank}

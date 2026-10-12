@@ -42,7 +42,7 @@ def test_log_contains_complete_selected_config_without_reading_key_contents(
     )
     path.unlink()
     with caplog.at_level(logging.INFO):
-        log_lwd_config(logging.getLogger("test.lwd-config"), config, LwdAPIConfig())
+        log_lwd_config(logging.getLogger("test.lwd-config"), config)
     line = caplog.records[-1].getMessage()
     assert line.startswith("[LWD][config] resolved=")
     result = json.loads(line.split("resolved=", 1)[1])
@@ -76,7 +76,8 @@ def test_log_contains_complete_selected_config_without_reading_key_contents(
     assert len(result["connections"]) == (1 if role == "edge" else 2)
     assert all(link["cloud_leader_rank"] == 2 for link in result["connections"])
     assert result["selected_instance"]["id"] == identity
-    assert result["lwd_api_config"] == {
+    assert "lwd_api_config" not in result
+    assert actual["api"] == {
         "api_server_rpc_port": None,
         "api_server_attach": None,
     }
@@ -94,13 +95,13 @@ def test_log_includes_multi_instance_api_endpoint(
             "path": str(lwd_yaml_dir / "s2_edge_share_2dp.yaml"),
             "role": "edge",
             "instance_id": identity,
-        }
+        },
+        api=LwdAPIConfig(**{field: "10.0.0.1:25100"}),
     )
-    api = LwdAPIConfig(**{field: "10.0.0.1:25100"})
-    api.validate_topology(config)
     with caplog.at_level(logging.INFO):
-        log_lwd_config(logging.getLogger("test.lwd-config"), config, api)
+        log_lwd_config(logging.getLogger("test.lwd-config"), config)
     result = json.loads(caplog.records[-1].getMessage().split("resolved=", 1)[1])
-    assert result["lwd_api_config"][field] == "10.0.0.1:25100"
+    assert "lwd_api_config" not in result
+    assert result["lwd_config"]["api"][field] == "10.0.0.1:25100"
     assert result["lwd_config"]["coordination"] is None
     assert [link["dp_idx"] for link in result["connections"]] == [0, 1]

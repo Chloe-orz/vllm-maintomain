@@ -5,9 +5,10 @@
 import argparse
 from dataclasses import dataclass
 from ipaddress import ip_address
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from .entry import LwdConfig, lwd_entry_from_dict
+if TYPE_CHECKING:
+    from .entry import LwdConfig
 
 
 def _endpoint(value: str | None, flag: str) -> None:
@@ -84,6 +85,9 @@ class LwdAPIConfig:
 
     @classmethod
     def from_namespace(cls, args: Any, *, headless: bool = False) -> "LwdAPIConfig":
+        # LwdConfig owns this class, so defer the entry-parser import.
+        from .entry import lwd_entry_from_dict
+
         config = cls(
             api_server_rpc_port=getattr(args, "api_server_rpc_port", None),
             api_server_attach=getattr(args, "api_server_attach", None),
@@ -102,7 +106,7 @@ class LwdAPIConfig:
                 raise ValueError("[LWD] API options require the HTTP frontend")
         return config
 
-    def validate_topology(self, lwd: LwdConfig | None) -> None:
+    def validate_topology(self, lwd: "LwdConfig | None") -> None:
         if not self.requested:
             return
         if lwd is None:

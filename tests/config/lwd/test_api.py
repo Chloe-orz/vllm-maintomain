@@ -76,12 +76,12 @@ def test_api_requires_edge_share_topology_but_is_optional_for_centralized(
         )
     with pytest.raises(ValueError, match="require lwd_config.path"):
         api.validate_topology(None)
-    entry = LwdConfig.from_dict(
-        {
-            "path": str(lwd_yaml_dir / "s3_cloud_share_1dp.yaml"),
-            "role": "edge",
-            "instance_id": 0,
-        }
-    )
     with pytest.raises(ValueError, match="scene=edge_share"):
-        api.validate_topology(entry)
+        LwdConfig.from_dict(
+            {
+                "path": str(lwd_yaml_dir / "s3_cloud_share_1dp.yaml"),
+                "role": "edge",
+                "instance_id": 0,
+            },
+            api=api,
+        )

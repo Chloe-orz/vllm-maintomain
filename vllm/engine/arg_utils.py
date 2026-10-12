@@ -84,7 +84,7 @@ from vllm.config.kernel import (
 )
 from vllm.config.load import SafetensorsLoadStrategy
 from vllm.config.lora import MaxLoRARanks
-from vllm.config.lwd import LwdAPIConfig
+from vllm.config.lwd import LwdAPIConfig, resolve_lwd_config
 from vllm.config.mamba import MambaBackendEnum, MambaSSUAlgorithm
 from vllm.config.model import (
     ConvertOption,
@@ -2051,7 +2051,10 @@ class EngineArgs:
 
         NOTE: If VllmConfig is incompatible, we raise an error.
         """
-        lwd_api_config = LwdAPIConfig.from_namespace(self, headless=headless)
+        lwd_config = resolve_lwd_config(
+            self.additional_config,
+            api=LwdAPIConfig.from_namespace(self, headless=headless),
+        )
         current_platform.pre_register_and_update()
 
         device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
@@ -2675,7 +2678,7 @@ class EngineArgs:
             reasoning_config=self.reasoning_config,
             profiler_config=self.profiler_config,
             additional_config=self.additional_config,
-            lwd_api_config=lwd_api_config,
+            lwd_config=lwd_config,
             optimization_level=self.optimization_level,
             performance_mode=self.performance_mode,
             weight_transfer_config=self.weight_transfer_config,
