@@ -1268,27 +1268,6 @@ class VllmConfig:
         if self.lwd_config is None:
             self.lwd_config = resolve_lwd_config(self.additional_config)
         if self.lwd_config is not None:
-            logger.info(
-                "[LWD][config] metadata_only=True role=%s instance_id=%d "
-                "scene=%s dps=%s topology_digest=%s coordination_enabled=%s; "
-                "execution is unchanged",
-                self.lwd_config.role,
-                self.lwd_config.instance_id,
-                self.lwd_config.topology.deployment.scene,
-                [(dp.dp_idx, dp.ranks) for dp in self.lwd_config.instance.dp],
-                self.lwd_config.topology.digest,
-                bool(
-                    self.lwd_config.coordination
-                    and self.lwd_config.coordination.enabled
-                ),
-            )
-            if self.lwd_config.api.requested:
-                logger.info(
-                    "[LWD][config] metadata_only=True api_server_rpc_port=%s "
-                    "api_server_attach=%s; API attachment is not enabled",
-                    self.lwd_config.api.api_server_rpc_port,
-                    self.lwd_config.api.api_server_attach,
-                )
             log_lwd_config(logger, self.lwd_config)
 
         self._resolve_mm_encoder_only()
