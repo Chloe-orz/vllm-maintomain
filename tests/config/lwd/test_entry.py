@@ -58,7 +58,7 @@ def test_absent_lwd_leaves_centralized_configuration_empty(raw: object) -> None:
         ({"instance_id": 2}, "Instance not found"),
         ({"instance_id": True}, "integer"),
         ({"role": "unknown"}, "role"),
-        ({"scheduler": "mixed"}, "unknown fields"),
+        ({"scheduler": "mixed"}, "scheduler"),
     ],
 )
 def test_invalid_entry_fails_during_configuration(
@@ -121,11 +121,16 @@ def test_legacy_coordination_cannot_shadow_nested_configuration(
         resolve_lwd_config(raw)
 
 
-@pytest.mark.parametrize("cloud_id", [0, 1])
-def test_cloud_coordination_name_defaults_to_selected_cloud(
-    cloud_id: int, lwd_yaml_dir: Path
+@pytest.mark.parametrize("cloud_id,name", [(0, None), (1, None), (1, "custom-cloud")])
+def test_cloud_coordination_name_preserves_override_or_defaults_to_selected_cloud(
+    cloud_id: int, name: str | None, lwd_yaml_dir: Path
 ) -> None:
-    supplied = {"enabled": True, "listen_port": 9133}
+    supplied = {
+        "enabled": True,
+        "listen_port": 9133,
+        **({"instance_id": name} if name else {}),
+    }
+    original = supplied.copy()
     entry = {
         "path": str(lwd_yaml_dir / "s2_edge_share_1dp.yaml"),
         "role": "cloud",
@@ -133,8 +138,8 @@ def test_cloud_coordination_name_defaults_to_selected_cloud(
         "coordination": supplied,
     }
     selected = resolve_lwd_config({"lwd_config": entry})
-    assert selected.coordination.instance_id == f"cloud-{cloud_id}"
-    assert "instance_id" not in supplied
+    assert selected.coordination.instance_id == (name or f"cloud-{cloud_id}")
+    assert supplied == original
 
 
 def test_absent_coordination_stays_disabled(lwd_yaml_dir: Path) -> None:
@@ -168,7 +173,7 @@ def test_api_cli_metadata_survives_snapshot_handoff(
             "coordination": {"enabled": False},
         }
     }
-    # CLI identity checks do not read a YAML file; the snapshot owns that read.
+    # Capturing CLI options does not read YAML; snapshot construction owns that read.
     api = LwdAPIConfig.from_namespace(args)
     path.write_bytes((lwd_yaml_dir / "s2_edge_share_2dp.yaml").read_bytes())
     original = copy.deepcopy(args.additional_config)

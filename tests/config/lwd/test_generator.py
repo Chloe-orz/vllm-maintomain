@@ -14,6 +14,13 @@ ROOT = Path(__file__).resolve().parents[3]
 GENERATOR = ROOT / "tools/gen_lwd_topology.py"
 
 
+def generate(output: Path, **options: str | int) -> subprocess.CompletedProcess[str]:
+    command = [sys.executable, str(GENERATOR), "-o", str(output)]
+    for name, value in options.items():
+        command.extend([f"--{name.replace('_', '-')}", str(value)])
+    return subprocess.run(command, capture_output=True, text=True)
+
+
 @pytest.mark.parametrize(
     "scene,edges,clouds,prefix",
     [
@@ -28,26 +35,14 @@ def test_explicit_card_counts_reproduce_original_payloads(
     tmp_path: Path, scene: str, edges: str, clouds: str, prefix: str, dp: int
 ) -> None:
     output = tmp_path / "topology.yaml"
-    subprocess.run(
-        [
-            sys.executable,
-            str(GENERATOR),
-            "--scene",
-            scene,
-            "--edge-machines",
-            edges,
-            "--cloud-machines",
-            clouds,
-            "--cloud-cards",
-            "0:8" if prefix in ("s1", "s3") else "0:8,1:8",
-            "--dp",
-            str(dp),
-            "-o",
-            str(output),
-        ],
-        check=True,
-        capture_output=True,
-    )
+    generate(
+        output,
+        scene=scene,
+        edge_machines=edges,
+        cloud_machines=clouds,
+        cloud_cards="0:8" if prefix in ("s1", "s3") else "0:8,1:8",
+        dp=str(dp),
+    ).check_returncode()
     expected = topology_payload(f"{prefix}_{scene}_{dp}dp.yaml")
     assert yaml.safe_load(output.read_text()) == expected
     assert list(tmp_path.iterdir()) == [output]
@@ -55,28 +50,15 @@ def test_explicit_card_counts_reproduce_original_payloads(
 
 def test_explicit_colocated_ids_generate_independent_ranks(tmp_path: Path) -> None:
     output = tmp_path / "topology.yaml"
-    subprocess.run(
-        [
-            sys.executable,
-            str(GENERATOR),
-            "--scene",
-            "cloud_share",
-            "--edge-machines",
-            "1@76.76.26.17,0@76.76.26.17",
-            "--cloud-machines",
-            "76.76.26.232",
-            "--cloud-cards",
-            "0:8",
-            "--dp",
-            "2",
-            "--port-base",
-            "15783",
-            "-o",
-            str(output),
-        ],
-        check=True,
-        capture_output=True,
-    )
+    generate(
+        output,
+        scene="cloud_share",
+        edge_machines="1@76.76.26.17,0@76.76.26.17",
+        cloud_machines="76.76.26.232",
+        cloud_cards="0:8",
+        dp="2",
+        port_base="15783",
+    ).check_returncode()
     raw = yaml.safe_load(output.read_text())
     assert [[d["ranks"] for d in e["dp"]] for e in raw["edges"]] == [
         [[0], [0]],
@@ -100,24 +82,13 @@ def test_invalid_inputs_do_not_overwrite_existing_yaml(
 ) -> None:
     output = tmp_path / "topology.yaml"
     output.write_text("preserve this file\n")
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(GENERATOR),
-            "--scene",
-            "cloud_share",
-            "--edge-machines",
-            edges,
-            "--cloud-machines",
-            "10.1.0.1",
-            "--cloud-cards",
-            "0:8",
-            "--dp",
-            dp,
-            "-o",
-            str(output),
-        ],
-        capture_output=True,
+    result = generate(
+        output,
+        scene="cloud_share",
+        edge_machines=edges,
+        cloud_machines="10.1.0.1",
+        cloud_cards="0:8",
+        dp=dp,
     )
     assert result.returncode != 0
     assert output.read_text() == "preserve this file\n"
@@ -156,28 +127,15 @@ def test_edge_share_allocates_explicit_cards_per_instance(
     tmp_path: Path, clouds: str, cards: str, dp: int, expected_ranks: list, world: int
 ) -> None:
     output = tmp_path / "topology.yaml"
-    subprocess.run(
-        [
-            sys.executable,
-            str(GENERATOR),
-            "--scene",
-            "edge_share",
-            "--edge-machines",
-            "10.0.0.1",
-            "--cloud-machines",
-            clouds,
-            "--cloud-cards",
-            cards,
-            "--dp",
-            str(dp),
-            "--port-base",
-            "6020",
-            "-o",
-            str(output),
-        ],
-        check=True,
-        capture_output=True,
-    )
+    generate(
+        output,
+        scene="edge_share",
+        edge_machines="10.0.0.1",
+        cloud_machines=clouds,
+        cloud_cards=cards,
+        dp=str(dp),
+        port_base="6020",
+    ).check_returncode()
     raw = yaml.safe_load(output.read_text())
     assert raw["deployment"]["hccl_world_size"] == world
     assert [[d["ranks"] for d in c["dp"]] for c in raw["clouds"]] == expected_ranks
@@ -205,26 +163,14 @@ def test_invalid_cloud_allocation_preserves_output(
 ) -> None:
     output = tmp_path / "topology.yaml"
     output.write_text("preserve this file\n")
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(GENERATOR),
-            "--scene",
-            "edge_share",
-            "--edge-machines",
-            "10.0.0.1",
-            "--cloud-machines",
-            clouds,
-            "--cloud-cards",
-            "0:4,1:4",
-            "--dp",
-            dp,
-            "--port-base",
-            port,
-            "-o",
-            str(output),
-        ],
-        capture_output=True,
+    result = generate(
+        output,
+        scene="edge_share",
+        edge_machines="10.0.0.1",
+        cloud_machines=clouds,
+        cloud_cards="0:4,1:4",
+        dp=dp,
+        port_base=port,
     )
     assert result.returncode != 0
     assert output.read_text() == "preserve this file\n"
@@ -242,26 +188,14 @@ def test_cloud_size_is_not_inferred_from_host_address(
     tmp_path: Path, scene: str, edges: str, cards: int, dp: int
 ) -> None:
     output = tmp_path / "topology.yaml"
-    subprocess.run(
-        [
-            sys.executable,
-            str(GENERATOR),
-            "--scene",
-            scene,
-            "--edge-machines",
-            edges,
-            "--cloud-machines",
-            "10.1.0.1",
-            "--cloud-cards",
-            f"0:{cards}",
-            "--dp",
-            str(dp),
-            "-o",
-            str(output),
-        ],
-        check=True,
-        capture_output=True,
-    )
+    generate(
+        output,
+        scene=scene,
+        edge_machines=edges,
+        cloud_machines="10.1.0.1",
+        cloud_cards=f"0:{cards}",
+        dp=str(dp),
+    ).check_returncode()
     topology = LwdTopology.from_file(str(output))
     edge_count = 1 if scene == "single_instance" else 2
     assert topology.deployment.hccl_world_size == edge_count + cards
@@ -310,6 +244,71 @@ def test_invalid_card_counts_preserve_existing_yaml(
 
 
 @pytest.mark.parametrize(
+    "scene,edges,clouds,cards",
+    [
+        ("single_instance", "10.1.0.1", "10.1.0.1", "0:6"),
+        ("cloud_share", "0@10.0.0.1,1@10.0.0.1,2@10.0.0.2", "10.1.0.1", "0:12"),
+        ("edge_share", "10.0.0.1", "0@10.1.0.1,1@10.1.0.2,2@10.1.0.1", "0:3,1:6,2:9"),
+        (
+            "lwd_cluster",
+            "0@10.0.0.1,1@10.0.0.1,2@10.0.0.2",
+            "0@10.1.0.1,1@10.1.0.2,2@10.1.0.1",
+            "0:3,1:6,2:9",
+        ),
+    ],
+)
+def test_allocation_rules_scale_beyond_two_instances_and_two_dps(
+    tmp_path: Path, scene: str, edges: str, clouds: str, cards: str
+) -> None:
+    output = tmp_path / "topology.yaml"
+    result = generate(
+        output,
+        scene=scene,
+        edge_machines=edges,
+        cloud_machines=clouds,
+        cloud_cards=cards,
+        dp=3,
+        port_base=6201,
+    )
+    assert result.returncode == 0, result.stderr
+    topology = LwdTopology.from_file(str(output))
+    counts = {
+        int(identity): int(count)
+        for identity, count in (entry.split(":") for entry in cards.split(","))
+    }
+    for cloud in topology.clouds:
+        assert [len(dp.ranks) for dp in cloud.dp] == [counts[cloud.id] // 3] * 3
+    edge_ranks = {r for edge in topology.edges for dp in edge.dp for r in dp.ranks}
+    cloud_ranks = [r for cloud in topology.clouds for dp in cloud.dp for r in dp.ranks]
+    assert len(cloud_ranks) == len(set(cloud_ranks)) == sum(counts.values())
+    assert edge_ranks.isdisjoint(cloud_ranks)
+    assert edge_ranks | set(cloud_ranks) == set(
+        range(topology.deployment.hccl_world_size)
+    )
+    if scene == "lwd_cluster":
+        endpoints = [
+            (dp.addr, dp.ctrl_port) for cloud in topology.clouds for dp in cloud.dp
+        ]
+        assert len(set(endpoints)) == len(endpoints)
+
+
+def test_colocated_cloud_port_overflow_preserves_output(tmp_path: Path) -> None:
+    output = tmp_path / "topology.yaml"
+    output.write_text("keep existing yaml\n")
+    result = generate(
+        output,
+        scene="lwd_cluster",
+        edge_machines="10.0.0.1,10.0.0.2",
+        cloud_machines="0@10.1.0.1,1@10.1.0.1",
+        cloud_cards="0:4,1:4",
+        port_base=65535,
+    )
+    assert result.returncode != 0
+    assert "ctrl_port" in result.stderr
+    assert output.read_text() == "keep existing yaml\n"
+
+
+@pytest.mark.parametrize(
     "scene,edges,clouds,cards,match",
     [
         (
@@ -340,23 +339,12 @@ def test_scene_requires_ids_only_where_instances_are_listed(
 ) -> None:
     output = tmp_path / "topology.yaml"
     output.write_text("keep existing yaml\n")
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(GENERATOR),
-            "--scene",
-            scene,
-            "--edge-machines",
-            edges,
-            "--cloud-machines",
-            clouds,
-            "--cloud-cards",
-            cards,
-            "-o",
-            str(output),
-        ],
-        capture_output=True,
-        text=True,
+    result = generate(
+        output,
+        scene=scene,
+        edge_machines=edges,
+        cloud_machines=clouds,
+        cloud_cards=cards,
     )
     assert result.returncode != 0
     assert match in result.stderr

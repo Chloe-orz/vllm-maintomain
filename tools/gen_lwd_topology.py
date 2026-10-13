@@ -3,8 +3,7 @@
 """Generate one LWD topology without importing the inference runtime."""
 
 import argparse
-import importlib.util
-import sys
+import runpy
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
@@ -14,31 +13,24 @@ import yaml
 SCENES = ("single_instance", "edge_share", "cloud_share", "lwd_cluster")
 
 
-def _addresses(value: str) -> list[str]:
-    addresses = [str(ip_address(item.strip())) for item in value.split(",")]
-    if len(set(addresses)) != len(addresses):
-        raise ValueError(
-            "Machine addresses must be unique; use ID@address for instances"
-        )
-    return addresses
-
-
 def _instances(value: str) -> list[tuple[int, str]]:
     items = [item.strip() for item in value.split(",")]
-    if any("@" in item for item in items):
-        if not all(item.count("@") == 1 for item in items):
-            raise ValueError("Do not mix plain addresses and ID@address entries")
-        instances = []
-        for item in items:
+    explicit = "@" in value
+    instances = []
+    for index, item in enumerate(items):
+        if explicit:
+            if item.count("@") != 1:
+                raise ValueError("Do not mix plain addresses and ID@address entries")
             identity, address = item.split("@")
             if not identity.isdecimal():
                 raise ValueError("Instance IDs must be non-negative integers")
-            instances.append((int(identity), str(ip_address(address))))
-        instances.sort()
-        if [identity for identity, _ in instances] != list(range(len(instances))):
-            raise ValueError("Instance IDs must be unique and contiguous from 0")
-        return instances
-    return list(enumerate(_addresses(value)))
+            index = int(identity)
+        else:
+            address = item
+        instances.append((index, str(ip_address(address))))
+    if not explicit and len({addr for _, addr in instances}) != len(instances):
+        raise ValueError("Repeated addresses require explicit ID@address entries")
+    return sorted(instances)
 
 
 def _edge_instances(scene: str, value: str, cloud_count: int) -> list[tuple[int, str]]:
@@ -47,44 +39,48 @@ def _edge_instances(scene: str, value: str, cloud_count: int) -> list[tuple[int,
             raise ValueError(
                 "edge_share requires one plain edge IP; edge IDs follow cloud IDs"
             )
-        address = _addresses(value)[0]
+        address = str(ip_address(value.strip()))
         return [(identity, address) for identity in range(cloud_count)]
     if scene == "cloud_share" and "@" not in value:
         raise ValueError("cloud_share requires --edge-machines ID@IP entries")
     return _instances(value)
 
 
+def _instance(
+    identity: int, address: str, ranks: list[list[int]], port_base: int | None = None
+) -> dict[str, Any]:
+    dps = []
+    for index, group in enumerate(ranks):
+        item: dict[str, Any] = {"dp_idx": index, "addr": address, "ranks": group}
+        if port_base is not None:
+            item["ctrl_port"] = port_base + index
+        dps.append(item)
+    return {"id": identity, "dp": dps}
+
+
 def _cloud_layout(
-    instances: list[tuple[int, str, int]], dp: int, edge_rank_count: int, port_base: int
+    instances: list[tuple[int, str, int]],
+    dp: int,
+    edge_rank_count: int,
+    port_base: int,
+    *,
+    shared_ports: bool = False,
 ) -> list[dict[str, Any]]:
-    machines = dict.fromkeys(address for _, address, _ in instances)
-    starts = {}
     next_rank = edge_rank_count
-    for address in machines:
-        starts[address] = next_rank
-        next_rank += sum(cards for _, host, cards in instances if host == address)
+    next_ports: dict[str, int] = {}
     clouds = []
     for identity, address, cards in instances:
         per_dp = cards // dp
-        # Host blocks contain only the cards explicitly assigned to instances.
-        base = starts[address]
-        clouds.append(
-            {
-                "id": identity,
-                "dp": [
-                    {
-                        "dp_idx": index,
-                        "addr": address,
-                        "ranks": list(
-                            range(base + index * per_dp, base + (index + 1) * per_dp)
-                        ),
-                        "ctrl_port": port_base + index,
-                    }
-                    for index in range(dp)
-                ],
-            }
-        )
-        starts[address] += cards
+        ranks = [
+            list(range(start, start + per_dp))
+            for start in range(next_rank, next_rank + cards, per_dp)
+        ]
+        port = next_ports.get(address, port_base)
+        clouds.append(_instance(identity, address, ranks, port))
+        next_rank += cards
+        # edge_share reuses edge-side channels; other scenes bind per cloud DP.
+        if not shared_ports:
+            next_ports[address] = port + dp
     return clouds
 
 
@@ -131,28 +127,20 @@ def build_topology(
     if scene == "edge_share" and "@" not in cloud_machines:
         raise ValueError("edge_share requires --cloud-machines ID@IP entries")
     cloud_instances = _cloud_instances(cloud_machines, cloud_cards, dp)
-    cloud_addresses = {address for _, address, _ in cloud_instances}
-    if scene != "edge_share" and len(cloud_addresses) != len(cloud_instances):
-        raise ValueError("Colocated cloud instances require scene=edge_share")
     instances = _edge_instances(scene, edge_machines, len(cloud_instances))
-    edges = []
-    for identity, address in instances:
-        rank = 0 if scene == "edge_share" else identity
-        edges.append(
-            {
-                "id": identity,
-                "dp": [
-                    {"dp_idx": index, "addr": address, "ranks": [rank]}
-                    for index in range(dp)
-                ],
-            }
-        )
+    shared = scene == "edge_share"
+    edges = [
+        _instance(identity, address, [[0 if shared else identity] for _ in range(dp)])
+        for identity, address in instances
+    ]
     # Distinct cloud-reuse instances retain distinct ranks on the same host.
-    edge_rank_count = 1 if scene == "edge_share" else len(edges)
-    clouds = _cloud_layout(cloud_instances, dp, edge_rank_count, port_base)
+    edge_rank_count = 1 if shared else len(edges)
+    clouds = _cloud_layout(
+        cloud_instances, dp, edge_rank_count, port_base, shared_ports=shared
+    )
     links = (
         [{"edge": edge["id"], "cloud": edge["id"]} for edge in edges]
-        if scene == "edge_share"
+        if shared
         else [
             {"edge": edge["id"], "cloud": cloud["id"]}
             for edge in edges
@@ -177,32 +165,18 @@ def build_topology(
 def _validate(raw: dict[str, Any]) -> None:
     # Use the runtime schema without importing torch, plugins or a device backend.
     path = Path(__file__).resolve().parents[1] / "vllm/config/lwd/topology.py"
-    spec = importlib.util.spec_from_file_location("lwd_topology_standalone", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    module.LwdTopology.from_dict(raw)
+    runpy.run_path(str(path))["LwdTopology"].from_dict(raw)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scene", required=True, choices=SCENES)
-    parser.add_argument(
-        "--edge-machines",
-        required=True,
-        help="S1: one IP; S2: one shared edge IP; S3: explicit ID@IP per edge",
-    )
-    parser.add_argument(
-        "--cloud-machines",
-        required=True,
-        help="S1/S3: one IP; S2: explicit ID@IP per cloud, including repeated hosts",
-    )
-    parser.add_argument(
-        "--cloud-cards",
-        required=True,
-        help="Cards per logical cloud instance, e.g. 0:4,1:8; not physical NPU IDs",
-    )
+    for name, help_text in (
+        ("edge-machines", "Edge IPs; cloud_share requires ID@IP per instance"),
+        ("cloud-machines", "Cloud IPs; edge_share requires ID@IP per instance"),
+        ("cloud-cards", "Comma-separated ID:card_count for every cloud instance"),
+    ):
+        parser.add_argument(f"--{name}", required=True, help=help_text)
     parser.add_argument(
         "--dp", type=int, default=1, help="Must divide each cloud card count"
     )

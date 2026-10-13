@@ -3,25 +3,22 @@
 """Original path/role/instance entry, without parallel or model projection."""
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import ConfigDict, TypeAdapter, with_config
+from typing_extensions import NotRequired, TypedDict
 
 from .api import LwdAPIConfig
 from .coordination import LwdCoordinationConfig
-from .topology import LwdDPConnection, LwdInstance, LwdTopology, _integer, _mapping
+from .topology import LwdDPConnection, LwdId, LwdInstance, LwdString, LwdTopology
 
 
-def lwd_entry_from_dict(raw: Any) -> tuple[str, str, int]:
-    """Validate the entry without reading YAML during early CLI checks."""
-    raw = _mapping(
-        raw, "lwd_config", {"path", "role", "instance_id"}, ("coordination",)
-    )
-    path = raw["path"]
-    if not isinstance(path, str) or not path.strip():
-        raise ValueError("[LWD] lwd_config.path must be a non-empty string")
-    if raw["role"] not in ("edge", "cloud"):
-        raise ValueError("[LWD] lwd_config.role must be 'edge' or 'cloud'")
-    identity = _integer(raw["instance_id"], "lwd_config.instance_id")
-    return path, raw["role"], identity
+@with_config(ConfigDict(extra="forbid"))
+class _LwdEntry(TypedDict):
+    path: LwdString
+    role: Literal["edge", "cloud"]
+    instance_id: LwdId
+    coordination: NotRequired[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -38,11 +35,12 @@ class LwdConfig:
 
     @classmethod
     def from_dict(cls, raw: Any, *, api: LwdAPIConfig | None = None) -> "LwdConfig":
-        path, role, identity = lwd_entry_from_dict(raw)
+        entry = TypeAdapter(_LwdEntry).validate_python(raw)
+        path, role, identity = entry["path"], entry["role"], entry["instance_id"]
         coordination = None
-        if "coordination" in raw:
+        if "coordination" in entry:
             coordination = LwdCoordinationConfig.from_dict(
-                raw["coordination"], cloud_id=identity if role == "cloud" else None
+                entry["coordination"], cloud_id=identity if role == "cloud" else None
             )
             coordination.validate_role(role)
         topology = LwdTopology.from_file(path)

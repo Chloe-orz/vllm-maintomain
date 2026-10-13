@@ -10,7 +10,7 @@ from .entry import LwdConfig
 
 
 def log_lwd_config(logger: logging.Logger, config: LwdConfig) -> None:
-    """Include all parsed fields and defaults, plus the selected connections."""
+    """Emit one startup record with all fields, defaults and selected connections."""
     snapshot = {
         "metadata_only": True,
         "lwd_config": asdict(config),

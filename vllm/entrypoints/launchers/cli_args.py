@@ -442,7 +442,8 @@ def validate_parsed_serve_args(args: argparse.Namespace):
     if hasattr(args, "subparser") and args.subparser not in ("serve", "launch"):
         return
 
-    LwdAPIConfig.from_namespace(args)
+    # Frontend flags are not forwarded to EngineArgs; config validation happens there.
+    LwdAPIConfig.validate_frontend(args)
 
     # Ensure that the chat template is valid; raises if it likely isn't
     validate_chat_template(args.chat_template)
