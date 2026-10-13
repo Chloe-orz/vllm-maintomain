@@ -14,10 +14,13 @@ ROOT = Path(__file__).resolve().parents[3]
 GENERATOR = ROOT / "tools/gen_lwd_topology.py"
 
 
-def generate(output: Path, **options: str | int) -> subprocess.CompletedProcess[str]:
+def generate(
+    output: Path, **options: str | int | None
+) -> subprocess.CompletedProcess[str]:
     command = [sys.executable, str(GENERATOR), "-o", str(output)]
     for name, value in options.items():
-        command.extend([f"--{name.replace('_', '-')}", str(value)])
+        if value is not None:
+            command.extend([f"--{name.replace('_', '-')}", str(value)])
     return subprocess.run(command, capture_output=True, text=True)
 
 
@@ -66,32 +69,6 @@ def test_explicit_colocated_ids_generate_independent_ranks(tmp_path: Path) -> No
     ]
     assert [d["ctrl_port"] for d in raw["clouds"][0]["dp"]] == [15783, 15784]
     assert raw["deployment"]["hccl_world_size"] == 10
-
-
-@pytest.mark.parametrize(
-    "edges,dp",
-    [
-        ("0@10.0.0.1,0@10.0.0.2", "1"),
-        ("0@10.0.0.1,2@10.0.0.2", "1"),
-        ("0@10.0.0.1,10.0.0.2", "1"),
-        ("0@10.0.0.1,1@10.0.0.2", "1,2"),
-    ],
-)
-def test_invalid_inputs_do_not_overwrite_existing_yaml(
-    tmp_path: Path, edges: str, dp: str
-) -> None:
-    output = tmp_path / "topology.yaml"
-    output.write_text("preserve this file\n")
-    result = generate(
-        output,
-        scene="cloud_share",
-        edge_machines=edges,
-        cloud_machines="10.1.0.1",
-        cloud_cards="0:8",
-        dp=dp,
-    )
-    assert result.returncode != 0
-    assert output.read_text() == "preserve this file\n"
 
 
 @pytest.mark.parametrize(
@@ -147,36 +124,6 @@ def test_edge_share_allocates_explicit_cards_per_instance(
 
 
 @pytest.mark.parametrize(
-    "clouds,dp,port",
-    [
-        ("0@10.1.0.1,0@10.1.0.2", "1", "6020"),
-        ("0@10.1.0.1,2@10.1.0.2", "1", "6020"),
-        ("0@10.1.0.1,10.1.0.2", "1", "6020"),
-        ("10.1.0.1,10.1.0.1", "1", "6020"),
-        ("0@10.1.0.1,1@10.1.0.1,2@10.1.0.1", "1", "6020"),
-        ("0@10.1.0.1,1@10.1.0.1", "8", "6020"),
-        ("0@10.1.0.1,1@10.1.0.2", "2", "65535"),
-    ],
-)
-def test_invalid_cloud_allocation_preserves_output(
-    tmp_path: Path, clouds: str, dp: str, port: str
-) -> None:
-    output = tmp_path / "topology.yaml"
-    output.write_text("preserve this file\n")
-    result = generate(
-        output,
-        scene="edge_share",
-        edge_machines="10.0.0.1",
-        cloud_machines=clouds,
-        cloud_cards="0:4,1:4",
-        dp=dp,
-        port_base=port,
-    )
-    assert result.returncode != 0
-    assert output.read_text() == "preserve this file\n"
-
-
-@pytest.mark.parametrize(
     "scene,edges",
     [
         ("single_instance", "10.0.0.1"),
@@ -200,47 +147,6 @@ def test_cloud_size_is_not_inferred_from_host_address(
     edge_count = 1 if scene == "single_instance" else 2
     assert topology.deployment.hccl_world_size == edge_count + cards
     assert [len(d.ranks) for d in topology.clouds[0].dp] == [cards // dp] * dp
-
-
-@pytest.mark.parametrize(
-    "cards,dp,match",
-    [
-        (None, "1", "required"),
-        ("0:0", "1", "positive"),
-        ("0:-1", "1", "ID:count"),
-        ("0:3", "2", "divisible"),
-        ("0:4,0:4", "1", "duplicate"),
-        ("1:4", "1", "every cloud instance"),
-        ("0:4,1:4", "1", "every cloud instance"),
-        ("4", "1", "ID:count"),
-        ("0:4", "0", "positive integer"),
-    ],
-)
-def test_invalid_card_counts_preserve_existing_yaml(
-    tmp_path: Path, cards: str | None, dp: str, match: str
-) -> None:
-    output = tmp_path / "topology.yaml"
-    output.write_text("keep existing yaml\n")
-    command = [
-        sys.executable,
-        str(GENERATOR),
-        "--scene",
-        "single_instance",
-        "--edge-machines",
-        "10.0.0.1",
-        "--cloud-machines",
-        "10.1.0.1",
-        "--dp",
-        dp,
-        "-o",
-        str(output),
-    ]
-    if cards is not None:
-        command.extend(["--cloud-cards", cards])
-    result = subprocess.run(command, capture_output=True, text=True)
-    assert result.returncode != 0
-    assert match in result.stderr
-    assert output.read_text() == "keep existing yaml\n"
 
 
 @pytest.mark.parametrize(
@@ -292,60 +198,91 @@ def test_allocation_rules_scale_beyond_two_instances_and_two_dps(
         assert len(set(endpoints)) == len(endpoints)
 
 
-def test_colocated_cloud_port_overflow_preserves_output(tmp_path: Path) -> None:
-    output = tmp_path / "topology.yaml"
-    output.write_text("keep existing yaml\n")
-    result = generate(
-        output,
-        scene="lwd_cluster",
-        edge_machines="10.0.0.1,10.0.0.2",
-        cloud_machines="0@10.1.0.1,1@10.1.0.1",
-        cloud_cards="0:4,1:4",
-        port_base=65535,
-    )
-    assert result.returncode != 0
-    assert "ctrl_port" in result.stderr
-    assert output.read_text() == "keep existing yaml\n"
+_SCENE_INPUTS = {
+    "single_instance": ("10.0.0.1", "10.1.0.1", "0:8"),
+    "edge_share": ("10.0.0.1", "0@10.1.0.1,1@10.1.0.2", "0:4,1:4"),
+    "cloud_share": ("0@10.0.0.1,1@10.0.0.2", "10.1.0.1", "0:8"),
+    "lwd_cluster": ("10.0.0.1,10.0.0.2", "0@10.1.0.1,1@10.1.0.1", "0:4,1:4"),
+}
 
 
 @pytest.mark.parametrize(
-    "scene,edges,clouds,cards,match",
+    "scene,overrides,match",
     [
         (
+            "cloud_share",
+            {"edge_machines": "0@10.0.0.1,0@10.0.0.2"},
+            "unique and contiguous",
+        ),
+        (
+            "cloud_share",
+            {"edge_machines": "0@10.0.0.1,2@10.0.0.2"},
+            "unique and contiguous",
+        ),
+        ("cloud_share", {"edge_machines": "0@10.0.0.1,10.0.0.2"}, "Do not mix"),
+        ("cloud_share", {"dp": "1,2"}, "invalid int value"),
+        # Match card IDs so these cases reach duplicate/gapped instance ID checks.
+        (
             "edge_share",
-            "10.0.0.1",
-            "10.1.0.1,10.1.0.2",
-            "0:4,1:4",
+            {"cloud_machines": "0@10.1.0.1,0@10.1.0.2", "cloud_cards": "0:4"},
+            "unique and contiguous",
+        ),
+        (
+            "edge_share",
+            {"cloud_machines": "0@10.1.0.1,2@10.1.0.2", "cloud_cards": "0:4,2:4"},
+            "unique and contiguous",
+        ),
+        ("edge_share", {"cloud_machines": "0@10.1.0.1,10.1.0.2"}, "Do not mix"),
+        (
+            "edge_share",
+            {"cloud_machines": "10.1.0.1,10.1.0.1"},
             "--cloud-machines ID@IP",
         ),
         (
             "edge_share",
-            "0@10.0.0.1,1@10.0.0.1",
-            "0@10.1.0.1,1@10.1.0.1",
-            "0:4,1:4",
-            "one plain edge IP",
+            {"cloud_machines": "0@10.1.0.1,1@10.1.0.1,2@10.1.0.1"},
+            "every cloud instance",
         ),
+        ("edge_share", {"dp": 8}, "divisible"),
+        ("edge_share", {"dp": 2, "port_base": 65535}, "within 1..65535"),
+        ("single_instance", {"cloud_cards": None}, "required"),
+        ("single_instance", {"cloud_cards": "0:0"}, "positive"),
+        ("single_instance", {"cloud_cards": "0:-1"}, "ID:count"),
+        ("single_instance", {"cloud_cards": "0:3", "dp": 2}, "divisible"),
+        ("single_instance", {"cloud_cards": "0:4,0:4"}, "duplicate"),
+        ("single_instance", {"cloud_cards": "1:4"}, "every cloud instance"),
+        ("single_instance", {"cloud_cards": "0:4,1:4"}, "every cloud instance"),
+        ("single_instance", {"cloud_cards": "4"}, "ID:count"),
+        ("single_instance", {"cloud_cards": "0:4", "dp": 0}, "positive integer"),
+        ("lwd_cluster", {"port_base": 65535}, "ctrl_port"),
+        (
+            "edge_share",
+            {"cloud_machines": "10.1.0.1,10.1.0.2"},
+            "--cloud-machines ID@IP",
+        ),
+        ("edge_share", {"edge_machines": "0@10.0.0.1,1@10.0.0.1"}, "one plain edge IP"),
         (
             "cloud_share",
-            "10.0.0.1,10.0.0.2",
-            "10.1.0.1",
-            "0:8",
+            {"edge_machines": "10.0.0.1,10.0.0.2"},
             "--edge-machines ID@IP",
         ),
     ],
 )
-def test_scene_requires_ids_only_where_instances_are_listed(
-    tmp_path: Path, scene: str, edges: str, clouds: str, cards: str, match: str
+def test_rejected_input_preserves_existing_yaml(
+    tmp_path: Path, scene: str, overrides: dict[str, str | int | None], match: str
 ) -> None:
+    edges, clouds, cards = _SCENE_INPUTS[scene]
+    options: dict[str, str | int | None] = {
+        "scene": scene,
+        "edge_machines": edges,
+        "cloud_machines": clouds,
+        "cloud_cards": cards,
+        "dp": 1,
+        "port_base": 6020,
+    }
     output = tmp_path / "topology.yaml"
     output.write_text("keep existing yaml\n")
-    result = generate(
-        output,
-        scene=scene,
-        edge_machines=edges,
-        cloud_machines=clouds,
-        cloud_cards=cards,
-    )
+    result = generate(output, **(options | overrides))
     assert result.returncode != 0
     assert match in result.stderr
     assert output.read_text() == "keep existing yaml\n"
