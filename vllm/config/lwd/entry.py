@@ -46,9 +46,12 @@ class LwdConfig:
         topology = LwdTopology.from_file(path)
         topology.instance(role, identity)
         coordination = None
-        if topology.coordination is not None:
+        # coordination is embedded in each instance, not at the top level.
+        instance = topology.instance(role, identity)
+        if instance.coordination is not None:
+            coord_dict = asdict(instance.coordination)
             coordination = LwdCoordinationConfig.from_dict(
-                asdict(topology.coordination),
+                coord_dict,
                 cloud_id=identity if role == "cloud" else None,
             )
             coordination.validate_role(role)

@@ -117,10 +117,11 @@ def build_topology(
     *,
     cloud_cards: str,
     tenant_key_file: str = "/run/secrets/edge-cloud-tenant-key",
-    consumer_id: str = "enterprise-a",
+    consumer_ids: str = "enterprise-a",
     connect_timeout: float = 5.0,
     listen_host: str = "0.0.0.0",
     listen_port: int = 8100,
+    control_url: str | None = None,
 ) -> dict[str, Any]:
     """Allocate global ranks; host-local physical devices remain launch settings."""
     if scene not in SCENES:
@@ -166,17 +167,33 @@ def build_topology(
         "instance_links": links,
     }
     if scene == "cloud_share":
-        # control_url points to the single cloud instance's coordination service.
-        cloud_ip = cloud_instances[0][1]
-        result["coordination"] = {
-            "enabled": True,
-            "control_url": f"http://{cloud_ip}:{listen_port}/v1/chat/completions",
-            "tenant_key_file": tenant_key_file,
-            "consumer_id": consumer_id,
-            "listen_host": listen_host,
-            "listen_port": listen_port,
-            "connect_timeout": connect_timeout,
-        }
+        # Parse consumer_ids into a list, one per edge instance.
+        consumer_id_list = [cid.strip() for cid in consumer_ids.split(",")]
+        if len(consumer_id_list) != len(edges):
+            raise ValueError(
+                f"--consumer-ids count ({len(consumer_id_list)}) must match "
+                f"edge instance count ({len(edges)})"
+            )
+        # control_url: use user-provided value, or auto-derive from cloud IP + port.
+        if control_url is None:
+            cloud_ip = cloud_instances[0][1]
+            control_url = f"http://{cloud_ip}:{listen_port}/v1/chat/completions"
+        # Embed coordination into each edge instance (edge-side fields).
+        for i, edge in enumerate(edges):
+            edge["coordination"] = {
+                "enabled": True,
+                "control_url": control_url,
+                "tenant_key_file": tenant_key_file,
+                "consumer_id": consumer_id_list[i],
+                "connect_timeout": connect_timeout,
+            }
+        # Embed coordination into each cloud instance (cloud-side fields).
+        for cloud in clouds:
+            cloud["coordination"] = {
+                "enabled": True,
+                "listen_host": listen_host,
+                "listen_port": listen_port,
+            }
     return result
 
 
@@ -207,9 +224,14 @@ def main() -> None:
         help="cloud_share only: tenant key file path on edge side",
     )
     parser.add_argument(
-        "--consumer-id",
+        "--consumer-ids",
         default="enterprise-a",
-        help="cloud_share only: edge-side consumer identifier",
+        help="cloud_share only: comma-separated consumer IDs, one per edge instance",
+    )
+    parser.add_argument(
+        "--control-url",
+        default=None,
+        help="cloud_share only: edge->cloud control service URL; auto-derived if omitted",
     )
     parser.add_argument(
         "--connect-timeout",
@@ -241,7 +263,8 @@ def main() -> None:
             args.port_base,
             cloud_cards=args.cloud_cards,
             tenant_key_file=args.tenant_key_file,
-            consumer_id=args.consumer_id,
+            consumer_ids=args.consumer_ids,
+            control_url=args.control_url,
             connect_timeout=args.connect_timeout,
             listen_host=args.listen_host,
             listen_port=args.listen_port,
