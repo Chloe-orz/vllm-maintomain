@@ -46,7 +46,7 @@ def test_log_contains_complete_selected_config_without_reading_key_contents(
     line = caplog.records[-1].getMessage()
     assert line.startswith("[LWD][config] resolved=")
     result = json.loads(line.split("resolved=", 1)[1])
-    assert result["metadata_only"] is True
+    assert "metadata_only" not in result
     actual = result["lwd_config"]
     assert (actual["path"], actual["role"], actual["instance_id"]) == (
         str(path),

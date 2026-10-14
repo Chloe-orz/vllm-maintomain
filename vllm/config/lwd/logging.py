@@ -12,7 +12,6 @@ from .entry import LwdConfig
 def log_lwd_config(logger: logging.Logger, config: LwdConfig) -> None:
     """Emit one startup record with all fields, defaults and selected connections."""
     snapshot = {
-        "metadata_only": True,
         "lwd_config": asdict(config),
         "selected_instance": asdict(config.instance),
         "connections": [
