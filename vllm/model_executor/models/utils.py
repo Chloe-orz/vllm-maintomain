@@ -868,10 +868,21 @@ def make_layers(
     Returns:
         Tuple of (start_layer, end_layer, modules).
     """
+    from vllm.config import get_current_vllm_config_or_none
     from vllm.distributed.parallel_state import get_pp_group
     from vllm.distributed.utils import get_pp_indices
     from vllm.model_executor.offloader import get_offloader
 
+    config = get_current_vllm_config_or_none()
+    lwd = config.lwd_config if config is not None else None
+    if lwd is not None and lwd.role == "edge":
+        # The edge calls embedding and lm_head directly, so decoder weights
+        # must never be allocated or loaded. Native TP groups remain intact.
+        return (
+            0,
+            0,
+            torch.nn.ModuleList(PPMissingLayer() for _ in range(num_hidden_layers)),
+        )
     start_layer, end_layer = get_pp_indices(
         num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
     )
