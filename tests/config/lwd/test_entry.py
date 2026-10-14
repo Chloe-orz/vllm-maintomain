@@ -36,8 +36,11 @@ def test_runtime_selects_the_same_link_on_both_sides(
             }
         }
     )
-    link = config.runtime_connection
+    # Runtime connection selection must survive a configuration handoff.
+    received = pickle.loads(pickle.dumps(config))
+    link = received.runtime_connection
     assert (link.edge.addr, link.cloud.addr) == ("10.0.0.1", "10.1.0.1")
+    assert len(link.cloud.ranks) == 8
 
 
 @pytest.mark.parametrize(
@@ -60,8 +63,16 @@ def test_runtime_rejects_unsupported_layout_without_discarding_links(
             }
         }
     )
-    with pytest.raises(ValueError, match="single_instance, DP=1"):
+    links_before = config.connections
+    with pytest.raises(ValueError, match="single_instance, DP=1") as error:
         _ = config.runtime_connection
+    message = str(error.value)
+    assert f"path={config.path!r}" in message
+    assert f"scene={config.topology.deployment.scene!r}" in message
+    assert "role='edge', instance_id=0" in message
+    selected = [(link.edge_id, link.cloud_id, link.dp_idx) for link in links_before]
+    assert f"connections(edge_id, cloud_id, dp_idx)={selected!r}" in message
+    assert config.connections == links_before
 
 
 def test_snapshot_survives_handoff_without_yaml_or_key_access(
