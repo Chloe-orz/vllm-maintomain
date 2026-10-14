@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """边侧引擎子类:通信面装配(POST_OUT bind/PRE_OUT 延迟连接)、
 HELLO 发现与互校、请求入口覆写。步进零覆写,直用原生
 step_with_batch_queue(批队列),LWD 契约经三项构造期适配满足:
@@ -11,6 +14,7 @@ bind POST_OUT、起接收线程、阻塞等云首拍 HELLO(云全量初始化后
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections import deque
 
@@ -22,7 +26,6 @@ from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
 from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
 )
-from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdC2eNotify,
     LwdHelloNotify,
@@ -37,6 +40,7 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
 )
+from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 
 logger = init_logger(__name__)
 
@@ -49,34 +53,38 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     """边 PO 引擎:通信面装配 + HELLO 互校 + 原生步进适配。"""
 
     lwd_scheduler_cls = LwdEdgeScheduler
+    scheduler: LwdEdgeScheduler
+    _lwd_publisher: LwdControlPublisher
+    _lwd_subscriber: LwdControlSubscriber
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         config = self.lwd_config
         # 层日志总开关:env 已开则不动,config 段开则补开(仅本进程)
-        LwdControlDiag.set_debug(config.debug)
+        LwdControlDiag.set_debug(logger.isEnabledFor(logging.DEBUG))
+        transport = config.transport
+        post_out = transport.endpoints(config.runtime_connection)["post_out"]
         # 通信面:bind POST_OUT 订阅面 + 延迟连接的 PRE_OUT 发布面;
         # 云端点由 HELLO 通告决定(边不预知云地址)
         self._lwd_subscriber = LwdControlSubscriber(
-            config.lwd_post_out_bind_endpoint(),
+            post_out,
             bind=True,
             decoder=lwd_decode_cloud_notify,
         )
         self._lwd_publisher = LwdControlPublisher(
-            None, bind=False, queue_max=config.publish_queue_max
+            None, bind=False, queue_max=transport.publish_queue_max
         )
         hello_event = threading.Event()
         self._lwd_subscriber.start(
             lambda msg: self._lwd_on_message(msg, hello_event),
             name="lwd-post-in",
         )
-        if not hello_event.wait(config.hello_timeout_s):
+        if not hello_event.wait(transport.hello_timeout_s):
             self._lwd_shutdown_comm()
             raise RuntimeError(
                 f"[Lwd] edge engine init failed: no cloud HELLO within "
-                f"{config.hello_timeout_s}s on POST_OUT "
-                f"(bind {config.lwd_post_out_bind_endpoint()}; check cloud "
-                f"master_addr connectivity and POST_OUT port)"
+                f"{transport.hello_timeout_s}s on POST_OUT "
+                f"(bind {post_out}; check the edge address and POST_OUT port)"
             )
         self._lwd_cross_check_hello()
         self.scheduler.lwd_edge_publisher = self._lwd_publisher
@@ -94,12 +102,11 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         logger.info(
             "[Lwd] edge engine assembled: POST_OUT bind %s, PRE_OUT "
             "discovered, native batch-queue stepping depth=%d",
-            config.lwd_post_out_bind_endpoint(), self.batch_queue_size,
+            post_out,
+            self.batch_queue_size,
         )
 
-    def _lwd_on_message(
-        self, msg, hello_event: threading.Event
-    ) -> None:
+    def _lwd_on_message(self, msg, hello_event: threading.Event) -> None:
         """POST_OUT 消息处理(接收线程):HELLO -> retarget PRE_OUT(云端点
         唯一事实源,队满自旋重试);C2e -> 调度器通告队列 + WAKEUP 敲门;
         未知帧告警丢弃。"""
@@ -110,9 +117,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             while not self._lwd_publisher.retarget(endpoint):
                 if self._lwd_subscriber.closed:
                     break
-                logger.warning(
-                    "[Lwd] PRE_OUT retarget deferred (queue full), retrying"
-                )
+                logger.warning("[Lwd] PRE_OUT retarget deferred (queue full), retrying")
                 threading.Event().wait(0.05)
             hello_event.set()
         elif isinstance(msg, LwdC2eNotify):
@@ -122,7 +127,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             logger.warning("[Lwd] drop unexpected POST_OUT frame %r", type(msg))
 
     def _lwd_cross_check_hello(self) -> None:
-        """HELLO 互校:max_num_batched_tokens/max_num_seqs 与云不一致即关停 fail-fast(不一致不报错,只会 preflight 恒 hold 静默串行);spec 系数以云为准采纳并复核活性;mrope 模型遇旧 wire 版本关停。"""
+        """Check peer scheduling budgets and adopt the cloud's draft budget."""
         hello = self._lwd_peer_hello
         sched = self.vllm_config.scheduler_config
         spec_config = getattr(self.vllm_config, "speculative_config", None)
@@ -152,13 +157,15 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             logger.warning(
                 "[Lwd] adopt cloud spec_factor=%d over edge local %d "
                 "(edge has no legitimate local source for it)",
-                remote[2] + 1, local[2] + 1,
+                remote[2] + 1,
+                local[2] + 1,
             )
             self.scheduler._lwd_spec_factor = remote[2] + 1
             # 采纳后复核活性下界(构造期检查用的是本地 factor)
             if (
                 self.scheduler.max_num_scheduled_tokens
-                - self.scheduler.max_num_running_reqs * (remote[2] + 1) < 1
+                - self.scheduler.max_num_running_reqs * (remote[2] + 1)
+                < 1
             ):
                 self._lwd_shutdown_comm()
                 raise RuntimeError(

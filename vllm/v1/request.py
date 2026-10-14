@@ -57,6 +57,8 @@ class StreamingUpdate:
 
 
 class Request:
+    lwd_embeds_placeholder: bool = False
+
     def __init__(
         self,
         request_id: str,

@@ -1,8 +1,17 @@
-"""边/云引擎公共基类:调度器注入时序、配置挂载与收发两面生命周期。"""
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Shared edge/cloud engine initialization and control transport ownership."""
 
 from __future__ import annotations
 
+from vllm.config.lwd import LwdConfig
 from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
+    LwdControlPublisher,
+)
+from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
+    LwdControlSubscriber,
+)
 
 
 class LwdBaseEngineCore(EngineCoreProc):
@@ -15,11 +24,17 @@ class LwdBaseEngineCore(EngineCoreProc):
     记账(执行层只 embed 切片),构造后恢复使开关仅作用于 LWD 引擎。"""
 
     lwd_scheduler_cls: type
+    lwd_config: LwdConfig
+    _lwd_publisher: LwdControlPublisher | None
+    _lwd_subscriber: LwdControlSubscriber | None
 
     def __init__(self, *args, **kwargs) -> None:
         self._lwd_publisher = None
         self._lwd_subscriber = None
         vllm_config = kwargs["vllm_config"]
+        self.lwd_config = vllm_config.lwd_config
+        # Reject unsupported runtime layouts before allocating any model workers.
+        _ = self.lwd_config.runtime_connection
         scheduler_config = vllm_config.scheduler_config
         scheduler_config.scheduler_cls = self.lwd_scheduler_cls
         chunked_prefill_wanted = scheduler_config.enable_chunked_prefill
