@@ -5,11 +5,63 @@ import argparse
 import copy
 import pickle
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-from lwd_config_under_test import LwdAPIConfig, resolve_lwd_config
+from lwd_config_under_test import LwdAPIConfig, lwd_spec_factor, resolve_lwd_config
 
 FIXTURE_NAME = "s3_cloud_share_2dp.yaml"
+
+
+@pytest.mark.parametrize("drafts,expected", [(None, 1), (1, 2), (3, 4)])
+def test_spec_factor_reserves_target_and_draft_tokens(
+    drafts: int | None, expected: int
+) -> None:
+    speculative = (
+        None if drafts is None else SimpleNamespace(num_speculative_tokens=drafts)
+    )
+    assert lwd_spec_factor(SimpleNamespace(speculative_config=speculative)) == expected
+
+
+@pytest.mark.parametrize("role", ["edge", "cloud"])
+def test_runtime_selects_the_same_link_on_both_sides(
+    role: str, lwd_yaml_dir: Path
+) -> None:
+    config = resolve_lwd_config(
+        {
+            "lwd_config": {
+                "path": str(lwd_yaml_dir / "s1_single_instance_1dp.yaml"),
+                "role": role,
+                "instance_id": 0,
+            }
+        }
+    )
+    link = config.runtime_connection
+    assert (link.edge.addr, link.cloud.addr) == ("10.0.0.1", "10.1.0.1")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "s1_single_instance_2dp.yaml",
+        "s2_edge_share_1dp.yaml",
+        "s3_cloud_share_1dp.yaml",
+    ],
+)
+def test_runtime_rejects_unsupported_layout_without_discarding_links(
+    name: str, lwd_yaml_dir: Path
+) -> None:
+    config = resolve_lwd_config(
+        {
+            "lwd_config": {
+                "path": str(lwd_yaml_dir / name),
+                "role": "edge",
+                "instance_id": 0,
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="single_instance, DP=1"):
+        _ = config.runtime_connection
 
 
 def test_snapshot_survives_handoff_without_yaml_or_key_access(

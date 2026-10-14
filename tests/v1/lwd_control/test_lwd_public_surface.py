@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """外部接入面守卫测试 + 包内依赖方向守卫。
 
 core.py 内联读 vllm_config.lwd_config 选引擎类;serve.py 不再接触
@@ -7,9 +10,12 @@ lwd_control;重量级模块(需 torch 的引擎/调度器)以 find_spec 断言
 
 from __future__ import annotations
 
+import ast
 import importlib
 import importlib.util
+import sys
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -64,11 +70,47 @@ def test_external_entry_sites():
     assert "lwd_control" not in serve
 
 
+@pytest.mark.parametrize("role", [None, "edge", "cloud"])
+def test_engine_selection_accepts_absent_config_and_current_roles(
+    role: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Execute the real selection block without loading a device runtime."""
+    tree = ast.parse((VLLM_DIR / "v1/engine/core.py").read_text())
+    selection = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(child, ast.ImportFrom)
+            and any(alias.name == "lwd_edge_engine" for alias in child.names)
+            for child in ast.walk(node)
+        )
+        and "lwd" in ast.unparse(node.test)
+    )
+    central, edge, cloud = object(), object(), object()
+    for name, expected in [("edge", edge), ("cloud", cloud)]:
+        path = f"vllm.v1.lwd_control.control_{name}_scheduler.lwd_{name}_engine"
+        module = ModuleType(path)
+        setattr(module, f"Lwd{name.title()}EngineCore", expected)
+        monkeypatch.setitem(sys.modules, path, module)
+    scope = {
+        "lwd": None if role is None else SimpleNamespace(role=role),
+        "engine_cls": central,
+    }
+    exec(
+        compile(ast.Module(body=[selection], type_ignores=[]), "core.py", "exec"), scope
+    )
+    assert scope["engine_cls"] is {None: central, "edge": edge, "cloud": cloud}[role]
+
+
 def test_cloud_scheduler_keeps_debug_static_method():
     """lwd_debug 引用的静态方法名仍在(文本守卫,免 torch);core.py 无
     LWD 模型输出钩子(c2e 收编调度器 update_from_output + 引擎 post_step)。"""
     source = (
-        VLLM_DIR / "v1" / "lwd_control" / "control_cloud_scheduler"
+        VLLM_DIR
+        / "v1"
+        / "lwd_control"
+        / "control_cloud_scheduler"
         / "lwd_cloud_scheduler.py"
     ).read_text()
     assert "def _lwd_c2e_finish_reasons(" in source

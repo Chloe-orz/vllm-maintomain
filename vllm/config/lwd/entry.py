@@ -65,3 +65,15 @@ class LwdConfig:
     @property
     def connections(self) -> tuple[LwdDPConnection, ...]:
         return self.topology.connections(self.role, self.instance_id)
+
+    @property
+    def runtime_connection(self) -> LwdDPConnection:
+        """Select the supported runtime link without changing the YAML schema."""
+        links = self.connections
+        if (
+            self.topology.deployment.scene != "single_instance"
+            or len(links) != 1
+            or links[0].dp_idx != 0
+        ):
+            raise ValueError("[LWD] runtime currently requires single_instance, DP=1")
+        return links[0]

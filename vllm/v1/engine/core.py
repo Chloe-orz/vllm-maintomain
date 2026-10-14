@@ -1329,19 +1329,19 @@ class EngineCoreProc(EngineCore):
                 # unless the mode is enabled (vanilla EngineCoreProc).
                 lwd = vllm_config.lwd_config
                 engine_cls = EngineCoreProc
-                if lwd.enabled and lwd.mode == "prefill_only":
-                    if lwd.is_edge:
-                        from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
-                            LwdEdgeEngineCore,
+                if lwd is not None:
+                    if lwd.role == "edge":
+                        from vllm.v1.lwd_control.control_edge_scheduler import (
+                            lwd_edge_engine,
                         )
 
-                        engine_cls = LwdEdgeEngineCore
+                        engine_cls = lwd_edge_engine.LwdEdgeEngineCore
                     else:
-                        from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
-                            LwdCloudEngineCore,
+                        from vllm.v1.lwd_control.control_cloud_scheduler import (
+                            lwd_cloud_engine,
                         )
 
-                        engine_cls = LwdCloudEngineCore
+                        engine_cls = lwd_cloud_engine.LwdCloudEngineCore
                 engine_core = engine_cls(*args, engine_index=dp_rank, **kwargs)
 
             assert engine_core is not None

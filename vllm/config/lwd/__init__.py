@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Device-independent LWD configuration, without execution hooks."""
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .api import LwdAPIConfig
 from .coordination import LwdCoordinationConfig
@@ -10,6 +10,9 @@ from .entry import LwdConfig
 from .logging import log_lwd_config
 from .topology import LwdTopology
 from .transport import LwdTransportConfig
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 __all__ = [
     "LwdAPIConfig",
@@ -19,6 +22,7 @@ __all__ = [
     "LwdTransportConfig",
     "log_lwd_config",
     "resolve_lwd_config",
+    "lwd_spec_factor",
 ]
 
 
@@ -45,3 +49,9 @@ def resolve_lwd_config(
     if lwd is None and api is not None:
         api.validate_topology(None)
     return lwd
+
+
+def lwd_spec_factor(config: "VllmConfig") -> int:
+    """Reserve the draft tokens and the target model's bonus token together."""
+    speculative = config.speculative_config
+    return 1 if speculative is None else speculative.num_speculative_tokens + 1
