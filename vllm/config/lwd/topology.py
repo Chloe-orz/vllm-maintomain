@@ -8,6 +8,7 @@ from hashlib import sha256
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import (
@@ -67,6 +68,33 @@ class LwdFeatures:
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class LwdCoordination:
+    """Prefix-cache coordination block, embedded per instance for cloud_share."""
+
+    enabled: StrictBool = False
+    # Edge-side fields
+    control_url: LwdString | None = None
+    tenant_key_file: LwdString | None = None
+    consumer_id: LwdString | None = None
+    # Cloud-side fields
+    listen_host: LwdString = "0.0.0.0"
+    listen_port: LwdPort = 8100
+    # Shared
+    connect_timeout: Annotated[
+        float, Field(strict=True, gt=0, allow_inf_nan=False)
+    ] = 10.0
+
+    @field_validator("control_url")
+    @classmethod
+    def validate_url(cls, value: str | None) -> str | None:
+        if value is not None:
+            url = urlsplit(value)
+            if url.scheme not in ("http", "https") or not url.hostname:
+                raise ValueError("[LWD] control_url must be an HTTP(S) endpoint")
+        return value
+
+
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LwdDP:
     dp_idx: LwdId
     addr: Annotated[StrictStr, AfterValidator(_address)]
@@ -78,6 +106,7 @@ class LwdDP:
 class LwdInstance:
     id: LwdId
     dp: Annotated[tuple[LwdDP, ...], Field(min_length=1)]
+    coordination: LwdCoordination | None = None
 
     @field_validator("dp")
     @classmethod
@@ -244,6 +273,27 @@ class LwdTopology:
             raise ValueError("[LWD] cloud_share requires multiple edges and one cloud")
         if scene == "lwd_cluster" and (edge_count < 2 or cloud_count < 2):
             raise ValueError("[LWD] lwd_cluster requires multiple edges and clouds")
+        # coordination only exists for cloud_share, embedded in each instance
+        if scene == "cloud_share":
+            for edge in self.edges:
+                if edge.coordination is None or not edge.coordination.enabled:
+                    raise ValueError(
+                        "[LWD] cloud_share requires each edge instance to have "
+                        "an enabled coordination block"
+                    )
+            for cloud in self.clouds:
+                if cloud.coordination is None or not cloud.coordination.enabled:
+                    raise ValueError(
+                        "[LWD] cloud_share requires each cloud instance to have "
+                        "an enabled coordination block"
+                    )
+        else:
+            for instance in (*self.edges, *self.clouds):
+                if instance.coordination is not None:
+                    raise ValueError(
+                        f"[LWD] coordination is only allowed in cloud_share scene, "
+                        f"got scene={scene}"
+                    )
         if scene == "edge_share":
             if edge_count != cloud_count or cloud_count < 2:
                 raise ValueError(

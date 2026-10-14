@@ -116,6 +116,12 @@ def build_topology(
     port_base: int,
     *,
     cloud_cards: str,
+    tenant_key_file: str = "/run/secrets/edge-cloud-tenant-key",
+    consumer_ids: str = "enterprise-a",
+    connect_timeout: float = 5.0,
+    listen_host: str = "0.0.0.0",
+    listen_port: int = 8100,
+    control_url: str | None = None,
 ) -> dict[str, Any]:
     """Allocate global ranks; host-local physical devices remain launch settings."""
     if scene not in SCENES:
@@ -147,7 +153,7 @@ def build_topology(
             for cloud in clouds
         ]
     )
-    return {
+    result: dict[str, Any] = {
         "deployment": {
             "mode": 0,
             "scene": scene,
@@ -160,6 +166,35 @@ def build_topology(
         "clouds": clouds,
         "instance_links": links,
     }
+    if scene == "cloud_share":
+        # Parse consumer_ids into a list, one per edge instance.
+        consumer_id_list = [cid.strip() for cid in consumer_ids.split(",")]
+        if len(consumer_id_list) != len(edges):
+            raise ValueError(
+                f"--consumer-ids count ({len(consumer_id_list)}) must match "
+                f"edge instance count ({len(edges)})"
+            )
+        # control_url: use user-provided value, or auto-derive from cloud IP + port.
+        if control_url is None:
+            cloud_ip = cloud_instances[0][1]
+            control_url = f"http://{cloud_ip}:{listen_port}/v1/chat/completions"
+        # Embed coordination into each edge instance (edge-side fields).
+        for i, edge in enumerate(edges):
+            edge["coordination"] = {
+                "enabled": True,
+                "control_url": control_url,
+                "tenant_key_file": tenant_key_file,
+                "consumer_id": consumer_id_list[i],
+                "connect_timeout": connect_timeout,
+            }
+        # Embed coordination into each cloud instance (cloud-side fields).
+        for cloud in clouds:
+            cloud["coordination"] = {
+                "enabled": True,
+                "listen_host": listen_host,
+                "listen_port": listen_port,
+            }
+    return result
 
 
 def _validate(raw: dict[str, Any]) -> None:
@@ -184,6 +219,38 @@ def main() -> None:
     parser.add_argument("--enable-early-recv", action="store_true")
     parser.add_argument("--enable-scramble", action="store_true")
     parser.add_argument(
+        "--tenant-key-file",
+        default="/run/secrets/edge-cloud-tenant-key",
+        help="cloud_share only: tenant key file path on edge side",
+    )
+    parser.add_argument(
+        "--consumer-ids",
+        default="enterprise-a",
+        help="cloud_share only: comma-separated consumer IDs, one per edge instance",
+    )
+    parser.add_argument(
+        "--control-url",
+        default=None,
+        help="cloud_share only: edge->cloud control service URL; auto-derived if omitted",
+    )
+    parser.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=5.0,
+        help="cloud_share only: edge->cloud control connection timeout (seconds)",
+    )
+    parser.add_argument(
+        "--listen-host",
+        default="0.0.0.0",
+        help="cloud_share only: cloud-side coordination service listen host",
+    )
+    parser.add_argument(
+        "--listen-port",
+        type=int,
+        default=8100,
+        help="cloud_share only: cloud-side coordination service listen port",
+    )
+    parser.add_argument(
         "-o", "--output", type=Path, required=True, help="One output YAML file"
     )
     args = parser.parse_args()
@@ -195,6 +262,12 @@ def main() -> None:
             args.dp,
             args.port_base,
             cloud_cards=args.cloud_cards,
+            tenant_key_file=args.tenant_key_file,
+            consumer_ids=args.consumer_ids,
+            control_url=args.control_url,
+            connect_timeout=args.connect_timeout,
+            listen_host=args.listen_host,
+            listen_port=args.listen_port,
         )
         raw["feature_ctrl"] = {
             "enable_early_recv": args.enable_early_recv,
