@@ -56,7 +56,10 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
     _lwd_subscriber: LwdControlSubscriber
 
     def __init__(self, *args, **kwargs) -> None:
+        self._lwd_recv_hint_mq = None
+        self._lwd_irecv_done_mq = None
         super().__init__(*args, **kwargs)
+        self._lwd_register_recv_hint()
         # PRE_OUT 接收线程构造期即起,与父线程 socket IO 共用 input_queue
         # (部署校验在 _lwd_setup_zmq 头部,失败走 EXECUTOR_FAILED 升级)
         threading.Thread(
@@ -87,7 +90,6 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         )
         # 首拍即通告(边侧可能已 bind 等待)
         self._lwd_announce()
-        self._lwd_register_recv_hint()
         logger.info(
             "[LWD] cloud engine assembled: PRE_OUT bind %s, POST_OUT connect %s",
             endpoints["pre_out"],
@@ -95,27 +97,25 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         )
 
     def _lwd_register_recv_hint(self) -> None:
-        """[Lwd][pre-recv] 提前收:提示下发通道 = 引擎 -> 云端点 worker
-        通信线程。走 executor 上的旁路 MQ(不是 rpc_broadcast_mq:那条由
-        busy_loop 单线程消费,会被几百毫秒的 prefill 前向堵住,提示就
-        "早"不起来了)。引擎在 super().__init__ 里就把 executor 建好了,
-        故此处直接取。"""
-        hint_mq = getattr(self.model_executor, "lwd_recv_hint_mq", None)
-        if hint_mq is not None:
-            from vllm_ascend.distributed.lwd_comm.pre_recv import (
-                register_hint_sender,
-            )
+        if not self.lwd_config.topology.feature_ctrl.enable_early_recv:
+            return
+        from vllm_ascend.distributed.lwd_comm.pre_recv import (
+            connect_recv_queues,
+            register_hint_sender,
+        )
 
-            # 阻塞投递:闸门开启时提示是正确性依赖,丢一条就没人提前挂该 recv,
-            # 水位不前进,闸门后的批永不下发。
-            register_hint_sender(lambda hint, mq=hint_mq: mq.enqueue(hint))
-            logger.info("[Lwd][pre-recv] hint sender registered (PD_mix -> hint MQ)")
-        else:
-            # PD_mix 是唯一调度形态:hint MQ 缺失 = 提示发不出去,闸门永不
-            # 放行,必须显式可见
-            logger.warning(
-                "[Lwd][pre-recv] hint MQ missing: pre-recv gate will never open"
-            )
+        # Only queue setup uses RPC; hints bypass the model execution loop.
+        hints, done = connect_recv_queues(self.model_executor)
+        self._lwd_recv_hint_mq, self._lwd_irecv_done_mq = hints, done
+        register_hint_sender(hints.enqueue)
+        logger.info("[LWD] cloud early receive enabled")
+
+    def shutdown(self) -> None:
+        self._lwd_shutdown_comm()
+        for queue in (self._lwd_recv_hint_mq, self._lwd_irecv_done_mq):
+            if queue is not None:
+                queue.shutdown()
+        super().shutdown()
 
     def _lwd_pre_out_loop(self) -> None:
         """Create and consume the socket on its owning IO thread."""
@@ -131,7 +131,14 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
                 if self._lwd_subscriber.closed:
                     break
                 continue
-            self._lwd_dispatch(msg)
+            try:
+                self._lwd_dispatch(msg)
+            except Exception:
+                logger.exception("[LWD] cloud control dispatch failed")
+                self.input_queue.put_nowait(
+                    (EngineCoreRequestType.EXECUTOR_FAILED, b"")
+                )
+                return
 
     def _lwd_announce(self) -> None:
         """首拍 HELLO 通告一次;队满不重试,由边侧等待超时 fail-fast 兜底。"""
@@ -166,7 +173,8 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             aux_rows = 0
             # 先打点再入队:worker 通信线程 0.5ms 就能取走,若打点在入队之后,
             # 跨进程写日志的次序会让 hint2sub 出现负值,看着像时序错乱。
-            post_irecv_hint(make_recv_hint(msg.seqno, num_tokens, aux_rows))
+            if self.lwd_config.topology.feature_ctrl.enable_early_recv:
+                post_irecv_hint(make_recv_hint(msg.seqno, num_tokens, aux_rows))
             return
         if isinstance(msg, LwdAbortNotify):
             # abort 清扫:摘除通知队列里该请求的条目——mixed 调度对
@@ -276,7 +284,7 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
 
     def _lwd_drain_irecv_completions(self) -> None:
         """每步排空 done MQ,把 worker 收完的 UP recv 并进提前收水位(闸门就绪判据)。"""
-        done_mq = getattr(self.model_executor, "lwd_irecv_done_mq", None)
+        done_mq = self._lwd_irecv_done_mq
         if done_mq is None:
             return
         from vllm_ascend.distributed.lwd_comm.pre_recv import (
@@ -288,10 +296,6 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             try:
                 items.append(done_mq.dequeue(timeout=0))
             except TimeoutError:
-                break
-            except Exception:
-                # 关停时 ring 被取消:记一条即可,水位停在原处不影响收尾
-                logger.exception("[Lwd][pre-recv] done MQ drain failed")
                 break
         if not items:
             return

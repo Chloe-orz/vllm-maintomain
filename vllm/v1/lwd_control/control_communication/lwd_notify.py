@@ -1,9 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Lwd 控制面通知:仅依赖 msgspec,不携带 tensor,只承载调度决策预告。
 上游输出类型经本模块 re-export,其余内核文件不得直接 import vllm.v1.engine。"""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Union
 
 import msgspec
 
@@ -12,7 +15,7 @@ if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutputs  # noqa: F401
 
 
-class LwdRangeItem(msgspec.Struct, gc=False):
+class LwdRangeItem(msgspec.Struct, gc=False):  # type: ignore[call-arg]
     """批量范围预告条目(mixed 组批);offset = 本 chunk 在 prompt 中的
     起点(chunk 支持已启用,lwd_chunked_prefill_design.md),云侧按
     offset == num_computed 对账。chunk 为 min(剩余 prompt, chunk 单元)
@@ -35,15 +38,16 @@ class LwdRangeItem(msgspec.Struct, gc=False):
     = 对端仍按 aux 帧协议运行(wire_version<2),云侧 fail-fast。"""
 
 
-class LwdRangeNotify(msgspec.Struct, gc=False, tag=True):
+class LwdRangeNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
     """边->云调度范围预告(PRE_OUT):items 即批(mixed 组批,一个批一个
     seqno),重复预告由云侧分类幂等剔除。"""
 
     seqno: int
     items: list[LwdRangeItem] = []
+    cancelled_req_ids: list[str] = []
 
 
-class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):
+class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
     """边->云请求预告(PRE_OUT),线上只带调度决策所需字段;block_hashes 为
     边侧算好的 prompt 满块链,供云侧前缀缓存命中,缺省空回退本地哈希。
 
@@ -59,26 +63,26 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):
     top_p: float = 1.0
     top_k: int = 0
     min_p: float = 0.0
-    seed: Optional[int] = None
+    seed: int | None = None
     repetition_penalty: float = 1.0
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     ignore_eos: bool = False
     stop_token_ids: list[int] = []
     min_tokens: int = 0
-    eos_token_id: Optional[int] = None
+    eos_token_id: int | None = None
     """结束符 id:边侧前端自 tokenizer 解析,云侧占位 prompt 无从
     得知,必须随预告透传;缺省 None = 云侧 EOS 判定落空,仅
     max_tokens 兜底(旧版边侧,additive 兼容)。"""
 
 
-class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):
+class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
     """边->云 abort 预告(PRE_OUT);云侧清理请求登记。"""
 
     request_id: str
 
 
-class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
+class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
     """云->边发现通告(POST_OUT,首拍一次);pre_out_* 是边侧连接云端点的
     唯一事实源,pre_out_host 须为边可路由真实 IP(0.0.0.0 不可作通告值)。
 
@@ -118,7 +122,7 @@ LWD_SAMPLING_FIELDS: tuple[tuple[str, object], ...] = (
 LWD_SAMPLING_DEFAULTS = dict(LWD_SAMPLING_FIELDS)
 
 
-class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
+class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
     """云->边步元数据通告(POST_OUT),先于隐藏张量到达,边侧据此预挂精确
     尺寸 recv;hidden_num_elements=0 为纯终结通告,边侧本地终结不派发 unembed。"""
 

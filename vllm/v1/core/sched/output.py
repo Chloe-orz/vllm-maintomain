@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -14,6 +14,7 @@ from vllm.v1.lwd.types import (  # noqa: F401
     LwdEmbedBatch,
     LwdUnembedBatch,
 )
+from vllm.v1.lwd_control.control_communication.lwd_notify import LwdC2eNotify
 
 if TYPE_CHECKING:
     import numpy as np
@@ -323,6 +324,7 @@ class SchedulerOutput:
     num_spec_tokens_to_schedule: int = 0
 
     lwd_batch: LwdBatch | None = None
+    lwd_c2e_notify: list["LwdC2eNotify"] = field(default_factory=list)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

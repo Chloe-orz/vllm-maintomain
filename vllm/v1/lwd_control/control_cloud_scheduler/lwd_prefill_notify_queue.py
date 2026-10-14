@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """云侧 prefill 通知队列:IO 线程投递、调度主线程消费的线程接缝。
 
 并发纪律唯一住处——一把锁串行全部操作,替代原先散在引擎与调度器
@@ -21,6 +24,7 @@ class LwdPrefillNotifyQueue:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._queue: deque[LwdRangeNotify] = deque()
+        self._last_seqno = -1
 
     def __len__(self) -> int:
         with self._lock:
@@ -30,6 +34,11 @@ class LwdPrefillNotifyQueue:
         """IO 线程投递:每条预告整条入队(重复预告即重复点名,调度器
         分类幂等剔除,无副作用;预告自带 seqno,出批时作 UP 链配对号)。"""
         with self._lock:
+            if notify.seqno <= self._last_seqno:
+                return
+            if notify.seqno != self._last_seqno + 1:
+                raise ValueError("[LWD] prompt notification sequence has a gap")
+            self._last_seqno = notify.seqno
             self._queue.append(notify)
 
     def peek(self) -> LwdRangeNotify | None:
@@ -47,21 +56,16 @@ class LwdPrefillNotifyQueue:
             return False
 
     def purge(self, request_id: str) -> int:
-        """IO 线程 abort 清扫:逐条目摘除该请求的 item,items 掏空则
-        整条移除。返回摘除 item 数(供日志)。"""
+        """Cancel model work, retaining the original wire shape until drained."""
         with self._lock:
-            kept: deque[LwdRangeNotify] = deque()
             removed = 0
             for notify in self._queue:
-                if notify.items:
-                    items = [
-                        item
-                        for item in notify.items
-                        if item.request_id != request_id
-                    ]
-                    removed += len(notify.items) - len(items)
-                    if items:
-                        notify.items = items
-                        kept.append(notify)
-            self._queue = kept
+                if request_id not in notify.cancelled_req_ids:
+                    count = sum(item.request_id == request_id for item in notify.items)
+                    if count:
+                        notify.cancelled_req_ids = [
+                            *notify.cancelled_req_ids,
+                            request_id,
+                        ]
+                        removed += count
             return removed

@@ -23,6 +23,7 @@ class LwdEmbedBatch(msgspec.Struct, tag=True):  # type: ignore[call-arg]
     prompt_offsets: list[int] = msgspec.field(default_factory=list)
     has_mrope: list[bool] = msgspec.field(default_factory=list)
     mrope_positions: list[bytes] = msgspec.field(default_factory=list)
+    discard_req_ids: list[str] = msgspec.field(default_factory=list)
 
 
 class LwdUnembedBatch(msgspec.Struct, tag=True):  # type: ignore[call-arg]

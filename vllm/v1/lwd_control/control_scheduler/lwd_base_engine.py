@@ -35,6 +35,10 @@ class LwdBaseEngineCore(EngineCoreProc):
         self.lwd_config = vllm_config.lwd_config
         # Reject unsupported runtime layouts before allocating any model workers.
         _ = self.lwd_config.runtime_connection
+        if vllm_config.cache_config.enable_prefix_caching:
+            raise ValueError(
+                "[LWD] this runtime requires --no-enable-prefix-caching on both sides"
+            )
         scheduler_config = vllm_config.scheduler_config
         scheduler_config.scheduler_cls = self.lwd_scheduler_cls
         chunked_prefill_wanted = scheduler_config.enable_chunked_prefill

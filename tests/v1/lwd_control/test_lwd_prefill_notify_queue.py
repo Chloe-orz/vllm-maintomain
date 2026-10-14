@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """LwdPrefillNotifyQueue 测试:FIFO、身份消费、abort 清扫与并发烟雾。"""
 
 from __future__ import annotations
@@ -43,27 +46,32 @@ def test_pop_front_identity_mismatch():
 
 
 def test_purge_mixed_items():
-    """条目级清扫:摘 item、items 掏空整条移除。"""
+    """Cancel model rows without changing the tensor size or sequence."""
     queue = LwdPrefillNotifyQueue()
     mixed = notify(0, [LwdRangeItem("a", 0, 5), LwdRangeItem("b", 0, 5)])
     solo = notify(1, [LwdRangeItem("c", 0, 3)])
     queue.append(mixed)
     queue.append(solo)
     assert queue.purge("a") == 1
-    assert mixed.items == [LwdRangeItem("b", 0, 5)]
+    assert mixed.items == [LwdRangeItem("a", 0, 5), LwdRangeItem("b", 0, 5)]
+    assert mixed.cancelled_req_ids == ["a"]
     assert len(queue) == 2
-    assert queue.purge("b") == 1  # 掏空 -> 整条移除
-    assert len(queue) == 1
+    assert queue.purge("b") == 1
+    assert len(queue) == 2
+    assert mixed.cancelled_req_ids == ["a", "b"]
+    assert queue.purge("b") == 0
     assert queue.purge("zzz") == 0
 
 
-def test_purged_notify_pop_front_is_noop():
-    """被 purge 摘除的 notify,pop_front 返回 False(视为已消费)。"""
+def test_cancelled_batch_remains_until_its_wire_receive_is_scheduled():
+    """Even an entirely cancelled batch must be consumed once."""
     queue = LwdPrefillNotifyQueue()
     n0 = notify(0, [LwdRangeItem("a", 0, 5)])
     queue.append(n0)
     queue.purge("a")
-    assert queue.pop_front(n0) is False
+    assert queue.peek() is n0
+    assert queue.pop_front(n0) is True
+    assert queue.peek() is None
 
 
 def test_concurrent_append_pop_monotonic():
