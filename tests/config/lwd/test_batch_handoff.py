@@ -78,3 +78,52 @@ def test_result_handoff_keeps_tensor_size_separate_from_draft_acceptance(
         )
         == meta
     )
+
+
+@pytest.mark.parametrize("placeholder", [True, False])
+def test_placeholder_handoff_preserves_shape_without_copying_prompt_values(
+    placeholder: bool,
+) -> None:
+    import ast
+    from types import SimpleNamespace
+
+    import torch
+
+    path = Path(__file__).resolve().parents[3] / "vllm/v1/core/sched/output.py"
+    tree = ast.parse(path.read_text())
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "NewRequestData"
+    )
+    method = next(
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "from_request"
+    )
+    method.decorator_list = []
+    module = ast.parse("from __future__ import annotations")
+    module.body.append(method)
+    scope = {"strip_covered_mm_data": lambda features, *args, **kwargs: features}
+    exec(compile(module, str(path), "exec"), scope)
+    embeds = torch.zeros(7, 4, dtype=torch.bfloat16)
+    request = SimpleNamespace(
+        request_id="r",
+        prompt_token_ids=None,
+        mm_features=[],
+        sampling_params=None,
+        pooling_params=None,
+        num_computed_tokens=0,
+        lora_request=None,
+        prompt_embeds=embeds,
+        prompt_is_token_ids=None,
+        lwd_embeds_placeholder=placeholder,
+    )
+    result = scope["from_request"](SimpleNamespace, request, ([],))
+    if placeholder:
+        assert result.prompt_embeds is None
+        assert result.lwd_prompt_embeds_shape == (7, 4)
+        assert result.lwd_prompt_embeds_dtype == torch.bfloat16
+    else:
+        assert result.prompt_embeds is embeds
+        assert result.lwd_prompt_embeds_shape is None

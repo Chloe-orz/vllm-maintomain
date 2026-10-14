@@ -51,6 +51,8 @@ class NewRequestData:
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
     prompt_is_token_ids: list[bool] | None = None
+    lwd_prompt_embeds_shape: tuple[int, int] | None = None
+    lwd_prompt_embeds_dtype: "torch.dtype | None" = None
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
@@ -63,6 +65,8 @@ class NewRequestData:
         prefill_token_ids: list[int] | None = None,
         uses_mrope: bool = False,
     ) -> "NewRequestData":
+        placeholder = request.lwd_embeds_placeholder
+        embeds = request.prompt_embeds
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
@@ -76,7 +80,13 @@ class NewRequestData:
             block_ids=block_ids,
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
-            prompt_embeds=request.prompt_embeds,
+            prompt_embeds=None if placeholder else embeds,
+            lwd_prompt_embeds_shape=(embeds.shape[0], embeds.shape[1])
+            if placeholder and embeds is not None
+            else None,
+            lwd_prompt_embeds_dtype=embeds.dtype
+            if placeholder and embeds is not None
+            else None,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
         )
@@ -87,6 +97,8 @@ class NewRequestData:
             return len(self.prompt_token_ids)
         if self.prompt_embeds is not None:
             return self.prompt_embeds.shape[0]
+        if self.lwd_prompt_embeds_shape is not None:
+            return self.lwd_prompt_embeds_shape[0]
         return 0
 
     def __repr__(self) -> str:
