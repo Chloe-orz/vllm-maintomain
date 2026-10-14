@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Original path/role/instance entry, without parallel or model projection."""
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 from pydantic import ConfigDict, TypeAdapter, with_config
@@ -19,7 +19,6 @@ class _LwdEntry(TypedDict):
     path: LwdString
     role: Literal["edge", "cloud"]
     instance_id: LwdId
-    coordination: NotRequired[dict[str, Any]]
     transport: NotRequired[dict[str, Any]]
 
 
@@ -38,16 +37,24 @@ class LwdConfig:
 
     @classmethod
     def from_dict(cls, raw: Any, *, api: LwdAPIConfig | None = None) -> "LwdConfig":
+        if isinstance(raw, dict) and "coordination" in raw:
+            raise ValueError(
+                "[LWD] coordination is retired from lwd_config; "
+                "it is now generated inside the topology yaml by "
+                "gen_lwd_topology.py. Remove the coordination block "
+                "from your lwd_config.yaml."
+            )
         entry = TypeAdapter(_LwdEntry).validate_python(raw)
         path, role, identity = entry["path"], entry["role"], entry["instance_id"]
-        coordination = None
-        if "coordination" in entry:
-            coordination = LwdCoordinationConfig.from_dict(
-                entry["coordination"], cloud_id=identity if role == "cloud" else None
-            )
-            coordination.validate_role(role)
         topology = LwdTopology.from_file(path)
         topology.instance(role, identity)
+        coordination = None
+        if topology.coordination is not None:
+            coordination = LwdCoordinationConfig.from_dict(
+                asdict(topology.coordination),
+                cloud_id=identity if role == "cloud" else None,
+            )
+            coordination.validate_role(role)
         return cls(
             path,
             role,
