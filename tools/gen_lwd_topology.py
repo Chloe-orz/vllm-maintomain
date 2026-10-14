@@ -116,6 +116,11 @@ def build_topology(
     port_base: int,
     *,
     cloud_cards: str,
+    tenant_key_file: str = "/run/secrets/edge-cloud-tenant-key",
+    consumer_id: str = "enterprise-a",
+    connect_timeout: float = 5.0,
+    listen_host: str = "0.0.0.0",
+    listen_port: int = 8100,
 ) -> dict[str, Any]:
     """Allocate global ranks; host-local physical devices remain launch settings."""
     if scene not in SCENES:
@@ -147,7 +152,7 @@ def build_topology(
             for cloud in clouds
         ]
     )
-    return {
+    result: dict[str, Any] = {
         "deployment": {
             "mode": 0,
             "scene": scene,
@@ -160,6 +165,19 @@ def build_topology(
         "clouds": clouds,
         "instance_links": links,
     }
+    if scene == "cloud_share":
+        # control_url points to the single cloud instance's coordination service.
+        cloud_ip = cloud_instances[0][1]
+        result["coordination"] = {
+            "enabled": True,
+            "control_url": f"http://{cloud_ip}:{listen_port}/v1/chat/completions",
+            "tenant_key_file": tenant_key_file,
+            "consumer_id": consumer_id,
+            "listen_host": listen_host,
+            "listen_port": listen_port,
+            "connect_timeout": connect_timeout,
+        }
+    return result
 
 
 def _validate(raw: dict[str, Any]) -> None:
@@ -184,6 +202,33 @@ def main() -> None:
     parser.add_argument("--enable-early-recv", action="store_true")
     parser.add_argument("--enable-scramble", action="store_true")
     parser.add_argument(
+        "--tenant-key-file",
+        default="/run/secrets/edge-cloud-tenant-key",
+        help="cloud_share only: tenant key file path on edge side",
+    )
+    parser.add_argument(
+        "--consumer-id",
+        default="enterprise-a",
+        help="cloud_share only: edge-side consumer identifier",
+    )
+    parser.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=5.0,
+        help="cloud_share only: edge->cloud control connection timeout (seconds)",
+    )
+    parser.add_argument(
+        "--listen-host",
+        default="0.0.0.0",
+        help="cloud_share only: cloud-side coordination service listen host",
+    )
+    parser.add_argument(
+        "--listen-port",
+        type=int,
+        default=8100,
+        help="cloud_share only: cloud-side coordination service listen port",
+    )
+    parser.add_argument(
         "-o", "--output", type=Path, required=True, help="One output YAML file"
     )
     args = parser.parse_args()
@@ -195,6 +240,11 @@ def main() -> None:
             args.dp,
             args.port_base,
             cloud_cards=args.cloud_cards,
+            tenant_key_file=args.tenant_key_file,
+            consumer_id=args.consumer_id,
+            connect_timeout=args.connect_timeout,
+            listen_host=args.listen_host,
+            listen_port=args.listen_port,
         )
         raw["feature_ctrl"] = {
             "enable_early_recv": args.enable_early_recv,
