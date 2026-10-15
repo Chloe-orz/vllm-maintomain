@@ -52,6 +52,10 @@ LICENSE、.gitattributes。
 输出:按 --max-shard-gb 切成若干 model-XXXXX-of-YYYYY.safetensors;多于一个
 分片时写新的 model.safetensors.index.json,只有一个分片则不写(避免留下会
 过滤掉自建分片的旧索引)。
+
+写盘期间显示进度(百分比 / 已写 GiB / 速率 / ETA):终端上原地刷新一行,重定向到
+日志文件时改为每 10 秒一行;用 --no-progress 关闭。进度只写 stderr,stdout 仍然
+只有报告本身,方便 grep 与重定向。
 """
 
 from __future__ import annotations
@@ -63,6 +67,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from collections import defaultdict
 
 INDEX_NAME = "model.safetensors.index.json"
@@ -180,6 +185,11 @@ def parse_args() -> argparse.Namespace:
         help="非权重文件策略:auto=按角色(云侧只拷 config.json/量化描述等必需文件);"
         "all=全拷(云侧仍跑未打补丁的 vllm 时用)",
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="关闭写盘进度显示(默认:终端原地刷新一行;重定向到文件时每 10 秒输出一行)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="只打印将保留/丢弃的清单,不写文件")
     return parser.parse_args()
 
@@ -277,9 +287,6 @@ def report(
     patterns: tuple[tuple[str, "re.Pattern[str]"], ...] = (),
 ) -> int | None:
     """打印保留/丢弃清单与体积;返回保留字节数(统计失败时为 None)。"""
-    def gib(num_bytes: int) -> float:
-        return num_bytes / 2**30
-
     per_shard_bytes = {name: os.path.getsize(os.path.join(src, name)) for name in set(weight_map.values())}
     total_bytes = sum(per_shard_bytes.values())
 
@@ -369,7 +376,97 @@ def copy_metadata(src: str, dst: str, names: list[str]) -> list[str]:
     return copied
 
 
-def write_slices(src: str, dst: str, weight_map: dict[str, str], keep: set[str], max_shard_bytes: int) -> list[str]:
+def gib(num_bytes: int) -> float:
+    """字节 -> GiB。"""
+    return num_bytes / 2**30
+
+
+def fmt_duration(seconds: float) -> str:
+    """秒 -> "m:ss" / "h:mm:ss"。"""
+    seconds = max(int(seconds), 0)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+class Progress:
+    """写盘进度显示(百分比 + 已写体积 + 速率 + ETA)。
+
+    模式:
+      bar   -- 终端:回车原地刷新一行(在 tty 上默认用它)
+      lines -- 非 tty(重定向/日志):每 interval 秒输出一行,避免把日志刷满
+      off   -- 不输出
+
+    进度只写 stderr,stdout 依旧只有报告,方便 grep / 重定向。
+    """
+
+    def __init__(
+        self,
+        total_bytes: int,
+        label: str,
+        mode: str = "auto",
+        stream=None,
+        interval: float | None = None,
+    ) -> None:
+        self.stream = stream if stream is not None else sys.stderr
+        if mode == "auto":
+            is_tty = bool(getattr(self.stream, "isatty", lambda: False)())
+            mode = "bar" if is_tty else "lines"
+        self.mode = mode
+        self.total = max(int(total_bytes), 1)
+        self.label = label
+        self.interval = interval if interval is not None else (0.3 if mode == "bar" else 10.0)
+        self.start = time.monotonic()
+        self.last_update = 0.0
+        self.done = 0
+        self.extra = ""
+        self.printed = False
+
+    def update(self, delta_bytes: int, **extra: object) -> None:
+        self.done += max(int(delta_bytes), 0)
+        if extra:
+            self.extra = " ".join(f"{key}={value}" for key, value in extra.items())
+        if self.mode == "off":
+            return
+        now = time.monotonic()
+        finished = self.done >= self.total
+        if not finished and now - self.last_update < self.interval:
+            return
+        self.last_update = now
+        elapsed = max(now - self.start, 1e-6)
+        ratio = min(self.done / self.total, 1.0)
+        speed = self.done / elapsed
+        eta = (self.total - self.done) / speed if speed > 0 else 0.0
+        text = (
+            f"{self.label} {ratio * 100:5.1f}% "
+            f"({gib(self.done):.1f}/{gib(self.total):.1f} GiB, "
+            f"{gib(speed):.2f} GiB/s, ETA {fmt_duration(eta)})"
+        )
+        if self.extra:
+            text += f" {self.extra}"
+        if self.mode == "bar":
+            print(f"\r{text}", end="\n" if finished else "", file=self.stream, flush=True)
+        else:
+            print(text, file=self.stream, flush=True)
+        self.printed = True
+
+    def close(self) -> None:
+        """收尾(bar 模式下补一个换行,免得后续输出接在同一行)。"""
+        if self.mode == "bar" and self.printed and self.done < self.total:
+            print(file=self.stream, flush=True)
+        self.printed = False
+
+
+def write_slices(
+    src: str,
+    dst: str,
+    weight_map: dict[str, str],
+    keep: set[str],
+    max_shard_bytes: int,
+    progress: "Progress | None" = None,
+) -> list[str]:
     from safetensors import safe_open
     from safetensors.torch import save_file
 
@@ -400,17 +497,24 @@ def write_slices(src: str, dst: str, weight_map: dict[str, str], keep: set[str],
         buffer_bytes = 0
 
     try:
+        seen = 0
         for shard in sorted(want_per_shard):
             with safe_open(os.path.join(src, shard), framework="pt") as handle:
                 for key in want_per_shard[shard]:
                     tensor = handle.get_tensor(key)
                     buffer[key] = tensor
-                    buffer_bytes += tensor.numel() * tensor.element_size()
+                    size = tensor.numel() * tensor.element_size()
+                    buffer_bytes += size
+                    seen += 1
                     del tensor
+                    if progress is not None:
+                        progress.update(size, shards=len(written), tensors=seen)
                     if buffer_bytes >= max_shard_bytes:
                         flush()
         flush()
     except BaseException:
+        if progress is not None:
+            progress.close()
         # 本次已写出的分片不完整,整套都不可用;清理掉,只保留 metadata 拷贝
         for name in written:
             path = os.path.join(dst, name)
@@ -422,6 +526,8 @@ def write_slices(src: str, dst: str, weight_map: dict[str, str], keep: set[str],
             file=sys.stderr,
         )
         raise
+    if progress is not None:
+        progress.close()
 
     # 分片名要带总数,先按最终数量重命名
     total = len(written)
@@ -528,7 +634,15 @@ def main() -> int:
     print(f"\n[copy] {len(copied)} metadata file(s): {copied}")
 
     keep = {key for keys in grouped.values() for key in keys}
-    shard_names = write_slices(src, dst, weight_map, keep, int(args.max_shard_gb * 2**30))
+    # 进度:体积来自上面的精确统计;统计不到(分片缺失)或用户 --no-progress 时关闭
+    progress = Progress(
+        keep_size or 0,
+        "[write]",
+        mode="off" if (args.no_progress or not keep_size) else "auto",
+    )
+    shard_names = write_slices(
+        src, dst, weight_map, keep, int(args.max_shard_gb * 2**30), progress=progress
+    )
     print(f"[write] {len(shard_names)} shard(s): {shard_names}")
     write_index(dst, weight_map, keep, shard_names)
 
