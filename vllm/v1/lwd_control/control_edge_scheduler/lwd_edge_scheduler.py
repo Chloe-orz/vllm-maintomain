@@ -41,8 +41,8 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_picker import (
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
     LwdReqPhase,
+    lwd_spec_factor,
 )
-from vllm.config.lwd import lwd_spec_factor
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.request import RequestStatus
 
@@ -93,7 +93,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # pending 闸门状态(仅作开/关转换日志用)
         self._lwd_prefill_gate_held: bool = False
         # MTP 预算系数(decode 每请求每步 1+k token);边云预算部署对齐,
-        # cap 直接读本地配置,公式唯一住处 lwd_config.lwd_spec_factor
+        # cap 直接读本地配置,公式唯一住处 lwd_base_scheduler.lwd_spec_factor
         self._lwd_spec_factor: int = lwd_spec_factor(self.vllm_config)
         # 多模态请求的整 prompt mrope positions([3,N] CPU 张量,准入时
         # 一次性算好,按 chunk 切片随 LwdEmbedBatch 下发 worker);嵌入

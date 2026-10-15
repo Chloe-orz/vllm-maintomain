@@ -13,6 +13,9 @@ from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
 )
+from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
+    lwd_spec_factor,
+)
 from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
     LwdControlPublisher,
 )
@@ -27,7 +30,6 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdRequestNotify,
     lwd_encode_cloud_notify,
 )
-from vllm.config.lwd import lwd_spec_factor
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,

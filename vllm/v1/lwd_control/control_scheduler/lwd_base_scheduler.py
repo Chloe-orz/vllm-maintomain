@@ -15,6 +15,20 @@ from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.request import Request
 
 
+def lwd_spec_factor(vllm_config) -> int:
+    """MTP 预算系数:decode 每请求每步消耗 1+k 个 token(草稿 token 占
+    预算与 KV),无 spec 配置恒 1。唯一住处(边云同源,spec 系数以云侧
+    HELLO 通告为准);main 的 vllm/config/lwd 是拓扑快照,无此派生值,
+    故随调度原语住在基类模块。"""
+    spec_config = getattr(vllm_config, "speculative_config", None)
+    num_spec_tokens = (
+        getattr(spec_config, "num_speculative_tokens", None)
+        if spec_config is not None
+        else None
+    )
+    return (num_spec_tokens or 0) + 1
+
+
 class LwdReqPhase(Enum):
     """请求的工作相位(边云同判据):PREFILL = 嵌入未发完
     (num_computed < num_prompt),DECODE = 等云侧采样回程。"""

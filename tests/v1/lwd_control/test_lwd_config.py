@@ -1,96 +1,91 @@
-"""vllm/config/lwd.py 的 LwdConfig 解析与 env 覆盖测试。
+"""配置面适配测试:lwd_spec_factor 表驱动 + 旧配置面清零守卫。
 
-依赖 vllm.logger -> vllm.envs 完整链(Python >=3.10);轻量环境
-(无 torch/py<3.10)模块级跳过。
+对齐 main 的配置面(PR #4,resolve_lwd_config/init-guard)后的语义对当:
+- 引擎选择判据从旧 `lwd.enabled / lwd.mode / lwd.is_edge`(未随本 PR
+  移植的 vllm/config/lwd.py)改为 `lwd_config is not None` + `role`
+  (显式给 lwd_config 即 LWD 开,schema 限 role ∈ {edge, cloud});
+- `lwd_spec_factor` 自旧 vllm/config/lwd.py 移入 lwd_base_scheduler
+  (新配置面是拓扑快照,无此派生值),语义不变:无 spec 恒 1,有 spec
+  为 num_speculative_tokens + 1(None/0 同样折算为 1);
+- 引擎侧端点/旋钮字段(pre_out_* / hello_timeout_s / publish_queue_max /
+  debug)仍按旧字段名读,随 runtime wiring 移植另行适配——本文件只守卫
+  "旧配置面符号在 core.py/lwd_control 内清零"。
+
+lwd_base_scheduler 完整链需 torch/Python>=3.10;轻量环境表驱动用例
+用例内跳过,源码扫描守卫照跑。
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-try:
-    from vllm.config.lwd import LwdConfig, lwd_spec_factor
-except Exception:  # pragma: no cover - 轻量环境(见 conftest)
-    pytest.skip(
-        "vllm.logger/envs 完整链不可用(需 Python>=3.10)",
-        allow_module_level=True,
-    )
+REPO_ROOT = Path(__file__).resolve().parents[3]
+VLLM_DIR = REPO_ROOT / "vllm"
 
 
-def test_transport_defaults():
-    cfg = LwdConfig.from_dict({})
-    assert cfg.pre_out_host == "127.0.0.1"
-    assert cfg.pre_out_port == 5558
-    assert cfg.post_out_port == 5559
-    assert cfg.hello_timeout_s == 600.0
-    assert cfg.debug is False
-    assert "scheduler_name" not in LwdConfig.__dataclass_fields__
+def test_old_config_face_purged_from_core_and_lwd_control():
+    """旧配置面清零:core.py 与 lwd_control 不再 import vllm.config.lwd,
+    旧判据字段(enabled/mode/is_edge)不再出现;新判据在位。"""
+    core = (VLLM_DIR / "v1" / "engine" / "core.py").read_text()
+    assert "from vllm.config.lwd import" not in core
+    for retired in ("lwd.enabled", "lwd.mode", "lwd.is_edge"):
+        assert retired not in core, retired
+    # 新判据:init-guard 语义(显式给 lwd_config 即开)+ role 分流
+    assert "vllm_config.lwd_config" in core
+    assert "if lwd is not None:" in core
+    assert 'lwd.role == "edge"' in core
+    for py in (VLLM_DIR / "v1" / "lwd_control").rglob("*.py"):
+        text = py.read_text()
+        assert "from vllm.config.lwd import" not in text, py
 
 
-def test_section_transport_fields():
-    cfg = LwdConfig.from_dict(
-        {"role": "cloud", "pre_out_host": "10.0.0.1", "pre_out_port": 6000}
-    )
-    assert cfg.is_edge is False
-    assert cfg.pre_out_host == "10.0.0.1"
-    assert cfg.pre_out_port == 6000
+def test_lwd_spec_factor_single_home():
+    """lwd_spec_factor 唯一住处 = lwd_base_scheduler(语义校验见同模块
+    表驱动用例;此处文本守卫保证不回流旧配置面)。"""
+    base = (
+        VLLM_DIR / "v1" / "lwd_control" / "control_scheduler"
+        / "lwd_base_scheduler.py"
+    ).read_text()
+    assert base.count("def lwd_spec_factor(") == 1
 
 
-def test_endpoints():
-    cfg = LwdConfig.from_dict({"pre_out_host": "10.1.1.1", "pre_out_port": 7})
-    assert cfg.lwd_pre_out_endpoint() == "tcp://10.1.1.1:7"
-    assert cfg.lwd_post_out_bind_endpoint() == "tcp://*:5559"
-
-
-def test_env_overrides(monkeypatch):
-    monkeypatch.setenv("VLLM_ASCEND_LWD_PRE_OUT_PORT", "6100")
-    monkeypatch.setenv("VLLM_ASCEND_LWD_PRE_OUT_HOST", "10.2.2.2")
-    monkeypatch.setenv("VLLM_ASCEND_LWD_HELLO_TIMEOUT_S", "12.5")
-    cfg = LwdConfig.from_dict({})
-    assert cfg.pre_out_port == 6100
-    assert cfg.pre_out_host == "10.2.2.2"
-    assert cfg.hello_timeout_s == 12.5
-
-
-def test_env_bad_value_keeps_default(monkeypatch):
-    monkeypatch.setenv("VLLM_ASCEND_LWD_PRE_OUT_PORT", "not-a-port")
-    cfg = LwdConfig.from_dict({})
-    assert cfg.pre_out_port == 5558
-
-
-def test_env_debug_strict_one(monkeypatch):
-    monkeypatch.setenv("VLLM_ASCEND_LWD_DEBUG", "1")
-    assert LwdConfig.from_dict({}).debug is True
-    monkeypatch.setenv("VLLM_ASCEND_LWD_DEBUG", "true")
-    assert LwdConfig.from_dict({}).debug is False
-
-
-def test_stale_scheduler_key_ignored():
-    """PD 分离已删:残留 scheduler 键不拦截、无对应字段。"""
-    cfg = LwdConfig.from_dict({"scheduler": "prefill_first"})
-    assert "scheduler_name" not in LwdConfig.__dataclass_fields__
-    assert cfg.pre_out_port == 5558  # 其余解析不受影响
-
-
-def test_lwd_diag_helpers():
-    from vllm.v1.lwd_control import (
-        lwd_diag_disable_down_enabled,
-        lwd_diag_token_passthrough_enabled,
-    )
-
-    assert lwd_diag_token_passthrough_enabled() is False
-    assert lwd_diag_disable_down_enabled() is False
-
-
-def test_spec_factor():
-    assert lwd_spec_factor(SimpleNamespace(speculative_config=None)) == 1
-    assert (
-        lwd_spec_factor(
-            SimpleNamespace(
-                speculative_config=SimpleNamespace(num_speculative_tokens=4)
-            )
+def test_lwd_spec_factor_table():
+    """表驱动:无 spec 配置/缺属性/None/0 恒 1;有 spec 为 k+1。
+    语义对当:与旧 vllm/config/lwd.lwd_spec_factor 完全一致(部署上
+    0 草稿与无配置等价,均不占额外预算)。"""
+    try:
+        from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
+            lwd_spec_factor,
         )
-        == 5
-    )
+    except Exception:  # pragma: no cover - 轻量环境(见 conftest)
+        pytest.skip(
+            "lwd_base_scheduler 完整链不可用(需 torch/Python>=3.10)"
+        )
+    table = [
+        # (vllm_config, expected)
+        (SimpleNamespace(speculative_config=None), 1),
+        (SimpleNamespace(), 1),
+        (
+            SimpleNamespace(
+                speculative_config=SimpleNamespace(num_speculative_tokens=None)
+            ),
+            1,
+        ),
+        (
+            SimpleNamespace(
+                speculative_config=SimpleNamespace(num_speculative_tokens=0)
+            ),
+            1,
+        ),
+        (
+            SimpleNamespace(
+                speculative_config=SimpleNamespace(num_speculative_tokens=3)
+            ),
+            4,
+        ),
+    ]
+    for cfg, expected in table:
+        assert lwd_spec_factor(cfg) == expected, cfg

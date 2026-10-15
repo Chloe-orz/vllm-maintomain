@@ -32,8 +32,8 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
     LwdReqPhase,
+    lwd_spec_factor,
 )
-from vllm.config.lwd import lwd_spec_factor
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 
 
@@ -48,7 +48,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         # 归通知队列)
         self.prefill_notify_queue = LwdPrefillNotifyQueue()
         # MTP 预算系数:decode 每请求每步消耗 1+k 个 token(草稿 token
-        # 占预算与 KV);公式唯一住处 lwd_config.lwd_spec_factor
+        # 占预算与 KV);公式唯一住处 lwd_base_scheduler.lwd_spec_factor
         self._lwd_spec_factor: int = lwd_spec_factor(self.vllm_config)
         lwd_logger.info(
             "[cloud-sched] chunked-prefill batches mixed "
