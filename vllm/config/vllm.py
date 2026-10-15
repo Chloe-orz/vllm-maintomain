@@ -40,6 +40,11 @@ from .kv_events import KVEventsConfig
 from .kv_transfer import KVTransferConfig
 from .load import LoadConfig
 from .lora import LoRAConfig
+from .lwd import (
+    LwdConfig,
+    log_lwd_config,
+    resolve_lwd_config,
+)
 from .mamba import MambaBackendEnum, MambaConfig
 from .model import ModelConfig
 from .observability import ObservabilityConfig
@@ -435,6 +440,8 @@ class VllmConfig:
     """Additional config for specified platform. Different platforms may
     support different configs. Make sure the configs are valid for the platform
     you are using. Contents must be hashable."""
+    lwd_config: LwdConfig | None = None
+    """Parsed LWD topology, coordination and API metadata; does not enable execution."""
     instance_id: str = ""
     """The ID of the vLLM instance."""
     optimization_level: OptimizationLevel = OptimizationLevel.O2
@@ -1256,6 +1263,16 @@ class VllmConfig:
 
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
+
+        # EngineArgs supplies a complete snapshot; direct callers can use raw input.
+        if (
+            isinstance(self.additional_config, dict)
+            and "lwd_config" in self.additional_config
+            and self.lwd_config is None
+        ):
+            self.lwd_config = resolve_lwd_config(self.additional_config)
+        if self.lwd_config is not None:
+            log_lwd_config(logger, self.lwd_config)
 
         self._resolve_mm_encoder_only()
 
