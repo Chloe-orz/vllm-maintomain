@@ -6,12 +6,11 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 from pydantic import ConfigDict, TypeAdapter, with_config
-from typing_extensions import NotRequired, TypedDict
+from typing_extensions import TypedDict
 
 from .api import LwdAPIConfig
 from .coordination import LwdCoordinationConfig
 from .topology import LwdDPConnection, LwdId, LwdInstance, LwdString, LwdTopology
-from .transport import LwdTransportConfig
 
 
 @with_config(ConfigDict(extra="forbid"))
@@ -19,7 +18,6 @@ class _LwdEntry(TypedDict):
     path: LwdString
     role: Literal["edge", "cloud"]
     instance_id: LwdId
-    transport: NotRequired[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -30,7 +28,6 @@ class LwdConfig:
     topology: LwdTopology
     coordination: LwdCoordinationConfig | None = None
     api: LwdAPIConfig = field(default_factory=LwdAPIConfig)
-    transport: LwdTransportConfig = field(default_factory=LwdTransportConfig)
 
     def __post_init__(self) -> None:
         self.api.validate_topology(self)
@@ -65,7 +62,6 @@ class LwdConfig:
             topology,
             coordination,
             api=api if api is not None else LwdAPIConfig(),
-            transport=LwdTransportConfig.from_dict(entry.get("transport", {})),
         )
 
     @property

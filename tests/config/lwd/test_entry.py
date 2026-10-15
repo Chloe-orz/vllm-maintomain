@@ -167,6 +167,7 @@ def test_absent_lwd_leaves_centralized_configuration_empty(raw: object) -> None:
         ({"instance_id": True}, "integer"),
         ({"role": "unknown"}, "role"),
         ({"scheduler": "mixed"}, "scheduler"),
+        ({"transport": {"wire_store_port": 29600}}, "transport"),
         ({"coordination": {"enabled": False}}, "coordination is retired"),
     ],
 )
