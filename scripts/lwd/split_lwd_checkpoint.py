@@ -38,7 +38,8 @@ VL 包装(model.language_model.*)、model.* 布局(Qwen3.5 等)、以及 DeepSee
           + mtp.* / model.mtp.*(开启投机解码时)
           (云侧不建视觉塔 visual)
 
-非权重文件按角色拷贝(--metadata auto,默认;规则支持 * 通配,目录会整目录拷贝):
+非权重文件按角色拷贝(--metadata auto,默认;规则支持 * 通配)。目录默认不拷,
+只有规则里显式点名(如 "yaml")或 --metadata all 才整目录拷贝。
 边侧要对外服务并自己跑视觉塔,所以 tokenizer/processor/chat_template 等全拷;
 云侧配套 vllm 的 LWD 改动(强制 skip_tokenizer_init + mm_encoder_remote,云侧
 不再建 tokenizer 与多模态 processor),因此只拷 config.json/configuration.json
@@ -144,7 +145,8 @@ SKIP_FILE_EXACT = {"README.md", "LICENSE", ".gitattributes"}
 SKIP_FILE_PREFIX = (".git", INDEX_NAME)
 
 # 每侧需要拷贝的非权重文件("auto" 策略),支持 * 通配(用 fnmatch 匹配);
-# 规则里如果写的是目录名,会整目录递归拷贝。
+# **目录默认不拷**:规则里显式点名某个目录(例如 "yaml")时才整目录递归拷贝,
+# 或者用 --metadata all 全拷。
 # 边侧对外服务、并且自己跑视觉塔编码 -> 全部配置/分词文件都要。
 # 云侧配套 vllm 侧 LWD 改动(强制 skip_tokenizer_init + mm_encoder_remote):
 # 不建 tokenizer、不建多模态 processor、不对外服务 -> 只需要 config.json;
@@ -332,31 +334,42 @@ def report(
     return keep_size
 
 
-def _metadata_candidates(src: str) -> list[str]:
-    """候选非权重条目(已排除 *.safetensors / index / .git* / README / LICENSE)。
+def _metadata_candidates(src: str) -> tuple[list[str], list[str]]:
+    """候选非权重条目 -> (文件, 目录),已排除 *.safetensors / index / .git* / README / LICENSE。
 
-    目录也算候选(例如某些导出会在模型目录里放 ``yaml/``),是否拷贝由角色规则决定。
+    目录单独返回:默认**不**拷贝(避免把导出附带的 ``yaml/`` 之类塞进模型目录),
+    只有角色规则里显式点名(如 ``"yaml"``)或 ``--metadata all`` 时才拷。
     """
-    names = []
+    files, dirs = [], []
     for name in sorted(os.listdir(src)):
         if name.endswith(".safetensors") or name.startswith(SKIP_FILE_PREFIX):
             continue
         if name in SKIP_FILE_EXACT:
             continue
-        names.append(name)
-    return names
+        (dirs if os.path.isdir(os.path.join(src, name)) else files).append(name)
+    return files, dirs
 
 
 def plan_metadata(src: str, role: str, mode: str) -> tuple[list[str], list[str]]:
-    """返回 (要拷贝的条目, 主动跳过的条目)。规则支持 * 通配。"""
-    allowed = ("*",) if mode == "all" else METADATA_RULES[role]
-    candidates = _metadata_candidates(src)
+    """返回 (要拷贝的条目, 主动跳过的条目)。
 
-    def keep(name: str) -> bool:
+    文件按角色规则(支持 ``*`` 通配)拷贝;目录默认不拷,除非规则里**显式点名**它
+    (写 ``"*"`` 不算点名,免得 ``--metadata auto`` 顺手带走整个目录)或 mode 是 ``all``。
+    """
+    allowed = ("*",) if mode == "all" else METADATA_RULES[role]
+    files, dirs = _metadata_candidates(src)
+
+    def keep_file(name: str) -> bool:
         return any(fnmatch.fnmatch(name, rule) for rule in allowed)
 
-    wanted = [name for name in candidates if keep(name)]
-    skipped = [name for name in candidates if name not in wanted]
+    def keep_dir(name: str) -> bool:
+        if mode == "all":
+            return True
+        return any(rule != "*" and fnmatch.fnmatch(name, rule) for rule in allowed)
+
+    wanted = [name for name in files if keep_file(name)]
+    wanted += [name for name in dirs if keep_dir(name)]
+    skipped = [name for name in files + dirs if name not in wanted]
     return wanted, skipped
 
 
