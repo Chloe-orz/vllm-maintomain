@@ -5,6 +5,10 @@
 The cloud binds a ROUTER, the edge connects a DEALER whose identity carries
 its session id. A transport must be opened, used and closed on a single
 thread (ZMQ sockets are not thread-safe).
+
+Both directions are bounded by `_LWD_LINK_HWM`, so a peer that stops reading
+eventually makes `send()` report a full link instead of buffering without
+limit.
 """
 
 from abc import ABC, abstractmethod
@@ -28,6 +32,10 @@ logger = init_lwd_logger(__name__)
 _LWD_TCP_KEEPALIVE_IDLE_S = 60
 _LWD_TCP_KEEPALIVE_INTVL_S = 10
 _LWD_TCP_KEEPALIVE_CNT = 6
+# Messages queued per connection and direction (the ZMQ default). The receive
+# side must be bounded too: otherwise libzmq keeps reading TCP into memory and
+# a stalled peer never backs up to the sender.
+_LWD_LINK_HWM = 1000
 
 
 class LwdPeerUnreachableError(RuntimeError):
@@ -61,10 +69,8 @@ class LwdControlTransport(ABC):
             # Options only apply to connections made after they are set, so
             # `make_zmq_socket`, which attaches immediately, cannot be used.
             sock.setsockopt(zmq.LINGER, 0)
-            # Unbounded at the link: backpressure lives in the bounded inproc
-            # queue in front of it.
-            sock.setsockopt(zmq.SNDHWM, 0)
-            sock.setsockopt(zmq.RCVHWM, 0)
+            sock.setsockopt(zmq.SNDHWM, _LWD_LINK_HWM)
+            sock.setsockopt(zmq.RCVHWM, _LWD_LINK_HWM)
             sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
             sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, _LWD_TCP_KEEPALIVE_IDLE_S)
             sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, _LWD_TCP_KEEPALIVE_INTVL_S)
@@ -103,20 +109,25 @@ class LwdControlTransport(ABC):
                 continue
             frames.append(frame)
 
-    def send(self, kind: LwdFrameKind, body: bytes, identity: bytes | None) -> None:
+    def send(self, kind: LwdFrameKind, body: bytes, identity: bytes | None) -> bool:
         """Send one message without blocking.
 
+        Returns:
+            False when the link cannot take the message now: the high-water
+            mark is reached, or the edge is not connected yet.
+
         Raises:
-            LwdPeerUnreachableError: No live connection to the peer.
+            LwdPeerUnreachableError: The cloud has no connection to `identity`.
         """
         try:
             self._send(kind.value, body, identity)
-        except zmq.Again as e:
-            raise LwdPeerUnreachableError(f"{self.endpoint}: not connected") from e
+        except zmq.Again:
+            return False
         except zmq.ZMQError as e:
             if e.errno != zmq.EHOSTUNREACH:
                 raise
             raise LwdPeerUnreachableError(f"{self.endpoint}: peer gone") from e
+        return True
 
     def close(self) -> None:
         """Idempotent; pending outbound frames are discarded."""
@@ -186,8 +197,8 @@ class LwdEdgeTransport(LwdControlTransport):
 
     def _configure(self, sock: zmq.Socket) -> None:
         sock.setsockopt(zmq.IDENTITY, self._identity)
-        # Never queue frames for a link that is not established: sends fail
-        # fast with EAGAIN instead of piling up until the cloud appears.
+        # Never queue frames for a link that is not established: sends report
+        # a full link (EAGAIN) instead of piling up until the cloud appears.
         sock.setsockopt(zmq.IMMEDIATE, 1)
 
     def _attach(self, sock: zmq.Socket) -> None:

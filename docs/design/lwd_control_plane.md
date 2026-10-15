@@ -139,21 +139,37 @@ flowchart LR
 - The IO thread is the only thread that touches the TCP socket.
 - The outbound queue is bounded by an inproc PUSH with a high-water mark. The IO side uses `RCVHWM=1`, because an inproc pipe holds `SNDHWM + RCVHWM` messages.
 
+### Backpressure
+
+The TCP socket bounds both directions to 1000 messages per connection (`_LWD_LINK_HWM`). When the link cannot take a payload, the IO thread holds it, stops reading the outbound queue and retries every 10 ms, so the queue fills and `send()` returns False. Payloads are neither dropped nor reordered while held.
+
+```mermaid
+flowchart LR
+    stall["peer stops reading"] --> rcv["peer RCVHWM full,<br/>libzmq stops reading TCP"]
+    rcv --> win["TCP window closes"] --> snd["local SNDHWM full,<br/>send gets EAGAIN"]
+    snd --> hold["IO thread holds the payload,<br/>stops reading the queue"] --> full["inproc queue full,<br/>send() returns False"]
+```
+
+- The edge treats a lost cloud the same way: without a connection its DEALER reports a full link, so payloads wait instead of being dropped.
+- Backpressure only covers the link: it fires when the peer's IO thread or the network stalls. The engines hand inbound messages to unbounded queues (`input_queue`, the edge `unembed_notify_queue`, the cloud `LwdPrefillNotifyQueue`), so a slow engine does not back up the link.
+- One held payload blocks every peer of the plane; with one peer per plane today this only affects that peer.
+
 ## Failure semantics
 
 | Event | Behavior |
 | --- | --- |
 | Outbound queue full | `send()` returns False |
+| Peer stops reading, or the network stalls | The link fills up and the IO thread holds payloads until `send()` returns False; see [Backpressure](#backpressure) |
 | `send()` to a peer that has not registered, or after shutdown | `LwdPeerNotRegisteredError` |
 | Malformed or unknown frame | Dropped with a warning; the link stays up |
 | Payload from an unregistered identity | Dropped with a warning |
 | Handshake reject or timeout on the edge | `wait_until_ready` shuts the plane down and raises `LwdHandshakeError` |
 | Port in use on the cloud | `start()` raises `LwdControlPlaneStartupError` |
-| Peer process exits | Not detected. Payloads to it are dropped with an error log; no callback fires |
+| Peer process exits | Not detected; no callback fires. The cloud drops payloads to a vanished edge with an error log; the edge holds payloads to a vanished cloud, so its `send()` soon returns False |
 | Network partition | Not detected by the plane. TCP keepalive drops an idle link after about 2 minutes; a link with unsent data waits for the kernel retransmission timeout. Payloads wait in ZMQ queues meanwhile |
 | Edge restarts | Its new session is rejected; restart the cloud as well |
 | Duplicate edge with the same instance and DP rank | The later process is rejected with an explicit "same configuration already registered" error; the registered edge keeps working |
-| Same edge process reconnects after a network blip | Same identity, so `ROUTER_HANDOVER` resumes the session at once |
+| Same edge process reconnects after a network blip | Same identity, so `ROUTER_HANDOVER` resumes the session at once. Payloads in flight during the gap are lost: the edge DEALER (`IMMEDIATE`) discards its queue on disconnect and the cloud drops payloads to the missing connection |
 | IO thread crashes | `on_fatal` fires and the plane stops |
 
 The link never stops the engine on its own. Shutdown is idempotent: it stops the IO thread, discards queued payloads and terminates the context. If the IO thread does not exit within 5 s, the context is destroyed.
@@ -171,7 +187,7 @@ control_plane:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `send_queue_max` | 1000 | Outbound messages buffered per DP rank before `send()` returns False |
+| `send_queue_max` | 1000 | Outbound messages buffered per DP rank before `send()` returns False, on top of the link's own 1000 per connection |
 | `hello_retry_interval_s` | 5 s | Interval between edge hellos until the cloud answers |
 | `handshake_timeout_s` | 1800 s | Edge wait for its cloud; must cover a full cloud engine startup |
 
@@ -181,7 +197,10 @@ control_plane:
 
 - `IMMEDIATE`, `ROUTER_MANDATORY` and `ROUTER_HANDOVER` only apply to connections made after they are set. `make_zmq_socket` binds or connects immediately, so the TCP sockets are built by hand.
 - On an identity collision ZMQ either disconnects the old connection (`ROUTER_HANDOVER`) or silently ignores the new one; it cannot tell a reconnect from a second process. Putting the session id in the identity removes collisions between processes, so handover only ever resumes the same process.
-- `ROUTER_MANDATORY` turns a send to an unknown identity into `EHOSTUNREACH` instead of a silent drop.
+- `ROUTER_MANDATORY` turns a send to an unknown identity into `EHOSTUNREACH` instead of a silent drop, and a send to a full connection into `EAGAIN`.
+- A DEALER reports `EAGAIN` both when it is not connected (`IMMEDIATE`) and when its high-water mark is reached; the plane treats both as a full link.
+- A ROUTER always reports `POLLOUT`, so a held payload is retried on a timer rather than on writability.
+- `SNDHWM=0` / `RCVHWM=0` mean unbounded. Both directions must be bounded for backpressure: an unbounded receive side lets libzmq keep reading TCP into memory.
 - `ctx.term()` blocks until every socket is closed. The engine-owned PUSH is closed by `shutdown()` on the engine thread.
 - TCP keepalive (60 s idle, 10 s interval, 6 probes) is a stopgap until application heartbeats: it only detects a dead peer on an idle connection.
 
@@ -191,10 +210,9 @@ This change delivers the link, the handshake, the business messages and the fact
 
 | Follow-up | Content |
 | --- | --- |
-| Backpressure on slow peers | Bound the per-peer queue on the link socket; today only the inproc queue is bounded, so a peer that stops reading grows sender memory |
 | Peer loss detection | Per-session application heartbeats, `on_peer_down`; a lease decides a new session: rejected while the registered one is alive (duplicate), accepted once it expires (restart) |
 | Several edges per cloud DP rank | Session table on the cloud, per-peer outbound queues and failure isolation; enables `cloud_share` |
 | Several clouds per edge DP rank | Several links per edge plane; enables `lwd_cluster` |
 | Engine integration | Engine cores start the plane from `vllm_config.lwd_config`, with the scheduler migration |
 | Tests | API-level tests through the factory once configuration and schedulers settle |
-| Lifecycle | Reconnect after a cloud restart, flushing queued payloads at shutdown, discovery, authentication |
+| Lifecycle | Reconnect after a cloud restart without losing payloads in flight, flushing queued payloads at shutdown, discovery, authentication |
