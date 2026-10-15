@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """把一个完整的 HF safetensors checkpoint 按 LWD 角色(edge/cloud)切成两个子集。
 
-背景:边云 LWD 的每一侧只运行一部分模块(配套 model_load_update 分支
-里的 ``patch_lwd_module_scope`` + ``lwd_weight_filter``),所以每侧的模型
-目录只需要放自己会用到的张量。但 HF 的 15 个分片是**按张量交错打包**的,
+背景:边云 LWD 的每一侧只运行一部分模块(配套 model_load_update 分支里的
+``LwdConfig.skips_module`` + ``lwd_skips_module()``(模型侧不构建本角色永不
+执行的模块)与 ``lwd_weight_filter``(装载期丢弃占位模块的权重)),所以每侧
+的模型目录只需要放自己会用到的张量。但 HF 的分片是**按张量交错打包**的,
 不能"整片给某一侧",必须按张量名拆分。
 
 用法(先 dry-run 看清单,再真拆):
@@ -20,19 +21,31 @@
     python split_lwd_checkpoint.py --src /home/extra/Qwen3.6-27B \
         --dst /home/extra/Qwen3.6-27B-cloud --role cloud
 
-规则(可用 --keep-prefix 覆盖/追加,默认同时兼容 VL 与纯文本两种命名):
+规则(可用 --keep-prefix / --keep-name-regex 追加)。默认同时覆盖三种命名布局:
+VL 包装(model.language_model.*)、model.* 布局(Qwen3.5 等)、以及 DeepSeek 原生
+布局(layers./norm./embed./head./hc_head/mtp.,无 model. 前缀)。
 
-  edge  : 顶层 lm_head.* + model.language_model.embed_tokens.* + model.visual.*
+  edge  : head.* / lm_head.* / model.head.*        (unembed:rank-replay)
+          + embed.* / embed_tokens.* / model.embed*.(embed:PP first rank)
+          + hc_head*(V4 顶层无条件创建的真参数,边侧也要)
+          + model.visual.*(多模态塔)
+          + 按名匹配 <*>.layers.<i>.mlp|ffn.gate.tid2eid
+            (DeepSeek-V4 的 Hash MoE 路由表:边侧不构建层,但会直接从
+             checkpoint 分片里读这些表,漏了会报 "Missing tid2eid tables")
           (边侧只做 embed / unembed;transformer 层与 final norm 都不建)
-  cloud : 顶层 lm_head.* + model.language_model.*(全部:embed/layers/norm)
+  cloud : layers.* / model.layers.* / model.language_model.*(全部层)
+          + norm.* + embed* + head.*/lm_head.* + hc_head*
           + mtp.* / model.mtp.*(开启投机解码时)
           (云侧不建视觉塔 visual)
 
-非权重文件按角色拷贝(--metadata auto,默认):边侧要对外服务并自己跑视觉塔,
-所以 tokenizer/processor/chat_template 等全拷;云侧配套 vllm 的 LWD 改动
-(强制 skip_tokenizer_init + mm_encoder_remote,云侧不再建 tokenizer 与多模态
-processor),因此**只拷 config.json**。若云侧仍跑未打补丁的 vllm,用
---metadata all 回到"全拷"。两侧都跳过 .git*、README.md、LICENSE、.gitattributes。
+非权重文件按角色拷贝(--metadata auto,默认;规则支持 * 通配,目录会整目录拷贝):
+边侧要对外服务并自己跑视觉塔,所以 tokenizer/processor/chat_template 等全拷;
+云侧配套 vllm 的 LWD 改动(强制 skip_tokenizer_init + mm_encoder_remote,云侧
+不再建 tokenizer 与多模态 processor),因此只拷 config.json/configuration.json
+与量化描述(*quant*description*.json)——**后者必须带**,ModelSlim 量化靠它判定
+(见 vllm-ascend 的 quantization/utils.py),缺了会被当成 float 加载。若云侧仍跑
+未打补丁的 vllm,用 --metadata all 回到"全拷"。两侧都跳过 .git*、README.md、
+LICENSE、.gitattributes。
 
 (若不用 --metadata auto 而想让云侧也具备完整配置:--metadata all。)
 
@@ -44,43 +57,106 @@ processor),因此**只拷 config.json**。若云侧仍跑未打补丁的 vllm,�
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
+import re
 import shutil
 import sys
 from collections import defaultdict
 
 INDEX_NAME = "model.safetensors.index.json"
 
-# 每侧必须保留的 checkpoint 名前缀。
+# 每侧必须保留的 checkpoint 名前缀。默认同时覆盖三种常见命名布局:
+#   1) VL 包装布局      model.language_model.*      (Qwen3-VL 等)
+#   2) model.* 布局     model.layers./norm./embed_tokens. (Qwen3.5 等)
+#   3) DeepSeek 原生布局 layers./norm./embed./head./hc_head/mtp.
+#      (见 vllm 的 _make_deepseek_v4_weights_mapper:
+#       layers.->model.layers.、embed.->model.embed.、norm.->model.norm.、
+#       head.weight->lm_head.weight、hc_head->model.hc_head、mtp.->model.mtp.)
 ROLE_RULES: dict[str, tuple[str, ...]] = {
     "edge": (
-        "lm_head.",  # 边侧 rank-replay 还原 token
-        "model.language_model.embed_tokens.",  # VL 布局:文本嵌入
-        "model.embed_tokens.",  # 纯文本布局:文本嵌入
-        "model.visual.",  # 视觉塔(多模态必须)
+        # --- 文本嵌入:边侧是 PP first rank,必须自己建 ---
+        "model.language_model.embed_tokens.",
+        "model.embed_tokens.",
+        "model.embed.",
+        "embed_tokens.",
+        "embed.",  # DeepSeek 原生:embed.weight -> embed_tokens.weight
+        # --- 输出头:边侧 rank-replay 还原 token,必须自己建 ---
+        "lm_head.",
+        "model.head.",
+        "head.",  # DeepSeek 原生:head.weight -> lm_head.weight
+        # --- DeepSeek-V4 顶层的 hc_head 参数:模型里**无条件**创建
+        # (vllm/models/deepseek_v4/*/model.py 与 vllm_ascend/models/deepseek_v4.py),
+        # 边侧也必须拿到,否则报缺权重 ---
+        "hc_head",
+        "model.hc_head",
+        # --- 视觉塔:多模态必须(边侧自己跑编码) ---
+        "model.visual.",
+        # 其它命名的塔(vision_tower / vision_model / mm_projector 等)用
+        # --keep-prefix 追加
     ),
     "cloud": (
+        # --- 全部 transformer 层 + 尾部 norm ---
+        "model.language_model.",  # VL 包装布局(含 embed/layers/norm)
+        "model.layers.",
+        "layers.",  # DeepSeek 原生布局
+        "model.norm.",
+        "norm.",
+        # --- 文本嵌入:decode 行需要本地嵌入 ---
+        "model.embed_tokens.",
+        "model.embed.",
+        "embed_tokens.",
+        "embed.",
+        # --- 采样头 + hc_head ---
         "lm_head.",  # 云侧采样 + 算秩
-        "model.language_model.",  # VL 布局:embed/layers/norm
-        "model.layers.",  # 纯文本布局:transformer 层
-        "model.norm.",  # 纯文本布局:final norm
-        "model.embed_tokens.",  # 纯文本布局:文本嵌入(decode 行本地嵌入)
-        "mtp.",  # 独立 MTP 权重(若开投机解码)
+        "model.head.",
+        "head.",
+        "hc_head",
+        "model.hc_head",
+        # --- MTP(若开投机解码) ---
+        "mtp.",  # DeepSeek 原生布局
         "model.mtp.",
     ),
+}
+
+# DeepSeek-V4 的 Hash MoE 路由表。边侧虽然不构建任何层,但会直接从 checkpoint
+# 分片里读这些表(vllm-ascend 的 worker/lwd_edge_worker.py:load_model ->
+# worker/lwd_hash/lwd_hash_tables.py),因此必须随边侧一起保留,否则边侧启动会报
+# "Missing tid2eid tables for Hash MoE layers [...]"。
+# 云侧不需要该特例:它构建全部层,这些表就是普通参数,由 layers./model.layers. 覆盖。
+_TID2EID_PATTERN = re.compile(
+    r"^(?:model\.)?layers\.\d+\.(?:ffn|mlp)\.gate\.tid2eid(?:\.weight)?$"
+)
+
+# 前缀规则表达不了的"按整个张量名匹配"的保留项。
+ROLE_NAME_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    "edge": (_TID2EID_PATTERN,),
+    "cloud": (),
 }
 
 SKIP_FILE_EXACT = {"README.md", "LICENSE", ".gitattributes"}
 SKIP_FILE_PREFIX = (".git", INDEX_NAME)
 
-# 每侧需要拷贝的非权重文件("auto" 策略)。
+# 每侧需要拷贝的非权重文件("auto" 策略),支持 * 通配(用 fnmatch 匹配);
+# 规则里如果写的是目录名,会整目录递归拷贝。
 # 边侧对外服务、并且自己跑视觉塔编码 -> 全部配置/分词文件都要。
 # 云侧配套 vllm 侧 LWD 改动(强制 skip_tokenizer_init + mm_encoder_remote):
-# 不建 tokenizer、不建多模态 processor、不对外服务 -> 只需要 config.json。
+# 不建 tokenizer、不建多模态 processor、不对外服务 -> 只需要 config.json;
+# 但**量化描述必须带上**:ModelSlim(W8A8/W4A8...)靠目录里的
+# quant_model_description.json 判定量化(见 vllm-ascend 的
+# quantization/utils.py 与 quantization/modelslim_config.py),缺了会被当成
+# float 加载,权重直接错。
 METADATA_RULES: dict[str, tuple[str, ...]] = {
     "edge": ("*",),
-    "cloud": ("config.json",),
+    "cloud": (
+        "config.json",
+        "configuration.json",
+        "*quant*description*.json",
+        # 仅为兼容启动脚本里 "--chat-template <模型目录>/chat_template.jinja" 的写法;
+        # 云侧不渲染模板(请求都在边侧),启动命令里没传 --chat-template 时可以不拷。
+        "chat_template.jinja",
+    ),
 }
 
 
@@ -92,10 +168,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-shard-gb", type=float, default=5.0, help="输出分片上限(默认 5GB;内存紧张就调小)")
     parser.add_argument("--keep-prefix", action="append", default=[], help="追加保留前缀(可重复)")
     parser.add_argument(
+        "--keep-name-regex",
+        action="append",
+        default=[],
+        help="追加按张量名匹配的正则(可重复;前缀规则表达不了时用,如仅保留某些层内参数)",
+    )
+    parser.add_argument(
         "--metadata",
         choices=("auto", "all"),
         default="auto",
-        help="非权重文件策略:auto=按角色(云侧只拷 config.json);all=全拷(云侧仍跑未打补丁的 vllm 时用)",
+        help="非权重文件策略:auto=按角色(云侧只拷 config.json/量化描述等必需文件);"
+        "all=全拷(云侧仍跑未打补丁的 vllm 时用)",
     )
     parser.add_argument("--dry-run", action="store_true", help="只打印将保留/丢弃的清单,不写文件")
     return parser.parse_args()
@@ -118,8 +201,16 @@ def load_weight_map(src: str) -> dict[str, str]:
     return weight_map
 
 
-def select_keys(weight_map: dict[str, str], prefixes: tuple[str, ...]) -> tuple[dict[str, list[str]], int]:
-    """按前缀归组要保留的张量;返回 {前缀: [张量名]} 与命中总数。"""
+def select_keys(
+    weight_map: dict[str, str],
+    prefixes: tuple[str, ...],
+    patterns: tuple[tuple[str, "re.Pattern[str]"], ...] = (),
+) -> tuple[dict[str, list[str]], int]:
+    """归组要保留的张量;返回 {规则标签: [张量名]} 与命中总数。
+
+    先按前缀匹配,未命中的再用正则按整个张量名匹配(用于 DeepSeek-V4 的
+    Hash MoE 路由表这类"藏在 layers.<i> 之下但边侧必须保留"的参数)。
+    """
     grouped: dict[str, list[str]] = defaultdict(list)
     matched = 0
     for key in weight_map:
@@ -128,6 +219,12 @@ def select_keys(weight_map: dict[str, str], prefixes: tuple[str, ...]) -> tuple[
                 grouped[prefix].append(key)
                 matched += 1
                 break
+        else:
+            for label, pattern in patterns:
+                if pattern.match(key):
+                    grouped[label].append(key)
+                    matched += 1
+                    break
     return grouped, matched
 
 
@@ -173,7 +270,11 @@ def kept_bytes(weight_map: dict[str, str], src: str, keep: set[str]) -> tuple[in
 
 
 def report(
-    weight_map: dict[str, str], src: str, grouped: dict[str, list[str]], prefixes: tuple[str, ...]
+    weight_map: dict[str, str],
+    src: str,
+    grouped: dict[str, list[str]],
+    prefixes: tuple[str, ...],
+    patterns: tuple[tuple[str, "re.Pattern[str]"], ...] = (),
 ) -> int | None:
     """打印保留/丢弃清单与体积;返回保留字节数(统计失败时为 None)。"""
     def gib(num_bytes: int) -> float:
@@ -182,17 +283,21 @@ def report(
     per_shard_bytes = {name: os.path.getsize(os.path.join(src, name)) for name in set(weight_map.values())}
     total_bytes = sum(per_shard_bytes.values())
 
+    labels = tuple(prefixes) + tuple(label for label, _ in patterns)
+    width = max([40, *(len(label) for label in labels)])
     print(f"[in ] {len(weight_map)} tensor(s), {gib(total_bytes):.2f} GiB on disk")
     print(f"[rule] keep prefixes: {list(prefixes)}")
-    print("\n  matched tensors per prefix:")
+    if patterns:
+        print(f"[rule] keep name patterns: {[label for label, _ in patterns]}")
+    print("\n  matched tensors per rule:")
     kept = 0
-    for prefix in prefixes:
-        keys = grouped.get(prefix, [])
+    for label in labels:
+        keys = grouped.get(label, [])
         if not keys:
-            print(f"    {prefix:40s} 0 tensor(s)  <-- 没命中,检查命名布局/是否该保留")
+            print(f"    {label:{width}s} 0 tensor(s)  <-- 没命中,检查命名布局/是否该保留")
             continue
         kept += len(keys)
-        print(f"    {prefix:40s} {len(keys)} tensor(s)")
+        print(f"    {label:{width}s} {len(keys)} tensor(s)")
     print(f"\n  => keep {kept} tensor(s) of {len(weight_map)}; drop {len(weight_map) - kept}")
 
     # 被丢弃的张量按"前 3 段"聚一下,便于确认丢的都是层权重
@@ -221,31 +326,42 @@ def report(
 
 
 def _metadata_candidates(src: str) -> list[str]:
-    """候选非权重文件(已排除 *.safetensors / index / .git* / README / LICENSE)。"""
+    """候选非权重条目(已排除 *.safetensors / index / .git* / README / LICENSE)。
+
+    目录也算候选(例如某些导出会在模型目录里放 ``yaml/``),是否拷贝由角色规则决定。
+    """
     names = []
     for name in sorted(os.listdir(src)):
         if name.endswith(".safetensors") or name.startswith(SKIP_FILE_PREFIX):
             continue
         if name in SKIP_FILE_EXACT:
             continue
-        if not os.path.isfile(os.path.join(src, name)):
-            continue
         names.append(name)
     return names
 
 
 def plan_metadata(src: str, role: str, mode: str) -> tuple[list[str], list[str]]:
-    """返回 (要拷贝的文件, 主动跳过的文件)。"""
+    """返回 (要拷贝的条目, 主动跳过的条目)。规则支持 * 通配。"""
     allowed = ("*",) if mode == "all" else METADATA_RULES[role]
-    wanted = [name for name in _metadata_candidates(src) if "*" in allowed or name in allowed]
-    skipped = [name for name in _metadata_candidates(src) if name not in wanted]
+    candidates = _metadata_candidates(src)
+
+    def keep(name: str) -> bool:
+        return any(fnmatch.fnmatch(name, rule) for rule in allowed)
+
+    wanted = [name for name in candidates if keep(name)]
+    skipped = [name for name in candidates if name not in wanted]
     return wanted, skipped
 
 
 def copy_metadata(src: str, dst: str, names: list[str]) -> list[str]:
+    """拷贝非权重条目;目录会整目录递归拷贝(例如导出附带的 yaml/)。"""
     copied = []
     for name in names:
         source_path = os.path.join(src, name)
+        if os.path.isdir(source_path):
+            shutil.copytree(source_path, os.path.join(dst, name), dirs_exist_ok=True)
+            copied.append(name + "/")
+            continue
         if not os.path.isfile(source_path):
             continue
         shutil.copy2(source_path, os.path.join(dst, name))
@@ -343,6 +459,16 @@ def write_index(dst: str, weight_map: dict[str, str], keep: set[str], shard_name
 def main() -> int:
     args = parse_args()
     prefixes = tuple(args.keep_prefix) + ROLE_RULES[args.role]
+    patterns: list[tuple[str, "re.Pattern[str]"]] = [
+        (f"re:{pattern.pattern}", pattern) for pattern in ROLE_NAME_PATTERNS[args.role]
+    ]
+    for raw in args.keep_name_regex:
+        try:
+            patterns.append((f"re:{raw}", re.compile(raw)))
+        except re.error as exc:
+            print(f"--keep-name-regex 非法: {raw} ({exc})", file=sys.stderr)
+            return 2
+    patterns_tuple = tuple(patterns)
     # 相对路径按当前工作目录解析;顺带展开 ~,并消掉符号链接,
     # 这样下面"dst 不能等于/包含 src"的校验不会被软链接绕过。
     src = os.path.realpath(os.path.expanduser(args.src))
@@ -351,10 +477,10 @@ def main() -> int:
         return 2
 
     weight_map = load_weight_map(src)
-    grouped, matched = select_keys(weight_map, prefixes)
-    keep_size = report(weight_map, src, grouped, prefixes)
+    grouped, matched = select_keys(weight_map, prefixes, patterns_tuple)
+    keep_size = report(weight_map, src, grouped, prefixes, patterns_tuple)
     if matched == 0:
-        print("\n没有任何张量命中保留规则,请用 --keep-prefix 指定正确前缀。", file=sys.stderr)
+        print("\n没有任何张量命中保留规则,请用 --keep-prefix/--keep-name-regex 指定正确规则。", file=sys.stderr)
         return 3
 
     meta_copy, meta_skip = plan_metadata(src, args.role, args.metadata)
