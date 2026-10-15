@@ -26,6 +26,15 @@ LWD (Layerwise Disaggregated) 是基于 vLLM v1 引擎的边云分布式推理�
 - **接入接缝**: 老代码经 `lwd_resolve_engine_cls` (engine 类按角色分流) 与 `lwd_serve_guard` (serve 入口注入云侧调度器) 两个钩子接入 vLLM; 另对 `v1/engine/core.py`、`v1/core/sched/scheduler.py`、`v1/worker/gpu_model_runner.py`、`distributed/parallel_state.py` 有侵入式改动.
 - **已知缺口**: 老代码 docstring 引用的设计文档 `docs/refactor/prefill_only_migration.md` 分支上并不存在, 整改时需补齐.
 
+## LWD 命名约定 (团队规范 7.5 的细化)
+
+- **一个概念一个词, 跨类名/字段/方法/异常/日志/报错文案保持一致.** 例: 控制面里"对端完成握手、可以发送"统一叫 registered (`_registered_peers`, `LwdPeerNotRegisteredError`), 不混用 ready/connected/up; 只有成对的回调 `on_peer_up`/`on_peer_down` 例外.
+- **复用配置框架的词汇, 不自造近义词.** `vllm/config/lwd/topology.py` 里 link = 一对实例 (`instance_links`), connection = 同序号的一对 DP (`LwdConfig.connections`); 参数名与配置字段同名 (`send_queue_max`, 不缩成 `queue_max`).
+- **字段名/参数名跟着类型名走 (vLLM 惯例).** `SchedulerConfig` -> `scheduler_config`; `LwdConfig` -> `lwd_config`; 同一作用域里不让两个不同对象都叫 `config`.
+- **Spec 与 Config 分工.** Config = 用户可写的配置 (YAML/CLI); Spec = 由配置推出、交给运行时组件的描述 (如 `LwdControlPlaneSpec`), 用户不直接写.
+- **名字描述对象本身, 不描述当前实现的局限.** 例: 控制面参数叫 `LwdControlPlaneSpec` 而非 `LwdLinkSpec` (一边多云后一个控制面含多条链路); 值对象的 docstring 不写"远端"之类只在部分调用处成立的限定.
+- **改名后全仓 grep 旧名, 设计文档和报错文案一起改.**
+
 > [!CAUTION]
 > **团队规范区**: 下方由 `TEAM STANDARDS (BEGIN)` 与 `TEAM STANDARDS (END)` 标记圈出的区域是团队规范原文, 仅由 committer 通过评审维护.
 > 在日常编码/文档任务中, **严禁修改区内任何内容**, 包括格式化、重排、翻译、增删条目.
