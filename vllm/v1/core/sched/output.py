@@ -35,7 +35,16 @@ class LwdBatchType(enum.Enum):
 
 @dataclass
 class LwdEmbedBatch:
-    """LWD prefill_only mode edge execute batch"""
+    """LWD prefill_only mode edge execute batch.
+
+    云侧不再"整批一次算完":调度器按**每个请求已收到多少行**与实时 KV 预算
+    取小来决定本步算多少(design v7 §5.3),逐请求的下发量由原生
+    ``num_scheduled_tokens`` 表达 —— 所以这里**不再需要** ``windows`` /
+    ``chunk_offsets``:那份拷贝会与原生水位分歧,而分歧的表现是静默切错窗口。
+
+    注意 ``token_ids`` 的长度仍是**边侧整批发送的逐请求行数**(HCCL P2P 要求
+    两端 numel 严格相等),它是"这一批有多少行"的事实,不是"本步算多少"。
+    """
 
     req_ids: list[str] = field(default_factory=list)
     token_ids: list[list[int]] = field(default_factory=list)
@@ -54,6 +63,17 @@ class LwdEmbedBatch:
     prompt_offsets: list[int] = field(default_factory=list)
     has_mrope: list[bool] = field(default_factory=list)
     mrope_positions: list[bytes] = field(default_factory=list)
+
+    # ------------------------------------------------------------------ #
+    # 已 abort 的请求(跨进程捎带,design v7 §6.4)                        #
+    # ------------------------------------------------------------------ #
+    # 它们的剩余行**永远不会**被算完,但载荷已经暂存在 host 上。调度器的
+    # 摘除台账只活在调度器进程里,worker 的暂存池看不到 —— 必须随批捎带过去,
+    # worker 才能冻结这些请求的剩余行(释放仍然等请求结束,§6.1)。
+    # v7 注:逐请求下发量改由原生 ``num_scheduled_tokens`` 表达,
+    # 所以这里不再有 ``windows`` / ``chunk_offsets`` 那份拷贝 —— 它与原生
+    # 水位是同一件事的两份账,分歧时表现为静默切错窗口。
+    aborted_req_ids: list[str] = field(default_factory=list)
 
 
 @dataclass

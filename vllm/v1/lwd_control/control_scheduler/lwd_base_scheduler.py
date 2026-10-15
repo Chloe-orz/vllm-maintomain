@@ -32,6 +32,24 @@ class LwdBaseScheduler(AsyncScheduler):
         # 未消费的 chunk 时先进本表,等这些 chunk 算完再真正 finish。
         self._lwd_abort_wait: dict[str, RequestStatus] = {}
 
+    def _lwd_note_abort_for_windowing(self, request_ids) -> None:
+        """把被 abort 的请求从窗口台账里摘成"永不消费"(§3.6 情形 B/D)。
+
+        **必须在延迟终结之前调用**:被 abort 的请求剩余行永远不会被消费,
+        只有把它们冻结,``live_rows`` 才能归零 —— 否则那一份 pinned host
+        载荷永不释放,且该 notify 作为队首会把后面所有预告钉死。这两个
+        后果在改造前都不存在(那时"整批要么全排要么不排",abort 一定消费
+        完),所以本钩子是窗口化新增的。
+
+        只有窗口化实现(``LwdCloudMixedScheduler``)提供目标方法;相位调度
+        逃生通道沿用原行为,此处自动 no-op。
+        """
+        hook = getattr(self, "_lwd_drop_request_from_chunks", None)
+        if hook is None or request_ids is None:
+            return
+        for request_id in request_ids:
+            hook(request_id)
+
     def _lwd_new_queue(self, reqs: list[Request]) -> RequestQueue:
         """新建调度策略队列并装入 reqs。"""
         queue = create_request_queue(self.policy)
@@ -78,7 +96,14 @@ class LwdBaseScheduler(AsyncScheduler):
         return getattr(self, "prefill_notify_queue", None)
 
     def _lwd_has_queued_chunk(self, request_id: str) -> bool:
-        """该请求在预告队列里是否还有未消费的 chunk(批量预告读 items)。"""
+        """该请求在预告队列里是否还有未消费的 chunk(批量预告读 items)。
+
+        窗口化(§3.6):被 abort 的请求其剩余行已被摘成"永不消费",它在队列
+        里的条目**不该**再算作"等它算完" —— 否则延迟 abort 会一直等一个
+        永远不会到来的消费,请求迟迟不终结(它的 KV 也就迟迟不释放)。
+        """
+        if request_id in getattr(self, "_lwd_dropped", ()):
+            return False
         for notify in self._lwd_notify_queue() or ():
             for item in notify.items or (notify,):
                 if item.request_id == request_id:
@@ -133,6 +158,9 @@ class LwdBaseScheduler(AsyncScheduler):
             return super().finish_requests(request_ids, finished_status)
         if isinstance(request_ids, str):
             request_ids = (request_ids,)
+        # 窗口化台账先摘除(§3.6 情形 B/D):被 abort 的剩余行永远不会被
+        # 消费,必须现在就冻结,否则 live_rows 不归零、pinned 泄漏、队首钉死。
+        self._lwd_note_abort_for_windowing(request_ids)
         immediate: list[str] = []
         for request_id in request_ids:
             if request_id not in self.requests:

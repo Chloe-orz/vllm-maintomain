@@ -124,6 +124,12 @@ class LwdCloudEngineCore(EngineCoreProc):
         self._lwd_announce()
         # 门池:元数据查重与暂存,到达即构建放行;仅本 IO 线程独占
         self._lwd_gate_pending: dict[str, LwdRequestNotify] = {}
+        # [host 暂存 / design v7 §5.2] 逐请求"已收行数"台账:worker 在 D2H
+        # 完成时随水位上报捎带过来,调度器按它决定下一步能给这个请求下发多少
+        # 行(§5.3 的 min(已收−已算, 预算))。引用交付调度器(IO 线程写 /
+        # 主循环读,dict 赋值原子)。
+        self._lwd_recv_rows: dict[str, int] = {}
+        self.scheduler.lwd_recv_rows = self._lwd_recv_rows
         # UP 链 seqno 登记(边→云→云 worker 的最后一跳,§9.12 接缝):
         # rid -> [chunk 序 seqno 列表],RangeNotify 到达即登记;调度器
         # 出 prefill 批时取快照挂 SO.lwd_up_seqnos 随批下发云 worker
@@ -256,6 +262,13 @@ class LwdCloudEngineCore(EngineCoreProc):
 
                 num_tokens = sum(item.num_tokens for item in items)
                 aux_rows = 0
+                # host 暂存(design v7 §4.3)要在"挂 recv"的时刻就知道逐请求
+                # 行表:暂存池按它把整块接收载荷拆到各请求自己的 buffer。
+                # offset 必须在场 —— 一个请求跨多个批到达时,第 2 段要落到
+                # 正确的 prompt 位置,否则会覆盖第 1 段。
+                req_ids = [item.request_id for item in items]
+                rows = [item.num_tokens for item in items]
+                offsets = [item.offset for item in items]
                 # 先打点再入队:worker 通信线程 0.5ms 就能取走,若打点在入队之后,
                 # 跨进程写日志的次序会让 hint2sub 出现负值,看着像时序错乱。
                 logger.info(
@@ -264,7 +277,10 @@ class LwdCloudEngineCore(EngineCoreProc):
                     msg.seqno, num_tokens, aux_rows, time.monotonic(),
                 )
                 post_irecv_hint(
-                    make_recv_hint(msg.seqno, num_tokens, aux_rows)
+                    make_recv_hint(
+                        msg.seqno, num_tokens, aux_rows,
+                        req_ids=req_ids, rows=rows, offsets=offsets,
+                    )
                 )
             return
         if isinstance(msg, LwdAbortNotify):
@@ -419,12 +435,59 @@ class LwdCloudEngineCore(EngineCoreProc):
                 break
         if not items:
             return
-        for channel, seqno in record_irecv_completions(items):
+        # 上报载荷两种形态:
+        #   * (channel, seqno)             —— 老形态(host 暂存关着)
+        #   * ((channel, seqno), arrived)  —— 捎带本批逐请求已收行数
+        #     arrived = [(req_id, rows_delta), ...](design v7 §5.2)
+        watermark_items = []
+        for item in items:
+            if (
+                isinstance(item, tuple)
+                and len(item) == 2
+                and isinstance(item[0], tuple)
+            ):
+                key, arrived = item
+                watermark_items.append(key)
+                self._lwd_note_arrived(arrived)
+            else:
+                watermark_items.append(item)
+        for channel, seqno in record_irecv_completions(watermark_items):
             # 引擎侧收到上报的落点(与 worker 的 REPORT 行对减 = 上报过 MQ +
             # 等到本步排空的延迟)
             logger.info(
                 "[Lwd][pre-recv] watermark advanced channel=%s seqno=%d ts=%.3f",
                 channel.value, seqno, time.monotonic(),
+            )
+
+    def _lwd_note_arrived(self, arrived) -> None:
+        """把 worker 上报的逐请求已收行数并进台账(design v7 §5.2)。
+
+        ``recv_rows[req]`` 用 **max() 累加**而不是 `+=`:边侧队满重试会产生
+        重复预告,worker 侧虽然只报增量,但跨进程传输本身也可能重放同一批;
+        max() 让整条链天然幂等,且不会把行数推过 prompt 长度。
+
+        这是调度器决定"这一步能给这个请求下发多少行"的**唯一**依据(§5.3)。
+        """
+        if not arrived:
+            return
+        ledger = self._lwd_recv_rows
+        touched = []
+        for req_id, rows in arrived:
+            try:
+                rid, n = str(req_id), int(rows)
+            except (TypeError, ValueError):
+                continue
+            if n <= 0:
+                continue
+            before = ledger.get(rid, 0)
+            if n > before:
+                # max(),不是 += :重放/重复上报都不会把行数推过真实已收量
+                ledger[rid] = n
+                touched.append((rid, before, n))
+        if touched:
+            logger.info(
+                "[Lwd][host-stage] ARRIVED ledger update %s (tracked=%d)",
+                touched, len(ledger),
             )
 
     def lwd_handle_model_output(
