@@ -7,9 +7,8 @@ import threading
 import time
 import torch
 
-from vllm.logger import init_logger
+from vllm.lwd_logger import lwd_logger
 from vllm.sampling_params import SamplingParams
-from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
@@ -23,7 +22,6 @@ from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_SAMPLING_DEFAULTS,
-    LwdAbortNotify,
     LwdHelloNotify,
     LwdRangeNotify,
     LwdRequestNotify,
@@ -35,8 +33,6 @@ from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,
 )
 from vllm.v1.request import Request
-
-logger = init_logger(__name__)
 
 
 # 步元数据队满重试小睡:元数据不可丢(边侧据此预挂精确尺寸 recv)
@@ -94,8 +90,8 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         # 首拍即通告(边侧可能已 bind 等待)
         self._lwd_announce()
         self._lwd_register_recv_hint()
-        logger.info(
-            "[Lwd] cloud engine assembled: PRE_OUT bind %s, POST_OUT announce -> "
+        lwd_logger.info(
+            "[cloud] engine assembled: PRE_OUT bind %s, POST_OUT announce -> "
             "%s:%s via master %s",
             config.lwd_pre_out_endpoint(),
             config.pre_out_host,
@@ -118,14 +114,14 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             # 阻塞投递:闸门开启时提示是正确性依赖,丢一条就没人提前挂该 recv,
             # 水位不前进,闸门后的批永不下发。
             register_hint_sender(lambda hint, mq=hint_mq: mq.enqueue(hint))
-            logger.info(
-                "[Lwd][pre-recv] hint sender registered (PD_mix -> hint MQ)"
+            lwd_logger.info(
+                "[pre-recv] hint sender registered (PD_mix -> hint MQ)"
             )
         else:
             # PD_mix 是唯一调度形态:hint MQ 缺失 = 提示发不出去,闸门永不
             # 放行,必须显式可见
-            logger.warning(
-                "[Lwd][pre-recv] hint MQ missing: pre-recv gate will "
+            lwd_logger.warning(
+                "[pre-recv] hint MQ missing: pre-recv gate will "
                 "never open"
             )
 
@@ -134,7 +130,7 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         try:
             self._lwd_setup_zmq()
         except Exception:
-            logger.exception("[Lwd] cloud PRE_OUT setup failed")
+            lwd_logger.exception("[cloud] PRE_OUT setup failed")
             self.input_queue.put_nowait((EngineCoreRequestType.EXECUTOR_FAILED, b""))
             return
         while True:
@@ -143,18 +139,20 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
                 if self._lwd_subscriber.closed:
                     break
                 continue
-            self._lwd_dispatch(msg)
+            self._lwd_on_message(msg)
 
     def _lwd_announce(self) -> None:
         """首拍 HELLO 通告一次;队满不重试,由边侧等待超时 fail-fast 兜底。"""
         self._lwd_publisher.publish(self._lwd_hello)
-        logger.info(
-            "[Lwd][cloud] HELLO announced: pre_out=%s:%s",
+        lwd_logger.info(
+            "[cloud] HELLO announced: pre_out=%s:%s",
             self._lwd_hello.pre_out_host, self._lwd_hello.pre_out_port,
         )
 
-    def _lwd_dispatch(self, msg) -> None:
-        """PRE_OUT 三类分派(本 IO 线程):元数据转 Request / abort 清扫+终结 / 范围预告入通知队列+下发提前收 hint。"""
+    def _lwd_dispatch_message(self, msg) -> bool:
+        """PRE_OUT 两类分派(本 IO 线程):范围预告入通知队列+下发提前收
+        hint;请求预告转 ADD。abort 通告功能未上,到达即未知帧由公共
+        入口告警丢弃。"""
         if isinstance(msg, LwdRangeNotify):
             # 范围预告:整条入通知队列(重复预告即重复点名,调度器分类
             # 幂等剔除,无副作用)。预告自带 seqno,出批时作 UP 链配对号。
@@ -180,28 +178,17 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             post_irecv_hint(
                 make_recv_hint(msg.seqno, num_tokens, aux_rows)
             )
-            return
-        if isinstance(msg, LwdAbortNotify):
-            # abort 清扫:摘除通知队列里该请求的条目——mixed 调度对
-            # "ADD 未落地"的预告是留队首等落地, aborted 请求永不落地,
-            # 不清扫会把队首永久堵住(条目掏空则整条移除)
-            removed = self.scheduler.prefill_notify_queue.purge(msg.request_id)
-            if removed:
-                logger.info(
-                    "[Lwd][cloud-ctrl] purged %d pending notify item(s) for "
-                    "aborted req=%s", removed, msg.request_id,
-                )
-            # 双队列与原生 ABORT 同款:eager 处理 + 保持 input_queue 次序
-            self.aborts_queue.put_nowait([msg.request_id])
-            self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [msg.request_id]))
-            return
-        request = self._lwd_build_request(msg)
-        self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
+            return True
+        if isinstance(msg, LwdRequestNotify):
+            request = self._lwd_build_request(msg)
+            self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
+            return True
+        return False
 
     def _lwd_build_request(self, req_notify: LwdRequestNotify) -> Request:
         """请求构建(唯一建请求点):采样参数自请求预告重建 + 占位零值
-        embeds(prompt 长度即行数,UP 注入直接写该缓冲窗口);哈希链
-        按缓存使能分叉。"""
+        embeds(prompt 长度即行数,UP 注入直接写该缓冲窗口)。前缀缓存
+        哈希链未随控制面移植(功能另上,届时再挂 block_hasher)。"""
         sampling_params = self._lwd_build_sampling_params(req_notify)
         # 不传真实 ids 也不造占位:按原生 prompt-embeds 语义挂零缓冲,
         # 行数即 prompt 长度;ids=None 时 input_batch 自动把 prompt 段
@@ -212,19 +199,13 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             self.vllm_config.model_config.get_hidden_size(),
             dtype=self.vllm_config.model_config.dtype,
         )
-        local_hasher = self.request_block_hasher
-        if local_hasher is None:
-            request = Request(
-                request_id=req_notify.request_id,
-                prompt_token_ids=None,
-                prompt_embeds=prompt_embeds,
-                sampling_params=sampling_params,
-                pooling_params=None,
-            )
-        else:
-            request = self._lwd_build_hashed_request(
-                req_notify, sampling_params, prompt_embeds, local_hasher
-            )
+        request = Request(
+            request_id=req_notify.request_id,
+            prompt_token_ids=None,
+            prompt_embeds=prompt_embeds,
+            sampling_params=sampling_params,
+            pooling_params=None,
+        )
         # 占位 embeds 不随 SO 上传运输层(NewRequestData 只带形状,
         # worker 本地分配):35MB 零 buffer 走 MQ overflow 通道实测
         # 单程 240ms+,是 prefill SO 开工延迟的主因。
@@ -243,36 +224,6 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         LwdControlDiag.cloud_request_admitted(req_notify, sampling_params)
         return sampling_params
 
-    def _lwd_build_hashed_request(
-        self,
-        req_notify: LwdRequestNotify,
-        sampling_params: SamplingParams,
-        prompt_embeds,
-        local_hasher,
-    ) -> Request:
-        """带边侧哈希链的请求体:prompt 首建用边侧预告链,续算/缺链/
-        长度不符回退本地(fail-open)——云侧占位 prompt 算不出真实
-        内容哈希,前缀缓存命中只能靠边侧按真实内容算出的链。"""
-        hash_block_size = resolve_kv_cache_block_sizes(
-            self.scheduler.kv_cache_config, self.vllm_config
-        )[1]
-
-        def block_hasher(request: Request) -> list[bytes]:
-            if len(request.block_hashes) == 0 and request.num_output_tokens == 0:
-                expected = request.num_prompt_tokens // hash_block_size
-                if len(req_notify.block_hashes) == expected:
-                    return req_notify.block_hashes
-            return local_hasher(request)
-
-        return Request(
-            request_id=req_notify.request_id,
-            prompt_token_ids=None,
-            prompt_embeds=prompt_embeds,
-            sampling_params=sampling_params,
-            pooling_params=None,
-            block_hasher=block_hasher,
-        )
-    
     def step_with_batch_queue(self):
         """步首排空提前收水位(done MQ -> 闸门就绪判据),其余走原生。"""
         self._lwd_drain_irecv_completions()
@@ -302,7 +253,7 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
                 break
             except Exception:
                 # 关停时 ring 被取消:记一条即可,水位停在原处不影响收尾
-                logger.exception("[Lwd][pre-recv] done MQ drain failed")
+                lwd_logger.exception("[pre-recv] done MQ drain failed")
                 break
         if not items:
             return

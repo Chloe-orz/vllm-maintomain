@@ -93,7 +93,7 @@ classDiagram
         +schedule() SchedulerOutput
         +has_requests() bool
         +update_from_output(scheduler_output, model_runner_output) dict
-        +lwd_edge_add_request(req)
+        +lwd_admit_request(req)
         +lwd_edge_notify_range(so) bool
         +lwd_edge_abort(rids)
         -_lwd_drop_pending_request(request_id)
@@ -179,7 +179,7 @@ classDiagram
 | `LwdEdgeScheduler.schedule()` | EMBED 优先出批，否则消费 c2e 出 UNEMBED 批 |
 | `LwdEdgeScheduler.has_requests()` | 原生步进取活谓词（EMBED 可派 / c2e 待消费） |
 | `LwdEdgeScheduler.update_from_output(scheduler_output, model_runner_output)` | LWD 收割：UNEMBED 逐请求交付（完成码映射原生 finish），EMBED 无本地出账；mrope 对账回收 |
-| `lwd_edge_add_request / lwd_edge_notify_range(scheduler_output) / lwd_edge_abort` | 请求入口（校验+云预告）/ 批发布（seqno 与发布成功绑定）/ abort 出口 |
+| `lwd_admit_request(request) / lwd_edge_notify_range(scheduler_output) / lwd_edge_abort` | 边准入（校验+mrope，本地账）/ 批发布（seqno 与发布成功绑定）/ abort 台账摘除；云预告与入队归引擎 `add_request`（通信在引擎） |
 | `_lwd_drop_pending_request(request_id)` | pending 台账消除（首 token/终结/abort 三路共用），批内清空即整条移除 |
 | `lwd_pick_prefill_batch(...)` | 组批纯函数：续传优先 + FCFS 前缀 + 末位截断 + 独占规则，不变量 Σexpected ≤ cap |
 | `LwdEdgeExecutorProxy.execute_model(so)` | 三项契约：None→空占位、诊断直通（判定来自 diag）、属性透传 |
@@ -194,7 +194,7 @@ classDiagram
 | `_lwd_compute_decode_consumption(decode_ids)` | decode 精确消耗推导：逐字复刻原生 num_new（含 max_tokens 守卫与节拍守卫的零消耗分支） |
 | `update_from_output(scheduler_output, model_runner_output)` | 原生入账后解 carrier 组 c2e 入 `pending_c2e`（纯记账无 IO），引擎 `post_step` 冲刷 |
 | `LwdPrefillNotifyQueue` | `append/peek/pop_front/purge`，一把锁串行，身份弹队防 purge 竞态 |
-| `LwdCloudEngineCore._lwd_build_request(req_notify)` | 字段表重建采样参数 + 占位零值 embeds + 边侧哈希链（首建信任边侧，续算回退本地） |
+| `LwdCloudEngineCore._lwd_build_request(req_notify)` | 字段表重建采样参数 + 占位零值 embeds（前缀缓存哈希链未随控制面移植，功能另上） |
 
 ### 4.4 诊断 `lwd_control_diag/`
 
@@ -215,7 +215,7 @@ classDiagram
 | `LwdRangeNotify` | 边→云 | `seqno` + `items: list[LwdRangeItem]` | 一批预告一条：整批原子性、seqno 为 UP 配对键 |
 | `LwdRangeItem` | 同上 | `request_id / offset / num_tokens / has_mrope / mrope_positions(bytes)` | 逐 chunk 条目；mrope 原始字节走控制面（wire v2） |
 | `LwdRequestNotify` | 边→云 | 请求元数据 + `LWD_SAMPLING_FIELDS` 采样字段表 | 云侧据字段表重建 SamplingParams；eos_token_id 走原生回填 |
-| `LwdAbortNotify` | 边→云 | `request_id` | 云侧清扫 + 双队列 abort |
+| `LwdAbortNotify` | 边→云 | `request_id` | 云侧清扫 + 双队列 abort（abort 链路功能未上，wire 定义保留） |
 | `LwdHelloNotify` | 云→边 | `pre_out_host/port` + 调度三元组 | 端点唯一事实源；三元组供边侧互校（cap/preflight 同源输入） |
 | `LwdC2eNotify` | 云→边 | `hidden_num_elements / top_id_ths / num_accepted_tokens / req_ids / finish_reasons / down_seqno / token_ids` | 步元数据先于 hidden 张量到达；`token_ids` 仅诊断旁路携带 |
 | 常量 | — | `LWD_NOT_FINISHED = -1`、`LWD_SAMPLING_FIELDS/DEFAULTS` | 完成码哨兵；采样字段表（边云同表驱动） |

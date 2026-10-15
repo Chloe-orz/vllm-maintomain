@@ -97,7 +97,7 @@ flowchart LR
 1. **防御核验已删（最大行为差异）**：边侧 chunk 步后核验、云侧准入核验与 offset/mrope 对账循环、wire_version 互校、legacy 回退全部移除。上游原生调度若演进导致边云划分漂移，表现从**当场报错**变为**静默错算**。回归防线后移到 CI/联调。冒烟建议：65536 长序列 + 多模态混发各一轮，抽日志比对逐请求排程量与预告量一致。
 2. **长驻 decode 相位请求**：边侧请求现终身留在原生 running。AsyncScheduler 旁路（preemption 统计、`is_prefill_chunk` 记账）对它们的行为需真机确认；参考分支同形态已验证可行。
 3. **finished_req_ids 交接时序**：终结改在收割时走原生 finish，随下一个 EMBED 批 SO 交接到 worker——纯睡眠期滞后与重构前一致，但路径变了，冒烟看 worker 缓存释放日志。
-4. **批队列深度恒 4 硬编码**：与重构前 `LWD_EDGE_BATCH_QUEUE_DEPTH` 同值，不受 `max_concurrent_batches` 配置影响。
+4. **批队列深度恒 2 硬编码**：`LWD_EDGE_BATCH_QUEUE_DEPTH = 2`（评审定值，原参照仓保守值 4），不受 `max_concurrent_batches` 配置影响；性能验证在真机环境补测。
 5. **日志大幅减少**：每步/每批/每请求 INFO 与 perf 探针删除 27 处；保留 fail-fast、闸门 HOLD/OPEN、defer 原因、一次性装配日志。排查手段相应减少，[Lwd][sched]/[Lwd][perf] 系列锚点不复存在。
 6. **LwdDebug 默认关**：`ENABLED=False`，热路径先判开关再做 tokenizer 解码；排查期手动置 True。
 

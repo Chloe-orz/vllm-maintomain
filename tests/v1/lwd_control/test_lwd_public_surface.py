@@ -115,3 +115,125 @@ def test_no_scheduler_mode_strings_left():
         text = py.read_text()
         assert "prefill_first" not in text, py
         assert "decode_first" not in text, py
+
+
+# ------------------------------------------------------------------ #
+# 评审闭环守卫(PR #3 review 轮落定的结构与接口约束)                  #
+# ------------------------------------------------------------------ #
+def test_lwd_control_uses_lwd_logger_only():
+    """日志接口唯一化:lwd_control 包内零 vllm.logger 直连,全部走
+    vllm.lwd_logger(消息自动带 [lwd] 前缀,VLLM_LWD_LOG_LEVEL 独立控级);
+    本 PR 在原生文件新加的两处日志(sched dbg / has_work)同口径。"""
+    for py in (VLLM_DIR / "v1" / "lwd_control").rglob("*.py"):
+        text = py.read_text()
+        assert "from vllm.logger import" not in text, py
+        assert "init_logger" not in text, py
+    sched = (VLLM_DIR / "v1" / "core" / "sched" / "scheduler.py").read_text()
+    assert "lwd_logger.info" in sched
+    base_engine = (
+        VLLM_DIR / "v1" / "lwd_control" / "control_scheduler"
+        / "lwd_base_engine.py"
+    ).read_text()
+    assert "lwd_logger.info" in base_engine
+
+
+def test_has_work_override_lives_in_base_engine():
+    """has_work 状态转换日志收编基类:core.py 原生判定不动,覆写在
+    LwdBaseEngineCore(评审:通用逻辑放 lwd_base_engine)。"""
+    core = (VLLM_DIR / "v1" / "engine" / "core.py").read_text()
+    assert "_last_has_work_state" not in core
+    base_engine = (
+        VLLM_DIR / "v1" / "lwd_control" / "control_scheduler"
+        / "lwd_base_engine.py"
+    ).read_text()
+    assert "def has_work" in base_engine
+
+
+def test_message_dispatch_skeleton_in_base_engine():
+    """接收线程消息入口统一在基类:入口 _lwd_on_message + 未知帧告警
+    丢弃住基类;两侧引擎只实现 _lwd_dispatch_message 钩子(评审:与
+    cloud 的分派一起提取到基类)。"""
+    base_engine = (
+        VLLM_DIR / "v1" / "lwd_control" / "control_scheduler"
+        / "lwd_base_engine.py"
+    ).read_text()
+    assert "def _lwd_on_message" in base_engine
+    assert "drop unexpected frame" in base_engine
+    for sub in (
+        "control_edge_scheduler/lwd_edge_engine.py",
+        "control_cloud_scheduler/lwd_cloud_engine.py",
+    ):
+        text = (VLLM_DIR / "v1" / "lwd_control" / sub).read_text()
+        assert "def _lwd_dispatch_message" in text, sub
+        assert "def _lwd_on_message" not in text, sub
+
+
+def test_review_deleted_code_stays_deleted():
+    """评审裁剪的代码不再回流(后续功能落地时随功能整体回归):
+    - 零接受活行剔除(_filter_deliver_rows,4 卡问题修复,后续再带上);
+    - 边调度器请求入口编排 lwd_edge_add_request(收编进引擎 add_request);
+    - 云侧哈希链前缀缓存(_lwd_build_hashed_request / local_hasher /
+      request_block_hasher,前缀缓存功能另上);
+    - abort 通告接线(功能未上,wire 结构 LwdAbortNotify 保留)。"""
+    cloud_sched = (
+        VLLM_DIR / "v1" / "lwd_control" / "control_cloud_scheduler"
+        / "lwd_cloud_scheduler.py"
+    ).read_text()
+    assert "_filter_deliver_rows" not in cloud_sched
+    edge_sched = (
+        VLLM_DIR / "v1" / "lwd_control" / "control_edge_scheduler"
+        / "lwd_edge_scheduler.py"
+    ).read_text()
+    assert "def lwd_edge_add_request" not in edge_sched
+    cloud_engine = (
+        VLLM_DIR / "v1" / "lwd_control" / "control_cloud_scheduler"
+        / "lwd_cloud_engine.py"
+    ).read_text()
+    for banned in (
+        "_lwd_build_hashed_request",
+        "local_hasher",
+        "request_block_hasher",
+        "LwdAbortNotify",
+    ):
+        assert banned not in cloud_engine, banned
+    assert "LwdAbortNotify" not in edge_sched
+    assert "LwdAbortNotify" not in (
+        VLLM_DIR / "v1" / "lwd_control" / "control_edge_scheduler"
+        / "lwd_edge_engine.py"
+    ).read_text()
+
+
+def test_edge_add_request_communication_in_engine():
+    """请求入口分工(评审:通信最好在 engine 里进行):引擎 add_request
+    编排 准入(lwd_admit_request)-> 云预告(_lwd_notify_request)->
+    原生 super().add_request(abort_immediately 走原生 abort_requests)。"""
+    edge_engine = (
+        VLLM_DIR / "v1" / "lwd_control" / "control_edge_scheduler"
+        / "lwd_edge_engine.py"
+    ).read_text()
+    assert "def add_request" in edge_engine
+    assert "self.scheduler.lwd_admit_request(request)" in edge_engine
+    assert "self._lwd_notify_request(request)" in edge_engine
+    assert "super().add_request(request)" in edge_engine
+    edge_sched = (
+        VLLM_DIR / "v1" / "lwd_control" / "control_edge_scheduler"
+        / "lwd_edge_scheduler.py"
+    ).read_text()
+    assert "def lwd_admit_request" in edge_sched
+    # 预告发布(通信)不再住调度器
+    assert "def lwd_edge_notify_request" not in edge_sched
+
+
+def test_edge_batch_queue_depth_is_two():
+    """批队列深度 = 2(评审定值;性能验证在真机环境补)。"""
+    import re
+
+    edge_engine = (
+        VLLM_DIR / "v1" / "lwd_control" / "control_edge_scheduler"
+        / "lwd_edge_engine.py"
+    ).read_text()
+    match = re.search(
+        r"^LWD_EDGE_BATCH_QUEUE_DEPTH\s*=\s*(\d+)", edge_engine, re.M
+    )
+    assert match is not None
+    assert int(match.group(1)) == 2

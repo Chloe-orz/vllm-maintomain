@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import time
 
-from vllm.logger import init_logger
+from vllm.lwd_logger import lwd_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import (
     LwdBatch,
@@ -36,8 +36,6 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
 from vllm.config.lwd import lwd_spec_factor
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 
-logger = init_logger(__name__)
-
 
 class LwdCloudScheduler(LwdBaseScheduler):
     """notify 门控的 prefill/decode 混排调度器(PD_mix,云侧唯一形态)。"""
@@ -52,8 +50,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
         # MTP 预算系数:decode 每请求每步消耗 1+k 个 token(草稿 token
         # 占预算与 KV);公式唯一住处 lwd_config.lwd_spec_factor
         self._lwd_spec_factor: int = lwd_spec_factor(self.vllm_config)
-        logger.info(
-            "[Lwd] cloud scheduler: chunked-prefill batches mixed "
+        lwd_logger.info(
+            "[cloud-sched] chunked-prefill batches mixed "
             "with decode (one notify consumed per step at most, "
             "spec_factor=%d)",
             self._lwd_spec_factor,
@@ -82,64 +80,30 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 meta.req_ids, engine_core_outputs
             )
             # [Lwd][eos-trace] A 点:零接受行留痕(kill 根因定位,
-            # 打原始行集——修复后 A 仍照打,作为发生率观测)
+            # 打原始行集——零接受活行剔除已随 4 卡修复一并移除,此处
+            # 仅作发生率观测)
             LwdControlDiag.trace_cloud_c2e_rows(
                 meta.down_seqno, meta.req_ids,
                 meta.num_accepted_tokens, finish_reasons,
             )
-            # 修复(eos-trace 定案 364/364 云组行):零接受活行剔除——
-            # accepted=0 且 finish=-1 的行无内容无终态,进交付行集只会
-            # 让边侧按"行缺且未完结"判 ERROR;带完结码的行保留(正常
-            # 收尾)。张量配对安全:0 接受行贡献 0 个 hidden 元素,
-            # hidden_num_elements 与边侧 recv 尺寸不变。
-            req_ids, accepted, finishes, top_ths = (
-                self._filter_deliver_rows(
-                    meta.req_ids, meta.num_accepted_tokens,
-                    finish_reasons, meta.top_id_ths,
-                )
-            )
-            if not req_ids:
-                # 全零接受活行:hidden 必为 0(Σaccepted=0),无张量无
-                # 内容,不发空通告
-                return engine_core_outputs
             # 诊断旁路(SKIP_SAMPLE):逐请求 accepted ids 捎带
             token_ids: list[list[int]] = []
             if LwdControlDiag.token_passthrough_enabled():
                 token_ids = LwdControlDiag.bypass_token_payload(
-                    req_ids, engine_core_outputs
+                    meta.req_ids, engine_core_outputs
                 )
             self.pending_c2e.append(LwdC2eNotify(
                 hidden_num_elements=meta.hidden_num_elements,
-                top_id_ths=top_ths,
-                num_accepted_tokens=accepted,
-                req_ids=req_ids,
-                finish_reasons=finishes,
+                top_id_ths=meta.top_id_ths,
+                num_accepted_tokens=meta.num_accepted_tokens,
+                req_ids=meta.req_ids,
+                finish_reasons=finish_reasons,
                 down_seqno=meta.down_seqno,
                 token_ids=token_ids,
             ))
         elif LwdControlDiag.disable_down_enabled():
             self._lwd_append_diag_c2e(engine_core_outputs)
         return engine_core_outputs
-
-    @staticmethod
-    def _filter_deliver_rows(
-        req_ids: list[str],
-        accepted: list[int],
-        finish_reasons: list[int],
-        top_id_ths: list[list[int]],
-    ) -> tuple[list[str], list[int], list[int], list[list[int]]]:
-        """剔除零接受活行(accepted=0 且 finish=-1),四数组按位同步
-        过滤保持对齐;其余(含零接受但带完结码的收尾行)全保留。"""
-        keep = [
-            i for i, (acc, fin) in enumerate(zip(accepted, finish_reasons))
-            if not (acc == 0 and fin == LWD_NOT_FINISHED)
-        ]
-        return (
-            [req_ids[i] for i in keep],
-            [accepted[i] for i in keep],
-            [finish_reasons[i] for i in keep],
-            [top_id_ths[i] for i in keep],
-        )
 
     def _lwd_append_diag_c2e(self, engine_core_outputs) -> None:
         """DISABLE_DOWN 诊断旁路:云不做 collect/不发 DOWN,c2e 照常
@@ -163,8 +127,23 @@ class LwdCloudScheduler(LwdBaseScheduler):
 
     @staticmethod
     def _lwd_carrier_to_meta(carrier):
-        """pinned 载荷解包为步元数据;布局 [ranks(各段行)...,
-        counts(accepted/请求)..., seg_lens(段长/请求)...]。"""
+        """pinned 载荷解包为步元数据。
+
+        载荷 = 云侧收集后 pinned 的扁平 int 张量,按"变长段在前、定长
+        尾巴在后"排布,无需另带长度字段即可从尾部反解:
+
+            vals = [ranks(变长:每请求 seg_lens[i] 个 rank id,按请求序
+                    拼接) ... | counts(n_req 个 accepted) ...
+                    | seg_lens(n_req 个段长)]
+
+        以 n_req=2、seg_lens=[3,1]、counts=[5,2] 为例:
+            vals = [r0 r1 r2 | r0 | 5 2 | 3 1]
+            counts   = vals[-2*n_req : -n_req] -> [5, 2]
+            seg_lens = vals[-n_req:]            -> [3, 1]
+            ranks    = vals[:-2*n_req]          -> [r0, r1, r2, r0]
+        再按 seg_lens 把 ranks 切回逐请求的 top_id_ths 行
+        (本例 [[r0,r1,r2],[r0]])。-2*n_req/-n_req 两个魔数即
+        "counts 段 + seg_lens 段"两条定长尾巴的宽度。"""
         from vllm.v1.outputs import LwdC2eMeta
 
         pinned, req_ids, hidden_numel, seqno = carrier
@@ -223,15 +202,21 @@ class LwdCloudScheduler(LwdBaseScheduler):
     def _lwd_filter_ready_items(
         self, items: list[LwdRangeItem]
     ) -> tuple[list[LwdRangeItem], bool]:
-        """从预告条目中筛出就绪项:逐条对云侧账本(self.requests)
-        核实——ready(已落地且待 prefill)保留,stale(已转 decode
-        相位,重复预告)幂等丢弃,unknown(ADD 未落地)置标志。
-        返回 (ready, 是否有 unknown);调用方据 unknown 决定整批
-        defer(一次 UP 收对应整批张量,不能只排子集)。
+        """从预告条目中筛出就绪项。
+
+        items 专用于 prefill_notify:一条 LwdRangeNotify(prefill 预告)
+        的 items 即一个边侧 prefill 批——批内逐请求一个 LwdRangeItem
+        (request_id + 该 chunk 的 offset/num_tokens + mrope 携带位),
+        整批共享一个 seqno(UP 数据面配对号),故整批 all-or-nothing。
+
+        逐条对云侧账本(self.requests)核实——ready(已落地且待
+        prefill)保留,stale(已转 decode 相位,重复预告)幂等丢弃,
+        unknown(ADD 未落地)置标志。返回 (ready, 是否有 unknown);
+        调用方据 unknown 决定整批 defer(一次 UP 收对应整批张量,
+        不能只排子集)。
 
         unknown 存在即整批 defer(all-or-nothing:一次 UP recv 对应整批
-        张量,不能只放行子集);abort 清扫(引擎侧)负责把永不落地的
-        条目摘除,队首不会被永久堵住。"""
+        张量,不能只放行子集)。"""
         ready: list[LwdRangeItem] = []
         unknown = False
         for item in items:
@@ -240,8 +225,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 unknown = True
                 continue
             if self._lwd_req_phase(request) is LwdReqPhase.DECODE:
-                logger.warning(
-                    "[Lwd][cloud-sched] drop stale notify item req=%s "
+                lwd_logger.warning(
+                    "[cloud-sched] drop stale notify item req=%s "
                     "num=%d (already prefilled; duplicate notify?)",
                     item.request_id, item.num_tokens,
                 )
@@ -271,8 +256,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
             + num_decode * self._lwd_spec_factor
         )
         if need_tokens > self.max_num_scheduled_tokens:
-            logger.info(
-                "[Lwd][cloud-sched] preflight hold: tokens %d > budget %d",
+            lwd_logger.info(
+                "[cloud-sched] preflight hold: tokens %d > budget %d",
                 need_tokens, self.max_num_scheduled_tokens,
             )
             return False
@@ -284,8 +269,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
             1 for item in items if item.request_id not in running_ids
         )
         if len(self.running) + new_items > self.max_num_running_reqs:
-            logger.info(
-                "[Lwd][cloud-sched] preflight hold: seqs %d+%d > max %d",
+            lwd_logger.info(
+                "[cloud-sched] preflight hold: seqs %d+%d > max %d",
                 len(self.running), new_items, self.max_num_running_reqs,
             )
             return False
@@ -295,8 +280,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
         )
         free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
         if need_blocks > free_blocks:
-            logger.info(
-                "[Lwd][cloud-sched] preflight hold: kv blocks %d > free %d",
+            lwd_logger.info(
+                "[cloud-sched] preflight hold: kv blocks %d > free %d",
                 need_blocks, free_blocks,
             )
             return False
@@ -316,9 +301,9 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 notify = None
             elif unknown:
                 # 请求 ADD 未落地(input_queue 次序滞后):预告留队首,
-                # 本步先 decode;abort 清扫兜底防永久堵队首
-                logger.info(
-                    "[Lwd][cloud-sched] notify seqno=%d deferred: "
+                # 本步先 decode
+                lwd_logger.info(
+                    "[cloud-sched] notify seqno=%d deferred: "
                     "request(s) not added yet",
                     notify.seqno,
                 )
@@ -332,8 +317,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 # 预算/名额/KV 不足:预告留队首,decode 泄压后重试。
                 # 这条必须打日志:它是"数据都收完了、闸门也放行了,prefill 却
                 # 一直不下发"的唯一静默出口(现场排查尾部停摆时,先看这条)。
-                logger.info(
-                    "[Lwd][cloud-sched] notify seqno=%d deferred: preflight "
+                lwd_logger.info(
+                    "[cloud-sched] notify seqno=%d deferred: preflight "
                     "rejected (reqs=%d tokens=%d decode=%d pending_notify=%d)",
                     notify.seqno, len(items),
                     sum(item.num_tokens for item in items), len(decode_ids),

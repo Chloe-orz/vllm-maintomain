@@ -49,11 +49,11 @@ def test_unembed_missing_rows():
 
 def test_trace_callables_no_crash(monkeypatch):
     """三点日志函数:正常流量(零接受行/无缺行)零输出不炸;有病灶时
-    走 logger 打点(此处仅验证调用安全,不验日志文本)。"""
+    走 lwd_logger 打点(此处仅验证调用安全,不验日志文本)。"""
     try:
-        import vllm.logger  # noqa: F401
+        import vllm.lwd_logger  # noqa: F401
     except Exception:  # pragma: no cover - 轻量环境(见 conftest)
-        pytest.skip("vllm.logger 完整链不可用(需 Python>=3.10)")
+        pytest.skip("vllm.lwd_logger 完整链不可用(需 Python>=3.10)")
     monkeypatch.delenv("VLLM_ASCEND_LWD_DISABLE_DOWN", raising=False)
     # A:无零接受行 → 不打
     LwdControlDiag.trace_cloud_c2e_rows(7, ["a"], [1], [_NOT_FINISHED])

@@ -131,11 +131,11 @@ class LwdControlDiag:
         self._spec_last_log = now
         if not self._spec_draft_tokens:
             return
-        from vllm.logger import init_logger
+        from vllm.lwd_logger import lwd_logger
 
         rate = self._spec_accepted / self._spec_draft_tokens * 100
-        init_logger(__name__).info(
-            "[Lwd][spec] cumulative: rate=%.1f%% accepted=%d "
+        lwd_logger.info(
+            "[spec] cumulative: rate=%.1f%% accepted=%d "
             "draft_tokens=%d",
             rate, self._spec_accepted, self._spec_draft_tokens,
         )
@@ -223,10 +223,10 @@ class LwdControlDiag:
             req_ids, accepted, finish_reasons
         )
         if rows:
-            from vllm.logger import init_logger
+            from vllm.lwd_logger import lwd_logger
 
-            init_logger(__name__).info(
-                "[Lwd][eos-trace] cloud seqno=%s zero-accept rows "
+            lwd_logger.info(
+                "[eos-trace] cloud seqno=%s zero-accept rows "
                 "(rid,acc,fin)=%s",
                 seqno, rows,
             )
@@ -244,10 +244,10 @@ class LwdControlDiag:
         A/C 日志配对。accepted 与 sampled_rows 是判定主证——
         accepted=0 → 云组行(零接受活行进了行集);accepted>0 且
         sampled_rows>0 → worker 单行缺;sampled_rows=0 → 整批空回填。"""
-        from vllm.logger import init_logger
+        from vllm.lwd_logger import lwd_logger
 
-        init_logger(__name__).info(
-            "[Lwd][eos-trace] edge kill seqno=%s rid=%s accepted=%d "
+        lwd_logger.info(
+            "[eos-trace] edge kill seqno=%s rid=%s accepted=%d "
             "finish=%d batch_rows=%d sampled_rows=%d",
             seqno, rid, accepted, finish_code, batch_rows, sampled_rows,
         )
@@ -286,10 +286,10 @@ class LwdControlDiag:
             req_ids, accepts, result_req_ids, sampled_token_ids
         )
         if missing:
-            from vllm.logger import init_logger
+            from vllm.lwd_logger import lwd_logger
 
-            init_logger(__name__).info(
-                "[Lwd][eos-trace] worker seqno=%s missing rows=%s",
+            lwd_logger.info(
+                "[eos-trace] worker seqno=%s missing rows=%s",
                 seqno, missing,
             )
 

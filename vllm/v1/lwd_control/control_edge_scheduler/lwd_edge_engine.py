@@ -1,8 +1,8 @@
 """边侧引擎子类:通信面装配(POST_OUT bind/PRE_OUT 延迟连接)、
-HELLO 发现与互校、请求入口覆写。步进零覆写,直用原生
-step_with_batch_queue(批队列),LWD 契约经三项构造期适配满足:
-深度下限 4、is_pooling_model=True(禁原生 sample_tokens 补发)、
-executor 代理(底层正常完成返回 None 的默认形态适配为占位)。
+HELLO 发现与互校、请求入口覆写(边准入 + 云预告,通信归引擎)。
+步进零覆写,直用原生 step_with_batch_queue(批队列),LWD 契约经三项
+构造期适配满足:深度下限 2、is_pooling_model=True(禁原生 sample_tokens
+补发)、executor 代理(底层正常完成返回 None 的默认形态适配为占位)。
 
 构造约束(注入时序与两面生命周期见基类):super() 建好引擎主体后
 bind POST_OUT、起接收线程、阻塞等云首拍 HELLO(云全量初始化后才发,
@@ -12,9 +12,10 @@ bind POST_OUT、起接收线程、阻塞等云首拍 HELLO(云全量初始化后
 from __future__ import annotations
 
 import threading
+import time
 from collections import deque
 
-from vllm.logger import init_logger
+from vllm.lwd_logger import lwd_logger
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
     LwdControlPublisher,
@@ -24,8 +25,10 @@ from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
+    LWD_SAMPLING_DEFAULTS,
     LwdC2eNotify,
     LwdHelloNotify,
+    LwdRequestNotify,
     lwd_decode_cloud_notify,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_executor_proxy import (
@@ -37,12 +40,15 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
 )
+from vllm.v1.request import Request
 
-logger = init_logger(__name__)
+# 原生批队列深度:派发(embed+unembed 合计)不收割的批数上限——
+# 深度 2 已维持流水对齐(参照仓经验 4 属保守值,先 2 验证性能)
+LWD_EDGE_BATCH_QUEUE_DEPTH = 2
 
-# 原生批队列深度下限:派发(embed+unembed 合计)不收割的批数下限,
-# 突发积压时连续派发喂饱 worker(参照仓经验 >=4 才能维持流水对齐)
-LWD_EDGE_BATCH_QUEUE_DEPTH = 4
+# add 预告发布重试:次数 x 递增间隔(共约 3s),耗尽即请求级报错
+_LWD_ADD_RETRY_STEPS = 5
+_LWD_ADD_RETRY_INTERVAL_S = 0.2
 
 
 class LwdEdgeEngineCore(LwdBaseEngineCore):
@@ -65,15 +71,14 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self._lwd_publisher = LwdControlPublisher(
             None, bind=False, queue_max=config.publish_queue_max
         )
-        hello_event = threading.Event()
+        self._lwd_hello_event = threading.Event()
         self._lwd_subscriber.start(
-            lambda msg: self._lwd_on_message(msg, hello_event),
-            name="lwd-post-in",
+            self._lwd_on_message, name="lwd-post-in"
         )
-        if not hello_event.wait(config.hello_timeout_s):
+        if not self._lwd_hello_event.wait(config.hello_timeout_s):
             self._lwd_shutdown_comm()
             raise RuntimeError(
-                f"[Lwd] edge engine init failed: no cloud HELLO within "
+                f"[LWD] edge engine init failed: no cloud HELLO within "
                 f"{config.hello_timeout_s}s on POST_OUT "
                 f"(bind {config.lwd_post_out_bind_endpoint()}; check cloud "
                 f"master_addr connectivity and POST_OUT port)"
@@ -81,45 +86,43 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self._lwd_cross_check_hello()
         self.scheduler.lwd_edge_publisher = self._lwd_publisher
         # 原生批队列步进适配(step/step_with_batch_queue 零覆写):
-        # ① 深度下限 4(size 与 maxlen 同步重建,防 appendleft 在满队
+        # ① 深度 2(size 与 maxlen 同步重建,防 appendleft 在满队
         #    时静默挤掉在飞批);② 边侧采样在 execute 内完成,置
         #    is_pooling_model 禁原生 sample_tokens 补发;③ executor 代理。
         self.is_pooling_model = True
-        # 批队列深度恒 4(硬编码,与重构前同值;size 与 maxlen 同步,
-        # 防 appendleft 静默挤掉在飞批)
+        # 批队列深度(size 与 maxlen 同步,防 appendleft 静默挤掉在飞批)
         self.batch_queue_size = LWD_EDGE_BATCH_QUEUE_DEPTH
         self.batch_queue = deque(maxlen=self.batch_queue_size)
         self.step_fn = self.step_with_batch_queue
         self.model_executor = LwdEdgeExecutorProxy(self.model_executor)
-        logger.info(
-            "[Lwd] edge engine assembled: POST_OUT bind %s, PRE_OUT "
+        lwd_logger.info(
+            "[edge] engine assembled: POST_OUT bind %s, PRE_OUT "
             "discovered, native batch-queue stepping depth=%d",
             config.lwd_post_out_bind_endpoint(), self.batch_queue_size,
         )
 
-    def _lwd_on_message(
-        self, msg, hello_event: threading.Event
-    ) -> None:
-        """POST_OUT 消息处理(接收线程):HELLO -> retarget PRE_OUT(云端点
-        唯一事实源,队满自旋重试);C2e -> 调度器通告队列 + WAKEUP 敲门;
-        未知帧告警丢弃。"""
+    def _lwd_dispatch_message(self, msg) -> bool:
+        """POST_OUT 消息分派(接收线程,入口在基类):HELLO -> retarget
+        PRE_OUT(云端点唯一事实源,队满自旋重试);C2e -> 调度器通告队列
+        + WAKEUP 敲门;未知帧返回 False 由公共入口告警丢弃。"""
         if isinstance(msg, LwdHelloNotify):
             endpoint = f"tcp://{msg.pre_out_host}:{msg.pre_out_port}"
-            logger.info("[Lwd] cloud discovered via HELLO: PRE_OUT -> %s", endpoint)
+            lwd_logger.info("[hello] cloud discovered: PRE_OUT -> %s", endpoint)
             self._lwd_peer_hello = msg
             while not self._lwd_publisher.retarget(endpoint):
                 if self._lwd_subscriber.closed:
                     break
-                logger.warning(
-                    "[Lwd] PRE_OUT retarget deferred (queue full), retrying"
+                lwd_logger.warning(
+                    "[hello] PRE_OUT retarget deferred (queue full), retrying"
                 )
                 threading.Event().wait(0.05)
-            hello_event.set()
-        elif isinstance(msg, LwdC2eNotify):
+            self._lwd_hello_event.set()
+            return True
+        if isinstance(msg, LwdC2eNotify):
             self.scheduler.unembed_notify_queue.append(msg)
             self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
-        else:
-            logger.warning("[Lwd] drop unexpected POST_OUT frame %r", type(msg))
+            return True
+        return False
 
     def _lwd_cross_check_hello(self) -> None:
         """HELLO 互校:max_num_batched_tokens/max_num_seqs 与云不一致即关停 fail-fast(不一致不报错,只会 preflight 恒 hold 静默串行);spec 系数以云为准采纳并复核活性;mrope 模型遇旧 wire 版本关停。"""
@@ -149,8 +152,8 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             # spec 系数以云为准:它预留的是云 decode 步的草稿预算,边侧
             # 本地取不到合法来源(边实例带 spec 配置会拖起 draft机制)。
             # 采纳对端值而非 fail-fast——部署上边侧无需再配 spec。
-            logger.warning(
-                "[Lwd] adopt cloud spec_factor=%d over edge local %d "
+            lwd_logger.warning(
+                "[hello] adopt cloud spec_factor=%d over edge local %d "
                 "(edge has no legitimate local source for it)",
                 remote[2] + 1, local[2] + 1,
             )
@@ -168,16 +171,48 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                     f"{remote[2] + 1});请增大 max_num_batched_tokens "
                     f"或减小 max_num_seqs"
                 )
-        logger.info("[Lwd] HELLO scheduling triple verified: %s", local)
+        lwd_logger.info("[hello] scheduling triple verified: %s", local)
 
     # ------------------------------------------------------------------ #
     # 引擎接口覆写                                                        #
     # ------------------------------------------------------------------ #
-    def add_request(self, request, _request_wave: int = 0) -> None:
-        """边校验 + 云预告 + 本地入队。"""
-        self.scheduler.lwd_edge_add_request(request)
+    def add_request(self, request: Request, _request_wave: int = 0) -> None:
+        """边准入(校验+mrope,调度器本地账) -> 云请求预告(通信归引擎)
+        -> 原生引擎入口(原生校验 + 入队 + abort_immediately 原生处理)。"""
+        self.scheduler.lwd_admit_request(request)
+        self._lwd_notify_request(request)
+        super().add_request(request)
 
     def abort_requests(self, request_ids: list[str]) -> None:
-        """abort 信号先出云,再走原生本地清理。"""
+        """pending 台账摘除(不摘会顶高 prefill 闸门),终结走原生;
+        云侧 abort 通告功能未上,随功能一并补齐。"""
         self.scheduler.lwd_edge_abort(request_ids)
         super().abort_requests(request_ids)
+
+    def _lwd_notify_request(self, request: Request) -> None:
+        """发请求元数据预告(唯一通信点,归引擎):采样参数字段表驱动
+        组包,队满短退避重试,耗尽抛 RuntimeError(沿 add 链回前端)。"""
+        values = dict(LWD_SAMPLING_DEFAULTS)
+        sampling_params = request.sampling_params
+        values.update(
+            {f: getattr(sampling_params, f) for f in LWD_SAMPLING_DEFAULTS}
+        )
+        if values["max_tokens"] is None:
+            values["max_tokens"] = 16
+        values["stop_token_ids"] = list(values["stop_token_ids"] or [])
+        message = LwdRequestNotify(
+            request_id=request.request_id,
+            num_prompt_tokens=len(request.prompt_token_ids),
+            block_hashes=list(request.block_hashes),
+            eos_token_id=sampling_params.eos_token_id,
+            **values,
+        )
+        for attempt in range(_LWD_ADD_RETRY_STEPS):
+            if self._lwd_publisher.publish(message):
+                return
+            time.sleep(_LWD_ADD_RETRY_INTERVAL_S * (attempt + 1))
+        raise RuntimeError(
+            f"[LWD] add-request notify for {request.request_id} dropped: "
+            f"publish queue full after {_LWD_ADD_RETRY_STEPS} retries "
+            f"(cloud PRE_OUT consumption stalled?)"
+        )

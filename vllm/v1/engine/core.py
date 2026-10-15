@@ -1406,18 +1406,11 @@ class EngineCoreProc(EngineCore):
 
     def has_work(self) -> bool:
         """Returns true if the engine should be stepped."""
-        state = (
-            self.engines_running,
-            self.scheduler.has_requests(),
-            bool(self.batch_queue),
+        return (
+            self.engines_running
+            or self.scheduler.has_requests()
+            or bool(self.batch_queue)
         )
-        if state != getattr(self, "_last_has_work_state", None):
-            logger.info(
-                "[has_work] engines_running=%s has_requests=%s batch_queue=%s",
-                *state,
-            )
-            self._last_has_work_state = state
-        return state[0] or state[1] or state[2]
 
     def is_running(self) -> bool:
         """Returns true if shutdown has not been requested."""

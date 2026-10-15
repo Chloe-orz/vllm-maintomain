@@ -73,7 +73,9 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):
 
 
 class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):
-    """边->云 abort 预告(PRE_OUT);云侧清理请求登记。"""
+    """边->云 abort 预告(PRE_OUT);云侧清理请求登记(通知队列清扫 +
+    双队列终结)。abort 链路功能未上:当前两侧均未接线,保留 wire 定义
+    供功能落地时启用。"""
 
     request_id: str
 

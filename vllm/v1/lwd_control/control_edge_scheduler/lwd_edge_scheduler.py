@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from vllm.logger import init_logger
+from vllm.lwd_logger import lwd_logger
 from vllm.v1.engine import (
     EngineCoreOutput,
     EngineCoreOutputs,
@@ -30,12 +30,9 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_NOT_FINISHED,
-    LWD_SAMPLING_DEFAULTS,
-    LwdAbortNotify,
     LwdC2eNotify,
     LwdRangeItem,
     LwdRangeNotify,
-    LwdRequestNotify,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_picker import (
     LwdPrefillCandidate,
@@ -50,13 +47,10 @@ from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
-    from vllm.sampling_params import SamplingParams
     from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
         LwdControlPublisher,
     )
     from vllm.v1.request import Request
-
-logger = init_logger(__name__)
 
 # 云端完成码 -> 边侧终态(前端 reason 走输出通道;ERROR 落 ABORTED)
 _LWD_FINISH_STATUS = {
@@ -65,10 +59,6 @@ _LWD_FINISH_STATUS = {
     FinishReason.ABORT: RequestStatus.FINISHED_ABORTED,
     FinishReason.ERROR: RequestStatus.FINISHED_ABORTED,
 }
-
-# add 预告发布重试:次数 x 递增间隔(共约 3s),耗尽即请求级报错
-_LWD_ADD_RETRY_STEPS = 5
-_LWD_ADD_RETRY_INTERVAL_S = 0.2
 
 # 云侧 pending 上限,按未消费 chunk(seqno)计:一条 seqno = 一个云步
 # 消费单位。边侧记录 seqno -> 批内请求列表,批内全部请求收到首 token
@@ -182,8 +172,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 and not self._lwd_prefill_gate_held
             ):
                 self._lwd_prefill_gate_held = True
-                logger.info(
-                    "[Lwd][edge-sched] prefill gate HOLD: "
+                lwd_logger.info(
+                    "[edge-sched] prefill gate HOLD: "
                     "pending_chunks=%d >= %d",
                     pending_chunks, _LWD_MAX_PENDING_CHUNKS,
                 )
@@ -195,7 +185,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """闸门开转换日志(HOLD -> OPEN 只打一次)。"""
         if self._lwd_prefill_gate_held:
             self._lwd_prefill_gate_held = False
-            logger.info("[Lwd][edge-sched] prefill gate OPEN")
+            lwd_logger.info("[edge-sched] prefill gate OPEN")
 
     def _lwd_schedule_embed(self) -> SchedulerOutput | None:
         """chunk 组批 + 预算钳制 + 步后核验 + RangeNotify 发布(成功才
@@ -285,8 +275,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if not self.lwd_edge_deliver_tokens(
                 request_id, sampled_token_ids, finished=finished_now
             ):
-                logger.warning(
-                    "[LWD] drop stale cloud payload for %s (not awaiting)",
+                lwd_logger.warning(
+                    "[edge-deliver] drop stale cloud payload for %s "
+                    "(not awaiting)",
                     request_id,
                 )
                 continue
@@ -385,20 +376,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             is not None
         )
 
-    def lwd_edge_add_request(self, request: Request) -> None:
-        """请求入口:校验 -> mrope -> 云预告 -> 本地入队;abort_immediately 走 finish+abort 出口。"""
+    def lwd_admit_request(self, request: Request) -> None:
+        """请求入口的调度器本地半段:模式边界校验 + mrope 预计算。
+        云预告(通信)与入队归引擎 add_request,abort_immediately 走
+        原生引擎路径(abort_requests 覆写里摘台账)。"""
         self._lwd_validate_request(request)
         self._lwd_compute_mrope_positions(request)
-        self.lwd_edge_notify_request(
-            request_id=request.request_id,
-            num_prompt_tokens=len(request.prompt_token_ids),
-            sampling_params=request.sampling_params,
-            block_hashes=list(request.block_hashes),
-        )
-        super().add_request(request)
-        if request.abort_immediately:
-            self.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED)
-            self.lwd_edge_abort([request.request_id])
 
     @staticmethod
     def _lwd_request_has_mm(request: Request) -> bool:
@@ -527,52 +510,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             has_mrope.append(req_has_mrope)
         return (items, req_ids, token_slices, prompt_offsets, has_mrope) if items else None
 
-    def lwd_edge_notify_request(
-        self,
-        request_id: str,
-        num_prompt_tokens: int,
-        sampling_params: SamplingParams | None = None,
-        block_hashes: list[bytes] | None = None,
-    ) -> None:
-        """发请求元数据预告;队满短退避重试,耗尽抛 RuntimeError(沿 add 链回前端)。"""
-        publisher = self.lwd_edge_publisher
-        values = dict(LWD_SAMPLING_DEFAULTS)
-        if sampling_params is not None:
-            values.update(
-                {f: getattr(sampling_params, f) for f in LWD_SAMPLING_DEFAULTS}
-            )
-        if values["max_tokens"] is None:
-            values["max_tokens"] = 16
-        values["stop_token_ids"] = list(values["stop_token_ids"] or [])
-        message = LwdRequestNotify(
-            request_id=request_id,
-            num_prompt_tokens=num_prompt_tokens,
-            block_hashes=block_hashes if block_hashes is not None else [],
-            eos_token_id=(
-                sampling_params.eos_token_id if sampling_params else None
-            ),
-            **values,
-        )
-        for attempt in range(_LWD_ADD_RETRY_STEPS):
-            if publisher.publish(message):
-                return
-            time.sleep(_LWD_ADD_RETRY_INTERVAL_S * (attempt + 1))
-        raise RuntimeError(
-            f"[LWD] add-request notify for {request_id} dropped: publish "
-            f"queue full after {_LWD_ADD_RETRY_STEPS} retries "
-            f"(cloud PRE_OUT consumption stalled?)"
-        )
-
     def lwd_edge_abort(self, request_ids: list[str]) -> None:
-        """发 AbortNotify + 台账摘除;调度器内清理走原生路径
-        (mrope positions 由收割期对账回收)。"""
-        publisher = self.lwd_edge_publisher
+        """abort 台账摘除(pending 水位防线,不摘会顶高 prefill 闸门);
+        云侧 abort 通告功能未上,终结清账走原生 abort_requests。"""
         for request_id in request_ids:
             self._lwd_drop_pending_request(request_id)
-            if not publisher.publish(LwdAbortNotify(request_id=request_id)):
-                logger.warning(
-                    "[Lwd] drop abort signal for %s: publish queue full", request_id
-                )
 
     def lwd_edge_deliver_tokens(
         self, request_id: str, token_ids: list[int], finished: bool
@@ -582,8 +524,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         不摘会泄漏水位顶高闸门);已终结/未知请求幂等丢弃。"""
         request = self.requests.get(request_id)
         if request is None or request.is_finished():
-            logger.warning(
-                "[Lwd][edge-deliver] stale result for req=%s (not awaiting)",
+            lwd_logger.warning(
+                "[edge-deliver] stale result for req=%s (not awaiting)",
                 request_id,
             )
             return False

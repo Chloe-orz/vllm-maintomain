@@ -10,15 +10,13 @@ from typing import Any
 import msgspec
 import zmq
 
-from vllm.logger import init_logger
+from vllm.lwd_logger import lwd_logger
 from vllm.v1.lwd_control.control_communication.lwd_control_communicator import (
     LwdControlCommunicator,
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     lwd_decode_notify,
 )
-
-logger = init_logger(__name__)
 
 # 接收循环 recv 超时拍(毫秒):仅作关停响应上限,收不到消息就再轮询
 LWD_RECV_TIMEOUT_MS = 5000
@@ -73,7 +71,7 @@ class LwdControlSubscriber:
                 msg = self._decoder(data)
                 return msg
             except (msgspec.DecodeError, msgspec.ValidationError):
-                logger.warning("[Lwd] drop malformed notify frame")
+                lwd_logger.warning("[subscribe] drop malformed notify frame")
         return None
 
     def shutdown(self) -> None:

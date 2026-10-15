@@ -11,15 +11,13 @@ from typing import Any
 
 import zmq
 
-from vllm.logger import init_logger
+from vllm.lwd_logger import lwd_logger
 from vllm.v1.lwd_control.control_communication.lwd_control_communicator import (
     LwdControlCommunicator,
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     lwd_encode_notify,
 )
-
-logger = init_logger(__name__)
 
 # 关停令:发布线程收到即退出;None 不会与通知混淆(它们是 msgspec 结构)
 _LWD_PUBLISH_SHUTDOWN = None
@@ -80,7 +78,7 @@ class LwdControlPublisher:
         try:
             self._queue.put_nowait(_LwdRetarget(endpoint))
         except queue.Full:
-            logger.error("[Lwd] retarget dropped: publish queue full")
+            lwd_logger.error("[publish] retarget dropped: publish queue full")
             return False
         return True
 
