@@ -23,7 +23,6 @@ from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
 from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
 )
-from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_SAMPLING_DEFAULTS,
     LwdC2eNotify,
@@ -50,6 +49,13 @@ LWD_EDGE_BATCH_QUEUE_DEPTH = 2
 _LWD_ADD_RETRY_STEPS = 5
 _LWD_ADD_RETRY_INTERVAL_S = 0.2
 
+# 运行时旋钮固定值(评审定案:不接收配置/env 注入):HELLO 等待 600s、
+# 发布队列深 1000(与通信层 LWD_PUBLISH_QUEUE_MAX 同值)。诊断层日志
+# 默认关——开关归 lwd_debug 自带的 env 通道,随其移植生效,引擎不再
+# 传播 config 段开关。
+_LWD_HELLO_TIMEOUT_S = 600.0
+_LWD_PUBLISH_QUEUE_MAX = 1000
+
 
 class LwdEdgeEngineCore(LwdBaseEngineCore):
     """边 PO 引擎:通信面装配 + HELLO 互校 + 原生步进适配。"""
@@ -59,8 +65,6 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         config = self.lwd_config
-        # 层日志总开关:env 已开则不动,config 段开则补开(仅本进程)
-        LwdControlDiag.set_debug(config.debug)
         # 通信面:bind POST_OUT 订阅面 + 延迟连接的 PRE_OUT 发布面;
         # 云端点由 HELLO 通告决定(边不预知云地址)
         self._lwd_subscriber = LwdControlSubscriber(
@@ -69,17 +73,17 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             decoder=lwd_decode_cloud_notify,
         )
         self._lwd_publisher = LwdControlPublisher(
-            None, bind=False, queue_max=config.publish_queue_max
+            None, bind=False, queue_max=_LWD_PUBLISH_QUEUE_MAX
         )
         self._lwd_hello_event = threading.Event()
         self._lwd_subscriber.start(
             self._lwd_on_message, name="lwd-post-in"
         )
-        if not self._lwd_hello_event.wait(config.hello_timeout_s):
+        if not self._lwd_hello_event.wait(_LWD_HELLO_TIMEOUT_S):
             self._lwd_shutdown_comm()
             raise RuntimeError(
                 f"[LWD] edge engine init failed: no cloud HELLO within "
-                f"{config.hello_timeout_s}s on POST_OUT "
+                f"{_LWD_HELLO_TIMEOUT_S}s on POST_OUT "
                 f"(bind {config.lwd_post_out_bind_endpoint()}; check cloud "
                 f"master_addr connectivity and POST_OUT port)"
             )

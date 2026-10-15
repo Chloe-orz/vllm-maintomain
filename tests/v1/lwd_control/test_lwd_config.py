@@ -52,6 +52,27 @@ def test_lwd_spec_factor_single_home():
     assert base.count("def lwd_spec_factor(") == 1
 
 
+def test_runtime_knobs_are_fixed_constants():
+    """评审定案:hello_timeout_s / publish_queue_max / debug 为固定值,
+    不经配置/env 注入——边引擎不再读对应 config 字段(set_debug 传播
+    一并移除,诊断开关归 lwd_debug 自带 env 通道,随其移植生效)。"""
+    engine = (
+        VLLM_DIR / "v1" / "lwd_control" / "control_edge_scheduler"
+        / "lwd_edge_engine.py"
+    ).read_text()
+    # 固定值冻结(改值须过评审)
+    assert "_LWD_HELLO_TIMEOUT_S = 600.0" in engine
+    assert "_LWD_PUBLISH_QUEUE_MAX = 1000" in engine
+    # 不得回流配置/env 注入
+    for banned in (
+        "config.hello_timeout_s",
+        "config.publish_queue_max",
+        "config.debug",
+        "set_debug",
+    ):
+        assert banned not in engine, banned
+
+
 def test_lwd_spec_factor_table():
     """表驱动:无 spec 配置/缺属性/None/0 恒 1;有 spec 为 k+1。
     语义对当:与旧 vllm/config/lwd.lwd_spec_factor 完全一致(部署上
