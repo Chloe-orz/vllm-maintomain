@@ -1325,7 +1325,27 @@ class EngineCoreProc(EngineCore):
                 # Note that parallel_config.data_parallel_index will still reflect
                 # the original DP rank.
                 parallel_config.reconfigure_for_independent_dp_rank()
-                engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+                # Lwd prefill-only engine selection (edge/cloud): no-op
+                # unless lwd_config was explicitly provided (vanilla
+                # EngineCoreProc). Gate follows main's resolve_lwd_config
+                # init-guard semantics — a parsed config means LWD is on;
+                # role picks the engine (schema restricts it to edge/cloud).
+                lwd = vllm_config.lwd_config
+                engine_cls = EngineCoreProc
+                if lwd is not None:
+                    if lwd.role == "edge":
+                        from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
+                            LwdEdgeEngineCore,
+                        )
+
+                        engine_cls = LwdEdgeEngineCore
+                    else:
+                        from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
+                            LwdCloudEngineCore,
+                        )
+
+                        engine_cls = LwdCloudEngineCore
+                engine_core = engine_cls(*args, engine_index=dp_rank, **kwargs)
 
             assert engine_core is not None
 
