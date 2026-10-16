@@ -1,22 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""边侧引擎子类:通信面装配(POST_OUT bind/PRE_OUT 延迟连接)、
-HELLO 发现与互校、请求入口覆写(边准入 + 云预告,通信归引擎)。
-步进零覆写,直用原生 step_with_batch_queue(批队列),LWD 契约经三项
-构造期适配满足:深度下限 2、is_pooling_model=True(禁原生 sample_tokens
-补发)、executor 代理(底层正常完成返回 None 的默认形态适配为占位)。
+"""Edge engine core: communication setup (POST_OUT bind, PRE_OUT connected
+lazily), HELLO discovery and cross-check, and the request entry (edge
+admission + announcement to the cloud; communication stays in the engine).
 
-构造约束(注入时序与两面生命周期见基类):super() 建好引擎主体后
-bind POST_OUT、起接收线程、阻塞等云首拍 HELLO(云全量初始化后才发,
-超时 fail-fast,无重发自愈——重启即整组重拉),三元组互校通过后
-回填 publisher 给调度器。"""
+Stepping is the native step_with_batch_queue, adapted at construction: depth
+2, is_pooling_model=True (no native sample_tokens) and an executor proxy (a
+normally completed batch returning None becomes a placeholder).
+
+Construction (injection order and the lifecycle of both channels: see the
+base class): once super() has built the engine, bind POST_OUT, start the
+receiver thread and block until the cloud's first HELLO, which the cloud sends
+once fully initialized; a timeout fails fast. There is no self-healing:
+restart the whole group. After the triple cross-check, the publisher is handed
+to the scheduler.
+"""
 
 from __future__ import annotations
 
 import threading
 import time
 from collections import deque
+from typing import Any
 
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.engine import EngineCoreRequestType
@@ -44,11 +50,13 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
 )
 from vllm.v1.request import Request
 
-# 原生批队列深度:派发(embed+unembed 合计)不收割的批数上限——
-# 深度 2 已维持流水对齐(参照仓经验 4 属保守值,先 2 验证性能)
+# Native batch queue depth: dispatched (embed + unembed) batches not yet
+# reaped. 2 keeps the pipeline aligned; the reference branch's 4 is
+# conservative, validate performance with 2 first.
 LWD_EDGE_BATCH_QUEUE_DEPTH = 2
 
-# add 预告发布重试:次数 x 递增间隔(共约 3s),耗尽即请求级报错
+# A full publish queue is retried for the add-request notify with growing
+# intervals (about 3 s in total); running out fails the request.
 _LWD_ADD_RETRY_STEPS = 5
 _LWD_ADD_RETRY_INTERVAL_S = 0.2
 
@@ -61,9 +69,11 @@ _LWD_PUBLISH_QUEUE_MAX = 1000
 
 
 class LwdEdgeEngineCore(LwdBaseEngineCore):
-    """边 PO 引擎:通信面装配 + HELLO 互校 + 原生步进适配。"""
+    """Edge PO engine: communication setup + HELLO cross-check + native
+    stepping."""
 
     lwd_scheduler_cls = LwdEdgeScheduler
+    scheduler: LwdEdgeScheduler
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -90,12 +100,14 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             )
         self._lwd_cross_check_hello()
         self.scheduler.lwd_edge_publisher = self._lwd_publisher
-        # 原生批队列步进适配(step/step_with_batch_queue 零覆写):
-        # ① 深度 2(size 与 maxlen 同步重建,防 appendleft 在满队
-        #    时静默挤掉在飞批);② 边侧采样在 execute 内完成,置
-        #    is_pooling_model 禁原生 sample_tokens 补发;③ executor 代理。
+        # Native batch queue stepping (step/step_with_batch_queue untouched):
+        # 1. depth 2, rebuilding the deque so its maxlen matches and
+        #    appendleft on a full queue cannot silently evict a batch in
+        #    flight;
+        # 2. the edge samples inside execute, so is_pooling_model stops the
+        #    native sample_tokens call;
+        # 3. the executor proxy.
         self.is_pooling_model = True
-        # 批队列深度(size 与 maxlen 同步,防 appendleft 静默挤掉在飞批)
         self.batch_queue_size = LWD_EDGE_BATCH_QUEUE_DEPTH
         self.batch_queue = deque(maxlen=self.batch_queue_size)
         self.step_fn = self.step_with_batch_queue
@@ -108,9 +120,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         )
 
     def _lwd_dispatch_message(self, msg) -> bool:
-        """POST_OUT 消息分派(接收线程,入口在基类):HELLO -> retarget
-        PRE_OUT(云端点唯一事实源,队满自旋重试);C2e -> 调度器通告队列
-        + WAKEUP 敲门;未知帧返回 False 由公共入口告警丢弃。"""
+        """POST_OUT dispatch (receiver thread, entry in the base class): HELLO
+        -> retarget PRE_OUT (the only source of the cloud endpoint; retried
+        while the queue is full); c2e -> scheduler notify queue + WAKEUP;
+        anything else is unknown and dropped with a warning by the entry."""
         if isinstance(msg, LwdHelloNotify):
             endpoint = f"tcp://{msg.pre_out_host}:{msg.pre_out_port}"
             lwd_logger.info("[hello] cloud discovered: PRE_OUT -> %s", endpoint)
@@ -131,9 +144,12 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         return False
 
     def _lwd_cross_check_hello(self) -> None:
-        """HELLO 互校:max_num_batched_tokens/max_num_seqs 与云不一致即关停
-        fail-fast(不一致不报错,只会 preflight 恒 hold 静默串行);spec 系数
-        以云为准采纳并复核活性;mrope 模型遇旧 wire 版本关停。"""
+        """HELLO cross-check. (max_num_batched_tokens, max_num_seqs) must match
+        the cloud: both feed the cap/preflight formulas, and a mismatch makes
+        the cloud hold prefills behind decodes forever without any error, so
+        it shuts down and fails fast. The speculative factor is adopted from
+        the cloud and liveness re-checked with it; mrope models shut down on an
+        old wire version."""
         hello = self._lwd_peer_hello
         sched = self.vllm_config.scheduler_config
         spec_config = getattr(self.vllm_config, "speculative_config", None)
@@ -151,35 +167,34 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self._lwd_shutdown_comm()
             raise RuntimeError(
                 f"[LWD] edge/cloud scheduling config mismatch: "
-                f"(max_num_batched_tokens, max_num_seqs) "
-                f"edge={local[:2]} != cloud={remote[:2]}; "
-                f"cap/preflight 公式两侧同源输入不一致会让 preflight 恒 "
-                f"hold、prefill 被 decode 静默串行——两侧拉起配置须同值"
+                f"(max_num_batched_tokens, max_num_seqs) edge={local[:2]} != "
+                f"cloud={remote[:2]}; a mismatch makes the cloud hold prefills "
+                f"behind decodes forever, so start both sides with the same values"
             )
         if local[2] != remote[2]:
-            # spec 系数以云为准:它预留的是云 decode 步的草稿预算,边侧
-            # 本地取不到合法来源(边实例带 spec 配置会拖起 draft机制)。
-            # 采纳对端值而非 fail-fast——部署上边侧无需再配 spec。
+            # The factor reserves draft budget of cloud decode steps; the edge
+            # has no legitimate local source (a spec config on the edge would
+            # start the draft machinery), so it adopts the cloud's.
+            spec_factor = remote[2] + 1
             lwd_logger.warning(
-                "[hello] adopt cloud spec_factor=%d over edge local %d "
-                "(edge has no legitimate local source for it)",
-                remote[2] + 1,
+                "[hello] adopt cloud spec_factor=%d over edge local %d",
+                spec_factor,
                 local[2] + 1,
             )
-            self.scheduler._lwd_spec_factor = remote[2] + 1
-            # 采纳后复核活性下界(构造期检查用的是本地 factor)
+            self.scheduler._lwd_spec_factor = spec_factor
+            # The scheduler checked liveness with the local factor.
             if (
                 self.scheduler.max_num_scheduled_tokens
-                - self.scheduler.max_num_running_reqs * (remote[2] + 1)
+                - self.scheduler.max_num_running_reqs * spec_factor
                 < 1
             ):
                 self._lwd_shutdown_comm()
                 raise RuntimeError(
-                    f"[LWD] 死锁配置: 采纳云侧 spec_factor={remote[2] + 1} "
-                    f"后 cap 恒 < 1(预算 {self.scheduler.max_num_scheduled_tokens}"
-                    f" − 满员 {self.scheduler.max_num_running_reqs} × "
-                    f"{remote[2] + 1});请增大 max_num_batched_tokens "
-                    f"或减小 max_num_seqs"
+                    f"[LWD] deadlock config: with the cloud spec_factor="
+                    f"{spec_factor} the cap is always < 1 (budget "
+                    f"{self.scheduler.max_num_scheduled_tokens} - max_num_seqs "
+                    f"{self.scheduler.max_num_running_reqs} x {spec_factor}); "
+                    f"increase max_num_batched_tokens or decrease max_num_seqs"
                 )
         lwd_logger.info("[hello] scheduling triple verified: %s", local)
 
@@ -200,17 +215,21 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         super().abort_requests(request_ids)
 
     def _lwd_notify_request(self, request: Request) -> None:
-        """发请求元数据预告(唯一通信点,归引擎):采样参数字段表驱动
-        组包,队满短退避重试,耗尽抛 RuntimeError(沿 add 链回前端)。"""
-        values = dict(LWD_SAMPLING_DEFAULTS)
+        """Announce the request to the cloud (the engine's only communication
+        point), packing the sampling fields from the shared table; a full queue
+        is retried with short backoffs, then RuntimeError is raised (back to
+        the frontend through add_request)."""
         sampling_params = request.sampling_params
-        values.update({f: getattr(sampling_params, f) for f in LWD_SAMPLING_DEFAULTS})
+        assert sampling_params is not None, "admission rejects pooling requests"
+        values: dict[str, Any] = {
+            f: getattr(sampling_params, f) for f in LWD_SAMPLING_DEFAULTS
+        }
         if values["max_tokens"] is None:
-            values["max_tokens"] = 16
+            values["max_tokens"] = LWD_SAMPLING_DEFAULTS["max_tokens"]
         values["stop_token_ids"] = list(values["stop_token_ids"] or [])
         message = LwdRequestNotify(
             request_id=request.request_id,
-            num_prompt_tokens=len(request.prompt_token_ids),
+            num_prompt_tokens=request.num_prompt_tokens,
             block_hashes=list(request.block_hashes),
             eos_token_id=sampling_params.eos_token_id,
             **values,

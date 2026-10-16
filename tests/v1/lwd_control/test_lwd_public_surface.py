@@ -209,16 +209,14 @@ def test_review_deleted_code_stays_deleted():
     ):
         assert banned not in cloud_engine, banned
     assert "LwdAbortNotify" not in edge_sched
-    assert (
-        "LwdAbortNotify"
-        not in (
-            VLLM_DIR
-            / "v1"
-            / "lwd_control"
-            / "control_edge_scheduler"
-            / "lwd_edge_engine.py"
-        ).read_text()
-    )
+    edge_engine = (
+        VLLM_DIR
+        / "v1"
+        / "lwd_control"
+        / "control_edge_scheduler"
+        / "lwd_edge_engine.py"
+    ).read_text()
+    assert "LwdAbortNotify" not in edge_engine
 
 
 def test_edge_add_request_communication_in_engine():

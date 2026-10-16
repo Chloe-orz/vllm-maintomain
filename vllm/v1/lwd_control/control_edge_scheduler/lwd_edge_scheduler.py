@@ -80,7 +80,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         publisher: LwdControlPublisher | None = None,
         **kwargs,
     ) -> None:
-        """publisher 经构造注入(与调度器同生命周期)。"""
+        """The publisher is injected through the constructor and lives as long
+        as the scheduler."""
         super().__init__(*args, **kwargs)
         self.lwd_edge_publisher = publisher
         self._lwd_seqno = 0
@@ -183,9 +184,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             lwd_logger.info("[edge-sched] prefill gate OPEN")
 
     def _lwd_schedule_embed(self) -> SchedulerOutput | None:
-        """chunk 组批 + 预算钳制 + 步后核验 + RangeNotify 发布(成功才
-        挂 EMBED 批,seqno 与发布绑定);不可派或发布失败返回 None——
-        弃批的进度损失由发布通道不丢消息前提保证不发生。"""
+        """Chunked batch + budget clamp + post-step check + RangeNotify publish
+        (the EMBED batch is attached only on success, seqno bound to the
+        publish). None when nothing is dispatchable or the publish fails; the
+        progress of a dropped batch is safe as long as the publish channel
+        never loses messages."""
         if not self._lwd_embed_dispatchable():
             return None
         out = self._lwd_schedule_batch()
@@ -424,8 +427,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 期间调度循环停转;MM 劣化归因)
 
     def lwd_edge_notify_range(self, scheduler_output: SchedulerOutput) -> bool:
-        """发一条批量 RangeNotify(seqno 先行):seqno 只分配给真正上 wire 的
-        批,发布原子性即整批原子性;失败返回 False,调用方弃批。"""
+        """Publish one batch RangeNotify (seqno first): a seqno is only taken
+        by a batch that reached the wire, so the publish is atomic for the
+        whole batch. False on failure, and the caller drops the batch."""
         built = self._lwd_build_range_items(scheduler_output.num_scheduled_tokens)
         if built is None:
             return True

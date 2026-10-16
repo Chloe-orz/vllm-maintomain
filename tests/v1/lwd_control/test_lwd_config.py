@@ -30,13 +30,15 @@ VLLM_DIR = REPO_ROOT / "vllm"
 
 
 def test_old_config_face_purged_from_core_and_lwd_control():
-    """旧配置面清零:core.py 与 lwd_control 不再 import vllm.config.lwd,
-    旧判据字段(enabled/mode/is_edge)不再出现;新判据在位。"""
+    """Old config surface purged: neither core.py nor lwd_control imports
+    vllm.config.lwd, the retired gate fields (enabled/mode/is_edge) are gone
+    and the new gate is in place."""
     core = (VLLM_DIR / "v1" / "engine" / "core.py").read_text()
     assert "from vllm.config.lwd import" not in core
     for retired in ("lwd.enabled", "lwd.mode", "lwd.is_edge"):
         assert retired not in core, retired
-    # 新判据:init-guard 语义(显式给 lwd_config 即开)+ role 分流
+    # New gate: init-guard semantics (LWD is on once lwd_config is given) +
+    # the role picks the engine.
     assert "vllm_config.lwd_config" in core
     assert "if lwd is not None:" in core
     assert 'lwd.role == "edge"' in core

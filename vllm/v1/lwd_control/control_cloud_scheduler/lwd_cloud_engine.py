@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""云侧 EngineCore 子类:覆写 socket IO 线程入口,PRE_OUT 循环独立成线程,
-边侧预告与步内元数据经 input_queue 走原生分发;仅 prefill_only 云角色启用。"""
+"""Cloud engine core: overrides the socket IO thread entry; the PRE_OUT loop
+runs on its own thread, and edge notifies and step metadata reach the native
+dispatch through input_queue. Enabled for the prefill_only cloud role only."""
 
 from __future__ import annotations
 
@@ -40,14 +41,16 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.request import Request
 
-# 步元数据队满重试小睡:元数据不可丢(边侧据此预挂精确尺寸 recv)
+# Sleep between retries of a full outbound queue: step metadata must not be
+# lost, the edge posts its receive of the exact size from it.
 _LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
 
 
 class LwdCloudEngineCore(LwdBaseEngineCore):
-    """云 PO 引擎:PRE_OUT 循环独立成线程,其余全走原生。"""
+    """Cloud PO engine: PRE_OUT loop on its own thread, the rest is native."""
 
     lwd_scheduler_cls = LwdCloudScheduler
+    scheduler: LwdCloudScheduler
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -88,7 +91,8 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         self._lwd_hello = LwdHelloNotify(
             pre_out_host=config.pre_out_host,
             pre_out_port=config.pre_out_port,
-            # 调度三元组供边侧互校(cap/preflight 公式的同源输入)
+            # Scheduling triple the edge cross-checks (same inputs of the
+            # cap/preflight formulas on both sides).
             max_num_batched_tokens=sched_config.max_num_batched_tokens,
             max_num_seqs=sched_config.max_num_seqs,
             num_speculative_tokens=lwd_spec_factor(self.vllm_config) - 1,
@@ -155,9 +159,10 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         )
 
     def _lwd_dispatch_message(self, msg) -> bool:
-        """PRE_OUT 两类分派(本 IO 线程):范围预告入通知队列+下发提前收
-        hint;请求预告转 ADD。abort 通告功能未上,到达即未知帧由公共
-        入口告警丢弃。"""
+        """PRE_OUT dispatch of two kinds (on this IO thread): range notify ->
+        notify queue + pre-recv hint; request notify -> native ADD. Abort is
+        not wired yet: it arrives as an unknown frame, dropped with a warning
+        by the common entry."""
         if isinstance(msg, LwdRangeNotify):
             # 范围预告:整条入通知队列(重复预告即重复点名,调度器分类
             # 幂等剔除,无副作用)。预告自带 seqno,出批时作 UP 链配对号。
@@ -263,8 +268,9 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         record_irecv_completions(items)
 
     def post_step(self, model_executed: bool) -> None:
-        """步末冲刷待发 c2e(调度器只入列,发布归引擎层;两条步路径的
-        原生尾部都会走到本钩子)。队满小睡重试,关停退出。"""
+        """Flush pending c2e to the edge at the end of the step (the
+        scheduler only queues them; both native step paths reach this hook).
+        A full queue is retried after a short sleep until shutdown."""
         for notify in self.scheduler.pending_c2e:
             while not self._lwd_publisher.closed:
                 if self._lwd_publisher.publish(notify):
