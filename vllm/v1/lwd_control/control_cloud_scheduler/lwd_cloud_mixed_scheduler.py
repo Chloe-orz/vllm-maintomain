@@ -554,17 +554,25 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
 
         下发规则(design v7 §5.3,提问方指定):
 
-            avail_i = recv_rows[i] − consumed_i          # 数据面到了多少
-            n_i     = min(avail_i, 剩余预算)              # 与预算取小
+            arrived_i = recv_rows[i] − num_computed[i]     # 数据面到了多少
+            avail_i   = min(arrived_i, item.num_tokens)    # 但本 chunk 只有这么多
+            n_i       = min(avail_i, 剩余预算)              # 再与预算取小
 
         ``recv_rows`` 是 worker 捎带上报的**已收行数**(§5.2),
-        ``consumed`` 直接取原生水位 ``request.num_computed_tokens −
-        item.offset``(唯一权威,不再维护第二本账)。
+        ``num_computed_tokens`` 直接取原生水位(唯一权威,不再维护第二本账)。
 
-        **为什么不按 ``item.num_tokens``(chunk 剩余)封顶**:那样预算就依赖
-        "原生批处理次序与我们一致"。只按 ``avail`` 封顶时,
-        ``budget = decode_exact + Σavail_i`` 与原生 FIFO 前缀序组合出的结果
-        **精确**等于逐请求取小;万一序不一致,原生最多排到 ``Σavail``,
+        **为什么要与 ``item.num_tokens`` 取小**(真机踩过):``recv_rows`` 是该
+        请求**跨全部 chunk 累计**的高水位,而一条 RangeNotify 只宣告**本 chunk**
+        那一段 —— ``item.num_tokens`` 是自限块 ``min(剩余 prompt, chunk 单元)``
+        的长度。一个被切成 1168 + 2342 的 prompt,在处理第二块时
+        ``recv_rows`` 已是 3510,若只与预算取小就会算出 3510 行;而这一批
+        只带了 2342 行,原生按批内容只排 2342,于是:
+
+            RuntimeError: [Lwd][cloud-sched] W2 violated seqno=2:
+            native prefill=2342 Σwindows=3510
+
+        取小之后,``window`` 永不超出本批实际携带的行数,原生保持 FIFO 前缀
+        序时二者精确相等;万一序不一致,原生最多排到 ``Σitem.num_tokens``,
         而 W2 会在下发后当场炸 —— 不会静默算脏数据(§7)。
 
         返回 ``(windows, windowed_items, decode_exact, budget, reason)``;
@@ -601,20 +609,24 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             if rid in self._lwd_dropped:
                 continue
             recv_rows = int(ledger.get(rid, 0))
-            # 已算行数取**原生水位**(引擎侧对象,我们与原生同进程)。
-            # 为什么不能用 ``recv_rows − item.offset`` 代替:``recv_rows`` 是
-            # 该请求**历史上**写入的最高行号,一个被切成多块的 prompt 里,
-            # chunk 1 算完后 chunk 2 的 offset 仍落在它之下 ⇒ 用 offset 做基准
-            # 会把"已经算过的段"重新算一遍。必须减去已算量。
-            #
-            # 这个减法是安全的:``num_computed_tokens`` 由原生在**引擎进程内**
-            # 推进;worker 侧的存储读指针(``consumed``)是另一个量,它跑到前面
-            # 不会改动这里(实测:worker 已 stage 时 num_computed 仍为 0)。
-            # 踩过的是**另一处**——拿 worker 侧那个量做减法(见 _lwd_verify_w2)。
             request = self.requests.get(rid)
             if request is None:
                 continue
-            available = recv_rows - (request.num_computed_tokens - item.offset)
+            # ---- 本步能给这个 item 下发多少行 ----
+            # ① 已算行数必须取**原生水位** ``num_computed_tokens``(引擎侧对象,
+            #    与原生同进程)。为什么不能用 ``item.offset`` 代替:一个被切成
+            #    多块的 prompt 里,chunk 1 算完后 chunk 2 的 offset 仍落在它
+            #    之下,用 offset 做基准会把"已经算过的段"重新算一遍。
+            #    这个减法是安全的:``num_computed_tokens`` 由原生在**引擎进程
+            #    内**推进;worker 侧那个存储读指针(``consumed``)是另一个量,
+            #    它跑到前面不会改动这里(踩过的是**另一处**,见 _lwd_verify_w2)。
+            # ② 再与 ``item.num_tokens`` 取小:``recv_rows`` 是**跨全部 chunk
+            #    累计**的高水位,而本批只携带 ``item.num_tokens`` 行(自限块)。
+            #    少了这一步就会下发比本批实际数据更多的行 —— 真机实录:
+            #    1168 + 2342 的 prompt 在第二块上算出 3510 窗口,而原生只排了
+            #    2342,W2 当场炸(native prefill=2342 Σwindows=3510)。
+            arrived = recv_rows - request.num_computed_tokens
+            available = min(arrived, item.num_tokens)
             if available <= 0:
                 # 这个 chunk 还一行都没到,或这一段已经算完:本步不给行。
                 continue
@@ -634,15 +646,19 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         )
         if capped_by_budget:
             reason = f"{reason}+budget"
+        # 日志里把三个量都摊开:到达量、本 chunk 长度、最终窗口。真机上
+        # "窗口 > 本批实际行数"就是从这里看出来的(avail 曾是跨 chunk 累计值),
+        # 只打 windows 看不出这层关系。
         logger.info(
-            "[Lwd][host-stage] WINDOW seqno=%d windows=%s avail=%s "
+            "[Lwd][host-stage] WINDOW seqno=%d windows=%s avail=%s chunk=%s "
             "room_left=%d decode_exact=%d decode_blocks=%d free=%d reason=%s",
             notify.seqno, windows,
             [
                 int(ledger.get(it.request_id, 0))
-                - (self.requests[it.request_id].num_computed_tokens - it.offset)
+                - self.requests[it.request_id].num_computed_tokens
                 for it in windowed
             ],
+            [it.num_tokens for it in windowed],
             room, decode_exact, decode_blocks,
             self.kv_cache_manager.block_pool.get_num_free_blocks(), reason,
         )
