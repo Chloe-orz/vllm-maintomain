@@ -631,6 +631,20 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 # 这个 chunk 还一行都没到,或这一段已经算完:本步不给行。
                 continue
             n = min(available, room)
+            # ---- 与原生块对齐(否则原生会把窗口再截一次)----
+            # 原生在 prefill 阶段做块对齐切分:只要**算完这一窗后还没越过
+            # 最后一个整块**(``num_computed + n < num_tokens - num_tokens %
+            # BS``),它就把 ``n`` 向下取整到 BS 的倍数。我们按"整块倍数"下发,
+            # 这个取整就成了恒等变换,窗口与原生实际排程量必然一致;
+            # 反之未对齐的窗口会被原生悄悄削掉尾巴(真机实录 1108 → 1080),
+            # 让"原生已算量"落在块内部,下一步对账全部错位。
+            # 整条剩余 prompt 可以一次装下时**不要**取整:那正是原生不取整的
+            # 情形(它要"把最后几行一起算掉"),取整反而会逼出一次多余的下发。
+            spans_all = n >= request.num_tokens - request.num_computed_tokens
+            if not spans_all and n > BS:
+                n = n // BS * BS
+                if n < 1:
+                    continue
             if n < available:
                 capped_by_budget = True
             if n < 1:
@@ -707,7 +721,41 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                     f"{LWD_WIRE_VERSION}),两侧必须同版本部署"
                 )
             request = self.requests[item.request_id]
-            if request.num_computed_tokens != item.offset:
+            # ---- 部分消费:把已算过的前缀从本 chunk 里扣掉 ----
+            #
+            # ``item`` 描述的是一整块 ``[offset, offset+num_tokens)``,而这块
+            # 可能**只被消费了一部分**:KV 紧张时原生把我们的窗口截短(真机实录
+            # 1108 → 1080),``num_computed_tokens`` 于是落在块**内部**而不是
+            # 块起点。这时再拿原始 offset 对账就会炸:
+            #
+            #   chunk offset mismatch req=..: notify offset=0 != cloud computed=1080
+            #   (chunk 断流/重复/乱序)   ← 其实既没断流也没乱序
+            #
+            # 正确的处理不是报错,而是把这一块当成"从 1080 行开始的剩余 28 行"
+            # 继续下发(数据就在 host 上),让 num_computed 补到块的终点;下一次
+            # 预告的 offset 自然会对上。``num_computed > 块起点`` 说明这一段
+            # **已经算过**,所以只需右移起点,不必重新搬数据。
+            start = item.offset
+            left = item.num_tokens
+            if request.num_computed_tokens > start:
+                skipped = request.num_computed_tokens - start
+                if skipped >= left:
+                    # 整块都已算完(重放/迟到预告):本步没有可下的行。
+                    continue
+                logger.info(
+                    "[Lwd][cloud-sched] partial chunk seqno=%d req=%s: "
+                    "rows [%d,%d) already computed, dispatching the "
+                    "remaining %d of %d",
+                    notify.seqno, item.request_id,
+                    start, request.num_computed_tokens,
+                    left - skipped, left,
+                )
+                start += skipped
+                left -= skipped
+                item.offset = start
+                item.num_tokens = left
+            elif request.num_computed_tokens < start:
+                # 原生水位还没到块起点:块被跳过/预告重复(>)或乱序(<)。
                 raise RuntimeError(
                     f"[Lwd][cloud-sched] chunk offset mismatch "
                     f"req={item.request_id} seqno={notify.seqno}: "
