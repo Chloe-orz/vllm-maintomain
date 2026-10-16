@@ -91,7 +91,44 @@ class LwdCloudEngineCore(EngineCoreProc):
             "[Lwd][pre-recv] armed=%s scheduler=%s",
             self._lwd_early_recv, scheduler_name,
         )
+        self._lwd_check_host_stage_switch()
         super().__init__(*args, **kwargs)
+
+    def _lwd_check_host_stage_switch(self) -> None:
+        """Fail fast when the cloud would deadlock on a missing switch.
+
+        PD_mix 的调度依赖"每个请求已收到多少行"(`recv_rows`)来决定下发多少,
+        而这个上报只由云 worker 的 host 暂存路径产生
+        (`VLLM_ASCEND_LWD_HOST_STAGE=1`)。开关关着时:
+
+            stager is None -> 不上报行数 -> recv_rows 恒 0
+            -> 可见集谓词永远挡掉该请求 -> 云侧空转,边侧等云端响应而挂住
+
+        这是一个**静默死锁**:两边都不报错,只是整个系统停住。所以这里在启动
+        阶段就把它点出来 —— 跨进程读不到 worker 的环境变量,读的是引擎自己
+        的环境(同一套启动脚本导出,足以判断配错)。
+
+        注意:这不是"开关关闭时的合法降级"。本方案的调度与上报是同一件事的
+        两半,必须同时在场。
+        """
+        if not self._lwd_early_recv:
+            return
+        try:
+            from vllm_ascend import envs
+        except ImportError:
+            logger.warning(
+                "[Lwd][host-stage] 无法导入 vllm_ascend.envs,跳过开关自检"
+            )
+            return
+        if envs.VLLM_ASCEND_LWD_HOST_STAGE:
+            return
+        raise RuntimeError(
+            "[Lwd][host-stage] VLLM_ASCEND_LWD_HOST_STAGE 未开启,但云端点"
+            "调度器需要它上报\"每个请求已收多少行\"。继续运行会静默死锁:"
+            "云侧 recv_rows 恒为 0 -> 可见集谓词挡掉所有 prefill -> 云侧空转、"
+            "边侧等不到云端响应。请在**云侧**启动脚本里 export "
+            "VLLM_ASCEND_LWD_HOST_STAGE=1 后重启。"
+        )
 
     def _lwd_setup_zmq(self) -> None:
         """介入 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载首拍

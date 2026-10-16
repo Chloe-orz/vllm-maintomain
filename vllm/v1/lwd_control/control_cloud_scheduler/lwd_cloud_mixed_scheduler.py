@@ -392,9 +392,21 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                     notify.seqno, len(gated), len(items),
                     len(items) - len(gated),
                 )
+            gated_out_all = bool(items) and not gated
             items = gated
-            live = self._lwd_live_rows(notify) if items or unknown else 0
-            if not items and not unknown:
+            # ---- 判序很重要,三层含义必须分开 ----
+            #   ① unknown  : ADD 还没落地 —— 暂时状态,让路等下一拍;
+            #   ② 全被 GATE 挡掉 : **数据面还没到** —— 同样是暂时状态,
+            #      必须 defer。绝不能让下面的 `live == 0` 把它当成
+            #      "没东西可算了"而弹队;
+            #   ③ live == 0 : 剩下的条目真的全算完/被 abort 了 —— 才弹队。
+            #
+            # ②③ 曾经被混为一谈,后果是:预告一到就撞上 recv_rows==0,
+            # items 被 GATE 清空 -> `_lwd_live_rows` 返回 0 -> 通知被弹掉,
+            # 于是 pending_notify=0、请求永远不进 batch、云侧纯空转
+            # (真机实录;数据随后到达也再没人认领这个通知)。
+            live = 0 if (unknown or gated_out_all) else self._lwd_live_rows(notify)
+            if not items and not unknown and not gated_out_all:
                 # 全部条目失效(完结/重复):弹队,本步纯 decode。
                 # 按对象身份弹(abort 清扫可能整体替换过 deque,见
                 # _schedule_mixed 同款处理)
@@ -402,26 +414,28 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 if queue and queue[0] is notify:
                     queue.popleft()
                 notify = None
+            elif unknown or gated_out_all:
+                # 暂时状态,本步不下发,预告**留在队首**:
+                #   * unknown      = 请求 ADD 未落地(input_queue 次序滞后);
+                #   * gated_out_all = 这一批的请求都还没收到行(recv_rows==0)。
+                # 两者都会在下一拍自行消失,abort 清扫兜底防永久堵队首。
+                logger.info(
+                    "[Lwd][cloud-sched] notify seqno=%d deferred: %s",
+                    notify.seqno,
+                    "request(s) not added yet" if unknown
+                    else "no rows arrived yet (gated)",
+                )
+                notify = None
             elif live == 0:
-                # (§3.6 情形 D)条目还在但**剩余活行为 0** —— 全部被 abort
-                # 或已消费完:notify 的这一批没有任何东西可算了,必须弹队,
-                # 否则它作为队首会把后面所有 notify 永久钉死(今天是同形态
-                # 死锁的真机实录)。
+                # (§6.2 情形 D)条目还在但**剩余活行为 0** —— 全部被 abort
+                # 或已算完:notify 的这一批没有任何东西可算了,必须弹队,
+                # 否则它作为队首会把后面所有 notify 永久钉死(真机实录)。
                 queue = self.prefill_notify_queue
                 if queue and queue[0] is notify:
                     queue.popleft()
                 logger.info(
                     "[Lwd][host-stage] notify seqno=%d released: live_rows=0 "
                     "(all items consumed or aborted)",
-                    notify.seqno,
-                )
-                notify = None
-            elif unknown:
-                # 请求 ADD 未落地(input_queue 次序滞后):预告留队首,
-                # 本步先 decode;abort 清扫兜底防永久堵队首
-                logger.info(
-                    "[Lwd][cloud-sched] notify seqno=%d deferred: "
-                    "request(s) not added yet",
                     notify.seqno,
                 )
                 notify = None
