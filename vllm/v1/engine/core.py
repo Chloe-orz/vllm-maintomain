@@ -1334,13 +1334,13 @@ class EngineCoreProc(EngineCore):
                 engine_cls = EngineCoreProc
                 if lwd is not None:
                     if lwd.role == "edge":
-                        from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
+                        from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (  # noqa: E501
                             LwdEdgeEngineCore,
                         )
 
                         engine_cls = LwdEdgeEngineCore
                     else:
-                        from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
+                        from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (  # noqa: E501
                             LwdCloudEngineCore,
                         )
 

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """控制面调度/执行层:边/云调度器与配置支撑。
 
 依赖方向:本包单向依赖 control_communication;继承例外 1 个

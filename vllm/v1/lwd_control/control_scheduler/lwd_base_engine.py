@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """边/云引擎公共基类:调度器注入时序、配置挂载与收发两面生命周期,
 接收线程消息入口与 has_work 状态转换日志的公共骨架。"""
 

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """云侧 prefill 通知队列:IO 线程投递、调度主线程消费的线程接缝。
 
 并发纪律唯一住处——一把锁串行全部操作,替代原先散在引擎与调度器
@@ -55,9 +58,7 @@ class LwdPrefillNotifyQueue:
             for notify in self._queue:
                 if notify.items:
                     items = [
-                        item
-                        for item in notify.items
-                        if item.request_id != request_id
+                        item for item in notify.items if item.request_id != request_id
                     ]
                     removed += len(notify.items) - len(items)
                     if items:

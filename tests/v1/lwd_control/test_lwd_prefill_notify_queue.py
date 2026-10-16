@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """LwdPrefillNotifyQueue 测试:FIFO、身份消费、abort 清扫与并发烟雾。"""
 
 from __future__ import annotations

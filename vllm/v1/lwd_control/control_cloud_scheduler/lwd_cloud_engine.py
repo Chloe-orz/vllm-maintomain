@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """云侧 EngineCore 子类:覆写 socket IO 线程入口,PRE_OUT 循环独立成线程,
 边侧预告与步内元数据经 input_queue 走原生分发;仅 prefill_only 云角色启用。"""
 
@@ -5,16 +8,14 @@ from __future__ import annotations
 
 import threading
 import time
+
 import torch
 
 from vllm.lwd_logger import lwd_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequestType
-from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
-    LwdBaseEngineCore,
-)
-from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
-    lwd_spec_factor,
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
+    LwdCloudScheduler,
 )
 from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
     LwdControlPublisher,
@@ -30,12 +31,14 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdRequestNotify,
     lwd_encode_cloud_notify,
 )
-from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
-from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
-    LwdCloudScheduler,
+from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
+    LwdBaseEngineCore,
 )
+from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
+    lwd_spec_factor,
+)
+from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.request import Request
-
 
 # 步元数据队满重试小睡:元数据不可丢(边侧据此预挂精确尺寸 recv)
 _LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
@@ -55,7 +58,9 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         ).start()
 
     def _lwd_setup_zmq(self) -> None:
-        """介入 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边承载 HELLO 与步元数据;注册 pre-recv hint 发送通道(经 executor 旁路 MQ,不走 busy_loop 消费的 rpc_broadcast_mq)。建站失败走 EXECUTOR_FAILED 升级。"""
+        """介入 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边承载 HELLO
+        与步元数据;注册 pre-recv hint 发送通道(经 executor 旁路 MQ,不走
+        busy_loop 消费的 rpc_broadcast_mq)。建站失败走 EXECUTOR_FAILED 升级。"""
         config = self.lwd_config
         master_addr = self.vllm_config.parallel_config.master_addr
         # 部署校验(fail-fast):master_addr 空则 zmq connect 报天书,这里
@@ -63,8 +68,7 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         # 可 bind 但不可通告——不拦会把失败变成边侧 600s HELLO 超时
         if not master_addr:
             raise ValueError(
-                "[LWD] prefill_only cloud requires --master-addr "
-                "(POST_OUT connect)"
+                "[LWD] prefill_only cloud requires --master-addr (POST_OUT connect)"
             )
         if config.pre_out_host == "0.0.0.0":
             raise ValueError(
@@ -116,19 +120,17 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             # 阻塞投递:闸门开启时提示是正确性依赖,丢一条就没人提前挂该 recv,
             # 水位不前进,闸门后的批永不下发。
             register_hint_sender(lambda hint, mq=hint_mq: mq.enqueue(hint))
-            lwd_logger.info(
-                "[pre-recv] hint sender registered (PD_mix -> hint MQ)"
-            )
+            lwd_logger.info("[pre-recv] hint sender registered (PD_mix -> hint MQ)")
         else:
             # PD_mix 是唯一调度形态:hint MQ 缺失 = 提示发不出去,闸门永不
             # 放行,必须显式可见
             lwd_logger.warning(
-                "[pre-recv] hint MQ missing: pre-recv gate will "
-                "never open"
+                "[pre-recv] hint MQ missing: pre-recv gate will never open"
             )
 
     def _lwd_pre_out_loop(self) -> None:
-        """PRE_OUT 接收循环:socket 与门状态在本线程内先建后用(zmq 单线程亲和);超时拍仅作关停响应上限。"""
+        """PRE_OUT 接收循环:socket 与门状态在本线程内先建后用(zmq 单线程
+        亲和);超时拍仅作关停响应上限。"""
         try:
             self._lwd_setup_zmq()
         except Exception:
@@ -148,7 +150,8 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         self._lwd_publisher.publish(self._lwd_hello)
         lwd_logger.info(
             "[cloud] HELLO announced: pre_out=%s:%s",
-            self._lwd_hello.pre_out_host, self._lwd_hello.pre_out_port,
+            self._lwd_hello.pre_out_host,
+            self._lwd_hello.pre_out_port,
         )
 
     def _lwd_dispatch_message(self, msg) -> bool:
@@ -177,9 +180,7 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             aux_rows = 0
             # 先打点再入队:worker 通信线程 0.5ms 就能取走,若打点在入队之后,
             # 跨进程写日志的次序会让 hint2sub 出现负值,看着像时序错乱。
-            post_irecv_hint(
-                make_recv_hint(msg.seqno, num_tokens, aux_rows)
-            )
+            post_irecv_hint(make_recv_hint(msg.seqno, num_tokens, aux_rows))
             return True
         if isinstance(msg, LwdRequestNotify):
             request = self._lwd_build_request(msg)
@@ -271,5 +272,3 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
                 time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)
         self.scheduler.pending_c2e.clear()
         super().post_step(model_executed)
-
-

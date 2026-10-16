@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """边侧引擎子类:通信面装配(POST_OUT bind/PRE_OUT 延迟连接)、
 HELLO 发现与互校、请求入口覆写(边准入 + 云预告,通信归引擎)。
 步进零覆写,直用原生 step_with_batch_queue(批队列),LWD 契约经三项
@@ -76,9 +79,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             None, bind=False, queue_max=_LWD_PUBLISH_QUEUE_MAX
         )
         self._lwd_hello_event = threading.Event()
-        self._lwd_subscriber.start(
-            self._lwd_on_message, name="lwd-post-in"
-        )
+        self._lwd_subscriber.start(self._lwd_on_message, name="lwd-post-in")
         if not self._lwd_hello_event.wait(_LWD_HELLO_TIMEOUT_S):
             self._lwd_shutdown_comm()
             raise RuntimeError(
@@ -102,7 +103,8 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         lwd_logger.info(
             "[edge] engine assembled: POST_OUT bind %s, PRE_OUT "
             "discovered, native batch-queue stepping depth=%d",
-            config.lwd_post_out_bind_endpoint(), self.batch_queue_size,
+            config.lwd_post_out_bind_endpoint(),
+            self.batch_queue_size,
         )
 
     def _lwd_dispatch_message(self, msg) -> bool:
@@ -129,7 +131,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         return False
 
     def _lwd_cross_check_hello(self) -> None:
-        """HELLO 互校:max_num_batched_tokens/max_num_seqs 与云不一致即关停 fail-fast(不一致不报错,只会 preflight 恒 hold 静默串行);spec 系数以云为准采纳并复核活性;mrope 模型遇旧 wire 版本关停。"""
+        """HELLO 互校:max_num_batched_tokens/max_num_seqs 与云不一致即关停
+        fail-fast(不一致不报错,只会 preflight 恒 hold 静默串行);spec 系数
+        以云为准采纳并复核活性;mrope 模型遇旧 wire 版本关停。"""
         hello = self._lwd_peer_hello
         sched = self.vllm_config.scheduler_config
         spec_config = getattr(self.vllm_config, "speculative_config", None)
@@ -159,13 +163,15 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             lwd_logger.warning(
                 "[hello] adopt cloud spec_factor=%d over edge local %d "
                 "(edge has no legitimate local source for it)",
-                remote[2] + 1, local[2] + 1,
+                remote[2] + 1,
+                local[2] + 1,
             )
             self.scheduler._lwd_spec_factor = remote[2] + 1
             # 采纳后复核活性下界(构造期检查用的是本地 factor)
             if (
                 self.scheduler.max_num_scheduled_tokens
-                - self.scheduler.max_num_running_reqs * (remote[2] + 1) < 1
+                - self.scheduler.max_num_running_reqs * (remote[2] + 1)
+                < 1
             ):
                 self._lwd_shutdown_comm()
                 raise RuntimeError(
@@ -198,9 +204,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         组包,队满短退避重试,耗尽抛 RuntimeError(沿 add 链回前端)。"""
         values = dict(LWD_SAMPLING_DEFAULTS)
         sampling_params = request.sampling_params
-        values.update(
-            {f: getattr(sampling_params, f) for f in LWD_SAMPLING_DEFAULTS}
-        )
+        values.update({f: getattr(sampling_params, f) for f in LWD_SAMPLING_DEFAULTS})
         if values["max_tokens"] is None:
             values["max_tokens"] = 16
         values["stop_token_ids"] = list(values["stop_token_ids"] or [])

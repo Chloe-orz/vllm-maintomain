@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """配置面适配测试:lwd_spec_factor 表驱动 + 旧配置面清零守卫。
 
 对齐 main 的配置面(PR #4,resolve_lwd_config/init-guard)后的语义对当:
@@ -46,8 +49,7 @@ def test_lwd_spec_factor_single_home():
     """lwd_spec_factor 唯一住处 = lwd_base_scheduler(语义校验见同模块
     表驱动用例;此处文本守卫保证不回流旧配置面)。"""
     base = (
-        VLLM_DIR / "v1" / "lwd_control" / "control_scheduler"
-        / "lwd_base_scheduler.py"
+        VLLM_DIR / "v1" / "lwd_control" / "control_scheduler" / "lwd_base_scheduler.py"
     ).read_text()
     assert base.count("def lwd_spec_factor(") == 1
 
@@ -57,7 +59,10 @@ def test_runtime_knobs_are_fixed_constants():
     不经配置/env 注入——边引擎不再读对应 config 字段(set_debug 传播
     一并移除,诊断开关归 lwd_debug 自带 env 通道,随其移植生效)。"""
     engine = (
-        VLLM_DIR / "v1" / "lwd_control" / "control_edge_scheduler"
+        VLLM_DIR
+        / "v1"
+        / "lwd_control"
+        / "control_edge_scheduler"
         / "lwd_edge_engine.py"
     ).read_text()
     # 固定值冻结(改值须过评审)
@@ -82,9 +87,7 @@ def test_lwd_spec_factor_table():
             lwd_spec_factor,
         )
     except Exception:  # pragma: no cover - 轻量环境(见 conftest)
-        pytest.skip(
-            "lwd_base_scheduler 完整链不可用(需 torch/Python>=3.10)"
-        )
+        pytest.skip("lwd_base_scheduler 完整链不可用(需 torch/Python>=3.10)")
     table = [
         # (vllm_config, expected)
         (SimpleNamespace(speculative_config=None), 1),
