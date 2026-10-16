@@ -384,19 +384,22 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             # 只挡"完全没数据"这一档就够了:到了但不够预算,由下发规则
             # (min(avail, budget))处理。
             #
-            # **判据只用数据面事实**:``recv_rows > item.offset`` 表示"这个
-            # chunk 的起点之后已经有行写入"。早先这里写的是
-            # ``recv_rows - request.num_computed_tokens``,那个量在请求被排程
-            # 之后会被原生推进,与 worker 侧的推进并不同步 —— 一旦水位领先,
-            # 一个数据已到的请求会被**假性挡掉**而饿死。数据面与算力进度是
-            # 两件事,闸门只该问前者。
+            # **判据用原生水位**(引擎侧对象):``recv_rows > num_computed_tokens``
+            # 表示"还有已写入但没算的行"。不能用 ``recv_rows > item.offset``
+            # 代替 —— 多块 prompt 里 chunk 1 算完后,chunk 2 的 offset 仍低于
+            # recv_rows,那样会把"这个 chunk 其实一行没到"误判成可下发。
             ledger = getattr(self, "lwd_recv_rows", None) or {}
             gated: list = []
             for item in items:
                 rid = item.request_id
                 recv_rows = int(ledger.get(rid, 0))
-                if recv_rows <= item.offset:
-                    # 这个 chunk 还一行都没到:本步不进 batch。
+                request = self.requests.get(rid)
+                if request is None:
+                    gated.append(item)
+                    continue
+                if recv_rows - request.num_computed_tokens <= 0:
+                    # 完全没到,或已到但全算完:本步不进 batch。
+                    # (后一种情形由下面的 all_done 逻辑消费掉队首。)
                     continue
                 gated.append(item)
             if len(gated) != len(items):
@@ -591,19 +594,26 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             rid = item.request_id
             if rid in self._lwd_dropped:
                 continue
+            recv_rows = int(ledger.get(rid, 0))
+            # 已算行数取**原生水位**(引擎侧对象,我们与原生同进程)。
+            # 为什么不能用 ``recv_rows − item.offset`` 代替:``recv_rows`` 是
+            # 该请求**历史上**写入的最高行号,一个被切成多块的 prompt 里,
+            # chunk 1 算完后 chunk 2 的 offset 仍落在它之下 ⇒ 用 offset 做基准
+            # 会把"已经算过的段"重新算一遍。必须减去已算量。
+            #
+            # 这个减法是安全的:``num_computed_tokens`` 由原生在**引擎进程内**
+            # 推进;worker 侧的存储读指针(``consumed``)是另一个量,它跑到前面
+            # 不会改动这里(实测:worker 已 stage 时 num_computed 仍为 0)。
+            # 踩过的是**另一处**——拿 worker 侧那个量做减法(见 _lwd_verify_w2)。
             request = self.requests.get(rid)
             if request is None:
                 continue
-            consumed = request.num_computed_tokens - item.offset
-            recv_rows = int(ledger.get(rid, 0))
-            avail = recv_rows - consumed
-            if avail <= 0:
-                # 数据面还没到(或这一段已算完):**本步不给它任何行**。
-                # avail == 0 的请求根本不该进 batch —— 那由可见集谓词挡掉
-                # (§5.3.1b);这里挡的是"到了但又算完了"。
+            available = recv_rows - (request.num_computed_tokens - item.offset)
+            if available <= 0:
+                # 这个 chunk 还一行都没到,或这一段已经算完:本步不给行。
                 continue
-            n = min(avail, room)
-            if n < avail:
+            n = min(available, room)
+            if n < available:
                 capped_by_budget = True
             if n < 1:
                 break  # 保序:后面的一并留到下步
