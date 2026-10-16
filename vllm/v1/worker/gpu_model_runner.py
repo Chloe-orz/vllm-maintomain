@@ -1222,7 +1222,7 @@ class GPUModelRunner(
             req_state = CachedRequestState(
                 req_id=req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
-                prompt_embeds=new_req_data.prompt_embeds,
+                prompt_embeds=self._resolve_prompt_embeds(new_req_data),
                 prompt_is_token_ids=new_req_data.prompt_is_token_ids,
                 mm_features=new_req_data.mm_features,
                 sampling_params=sampling_params,
@@ -1550,6 +1550,17 @@ class GPUModelRunner(
                     num_reqs,
                 )
 
+    def _resolve_prompt_embeds(
+        self, new_req_data: NewRequestData
+    ) -> torch.Tensor | None:
+        """Resolve the prompt embeds carried by an incoming request.
+
+        Native deployments pass the embeds through unchanged. Subclasses
+        that rebuild requests from remote transports can override this
+        to allocate a local placeholder when only the shape arrived.
+        """
+        return new_req_data.prompt_embeds
+
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
     ) -> CachedRequestState:
@@ -1566,7 +1577,7 @@ class GPUModelRunner(
 
         req_state.prompt_token_ids = new_req_data.prompt_token_ids
         req_state.mm_features = new_req_data.mm_features
-        req_state.prompt_embeds = new_req_data.prompt_embeds
+        req_state.prompt_embeds = self._resolve_prompt_embeds(new_req_data)
         req_state.sampling_params = new_req_data.sampling_params
         req_state.pooling_params = new_req_data.pooling_params
         self.late_interaction_runner.register_request(req_id, req_state.pooling_params)
@@ -1588,6 +1599,17 @@ class GPUModelRunner(
     def _init_mrope_positions(self, req_state: CachedRequestState):
         model = self.get_model()
         assert supports_mrope(model), "M-RoPE support is not implemented."
+        if req_state.prompt_token_ids is None:
+            # prompt-embeds only(如 LWD 云侧):纯文本 M-RoPE positions 与
+            # ids 内容无关(扫描仅认 vision 标记,纯文本恒为 arange),
+            # 直接按 prompt 长度构造,与 get_mrope_input_positions 对
+            # 纯文本的输出逐值一致。
+            n = req_state.num_prompt_tokens
+            req_state.mrope_positions = (
+                torch.arange(n).unsqueeze(0).expand(3, n).clone()
+            )
+            req_state.mrope_position_delta = 0
+            return
         assert req_state.prompt_token_ids is not None, (
             "M-RoPE requires prompt_token_ids to be available."
         )
@@ -3411,6 +3433,18 @@ class GPUModelRunner(
         inputs_embeds = self.inputs_embeds.gpu[:num_tokens]
         return input_ids, inputs_embeds
 
+    def _should_run_mm_encoder(
+        self, is_first_rank: bool, is_encoder_decoder: bool
+    ) -> bool:
+        """Decide whether the multimodal encoder branch runs this step.
+
+        Native rule: first PP rank of an MM-capable, non-encoder-decoder
+        model. Subclasses whose batches carry externally provided prompt
+        embeds must skip the encoder, or the freshly computed embeddings
+        would overwrite the provided ones.
+        """
+        return self.supports_mm_inputs and is_first_rank and not is_encoder_decoder
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3432,7 +3466,7 @@ class GPUModelRunner(
         # modal outputs after that to ensure the correct order
         ec_connector_output = None
 
-        if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
+        if self._should_run_mm_encoder(is_first_rank, is_encoder_decoder):
             # Run the multimodal encoder if any.
             with self.maybe_get_ec_connector_output(
                 scheduler_output,

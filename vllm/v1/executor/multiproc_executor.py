@@ -115,12 +115,13 @@ class MultiprocExecutor(Executor):
         self.failure_callback: FailureCallback | None = None
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
-        assert self.world_size == tp_size * pp_size * pcp_size, (
-            f"world_size ({self.world_size}) must be equal to the "
-            f"tensor_parallel_size ({tp_size}) x pipeline"
-            f"_parallel_size ({pp_size}) x prefill_context"
-            f"_parallel_size ({pcp_size}). "
-        )
+        if not self.parallel_config.lwd_config.enable_lwd:
+            assert self.world_size == tp_size * pp_size * pcp_size, (
+                f"world_size ({self.world_size}) must be equal to the "
+                f"tensor_parallel_size ({tp_size}) x pipeline"
+                f"_parallel_size ({pp_size}) x prefill_context"
+                f"_parallel_size ({pcp_size}). "
+            )
 
         set_multiprocessing_worker_envs()
 
@@ -132,7 +133,13 @@ class MultiprocExecutor(Executor):
         scheduler_output_handle: Handle | None = None
         # Initialize worker and set up message queues for SchedulerOutputs
         # and ModelRunnerOutputs
-        if self.parallel_config.node_rank_within_dp == 0:
+        # LWD edge-cloud: both sides run their own engine and broadcast only
+        # to their LOCAL workers, so the cloud executor needs a broadcast
+        # queue too, and on both sides the reader count is the local worker
+        # count — a world-sized count would wait forever in the readiness
+        # handshake for cross-side subscribers that never join.
+        lwd_enable = self.parallel_config.lwd_config.enable_lwd
+        if self.parallel_config.node_rank_within_dp == 0 or lwd_enable:
             # For leader node within each dp rank,
             # each dp will have its own leader multiproc executor.
             max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
@@ -149,21 +156,30 @@ class MultiprocExecutor(Executor):
                 self.local_world_size,
             )
             self.rpc_broadcast_mq = MessageQueue(
-                self.world_size,
+                self.local_world_size if lwd_enable else self.world_size,
                 self.local_world_size,
                 max_chunk_bytes=max_chunk_bytes,
                 connect_ip=mq_connect_ip,
             )
             scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
+        # LWD 提前收:建下行提示 MQ(必须在 worker 被创建之前,handle 走环境变量)
+        self._lwd_init_early_recv_mq()
         # Create workers
         context = get_mp_context()
         shared_worker_lock = context.Lock()
         unready_workers: list[UnreadyWorkerProcHandle] = []
         success = False
         try:
-            global_start_rank = (
-                self.local_world_size * self.parallel_config.node_rank_within_dp
-            )
+            if self.parallel_config.lwd_config.enable_lwd:
+                global_start_rank = (
+                    0
+                    if self.parallel_config.lwd_config.is_edge_node
+                    else self.parallel_config.lwd_config.edge_npu_count
+                )
+            else:
+                global_start_rank = (
+                    self.local_world_size * self.parallel_config.node_rank_within_dp
+                )
             # When using fork, keep track of socket file descriptors that are
             # inherited by the worker, so that we can close them in subsequent
             # workers
@@ -205,14 +221,22 @@ class MultiprocExecutor(Executor):
                 self.start_worker_monitor()
 
             self.response_mqs = []
-            # Only leader node have remote response mqs
-            if self.parallel_config.node_rank_within_dp == 0:
+            # Only leader node have remote response mqs. LWD: both sides run
+            # their own engine and collect their LOCAL workers' replies;
+            # remote (cross-side) ranks are skipped — their outputs return
+            # via the lwd duplex channels instead.
+            if self.parallel_config.node_rank_within_dp == 0 or (
+                self.parallel_config.lwd_config.enable_lwd
+            ):
                 for rank in range(self.world_size):
-                    if rank < self.local_world_size:
-                        local_message_queue = self.workers[rank].worker_response_mq
+                    local_idx = rank - global_start_rank
+                    if 0 <= local_idx < self.local_world_size:
+                        local_message_queue = self.workers[
+                            local_idx
+                        ].worker_response_mq
                         assert local_message_queue is not None
                         self.response_mqs.append(local_message_queue)
-                    else:
+                    elif not self.parallel_config.lwd_config.enable_lwd:
                         remote_message_queue = self.workers[0].peer_worker_response_mqs[
                             rank
                         ]
@@ -228,6 +252,11 @@ class MultiprocExecutor(Executor):
             # Wait for all remote response mqs to be ready.
             for response_mq in self.response_mqs:
                 response_mq.wait_until_ready()
+
+            # LWD 提前收:挂上行完成上报 MQ 的 reader(worker 是 writer,handle
+            # 随 READY 握手回传)。此处不做 wait_until_ready:writer 在 worker
+            # 的 init_device 之后才开始上报,而 init_device 晚于 READY。
+            self._lwd_attach_irecv_done_mq()
 
             self.futures_queue = deque[FutureWrapper]()
 
@@ -248,11 +277,12 @@ class MultiprocExecutor(Executor):
 
     def _get_parallel_sizes(self) -> tuple[int, int, int]:
         self.world_size = self.parallel_config.world_size
-        assert self.world_size % self.parallel_config.nnodes_within_dp == 0, (
-            f"global world_size ({self.parallel_config.world_size}) must be "
-            f"divisible by nnodes_within_dp "
-            f"({self.parallel_config.nnodes_within_dp}). "
-        )
+        if not self.parallel_config.lwd_config.enable_lwd:
+            assert self.world_size % self.parallel_config.nnodes_within_dp == 0, (
+                f"global world_size ({self.parallel_config.world_size}) must be "
+                f"divisible by nnodes_within_dp "
+                f"({self.parallel_config.nnodes_within_dp}). "
+            )
         self.local_world_size = self.parallel_config.local_world_size
         tp_size = self.parallel_config.tensor_parallel_size
         pp_size = self.parallel_config.pipeline_parallel_size
@@ -262,7 +292,60 @@ class MultiprocExecutor(Executor):
     def _post_init_executor(self) -> None:
         pass
 
+    # ------------------------------------------------------------------ #
+    # LWD 提前收(pre-recv)的旁路消息队列                                   #
+    # ------------------------------------------------------------------ #
+    def _lwd_init_early_recv_mq(self) -> None:
+        """建下行提示 MQ(writer),并把 handle 交给即将创建的 worker。
+
+        为什么必须是**独立 MQ**、不能借 ``rpc_broadcast_mq``:
+        ``worker_busy_loop`` 是单线程的,它会在 ``execute_model`` 里为一个
+        prefill 批阻塞几百毫秒;提示排在那条队列上,就要等这一步跑完才会被
+        取走 —— 提前挂 recv 的重叠就没了。所以走一条只由 worker 侧通信线程
+        消费的旁路。
+
+        只有云侧(LWD 且非边节点)建;边侧/非 LWD 保持 None,不导 handle。
+        上行的完成上报 MQ 方向相反(worker 建 writer、handle 随 READY 回传),
+        见 ``_lwd_attach_irecv_done_mq``。
+        """
+        self.lwd_recv_hint_mq: MessageQueue | None = None
+        self.lwd_irecv_done_mq: MessageQueue | None = None
+        lwd = self.parallel_config.lwd_config
+        if not (lwd.enable_lwd and not lwd.is_edge_node):
+            return
+        from vllm_ascend.distributed.lwd_comm.pre_recv import create_hint_mq
+
+        self.lwd_recv_hint_mq = create_hint_mq()
+        logger.info(
+            "[Lwd][pre-recv] hint MQ created on cloud executor "
+            "(local_world_size=%d)", self.local_world_size,
+        )
+
+    def _lwd_attach_irecv_done_mq(self) -> None:
+        """从 worker 的 READY 载荷里收完成上报 MQ 的 reader。
+
+        只有云端点 rank 会建 writer(它才真的收跨机数据),故取那个非 None 的
+        句柄即可;其余 rank 的 MQ 恒空、也不上报。
+        """
+        if self.lwd_recv_hint_mq is None:
+            return
+        for worker in self.workers:
+            if worker.irecv_done_mq is not None:
+                self.lwd_irecv_done_mq = worker.irecv_done_mq
+                break
+        logger.info(
+            "[Lwd][pre-recv] done MQ attached on cloud executor: %s",
+            "OK" if self.lwd_irecv_done_mq is not None else "NONE",
+        )
+
     def _is_driver_worker(self, rank: int) -> bool:
+        if self.parallel_config.lwd_config.enable_lwd:
+            # Each side's first rank is its own engine's driver worker
+            # (edge rank 0, cloud rank edge_npu_count); the native
+            # ``rank % tp_size`` picks the wrong worker under the
+            # edge-first asymmetric layout.
+            lwd = self.parallel_config.lwd_config
+            return rank == (0 if lwd.is_edge_node else lwd.edge_npu_count)
         return rank % self.parallel_config.tensor_parallel_size == 0
 
     def start_worker_monitor(self, inline=False) -> None:
@@ -371,7 +454,24 @@ class MultiprocExecutor(Executor):
             send_method = method
         else:
             send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
+        if self.parallel_config.lwd_config.enable_lwd:
+            import time as _time
+
+            logger.info(
+                "[Lwd][perf] rpc-enqueue method=%s ts=%.3f",
+                method, _time.monotonic(),
+            )
         self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
+        if self.parallel_config.lwd_config.enable_lwd:
+            import time as _time
+
+            # 探针②对照点:enqueue 返回时刻。与上行 rpc-enqueue 做差 =
+            # 引擎侧入队成本(序列化/MQ 写入阻塞);与 worker 侧
+            # rpc-dequeue 做差 = MQ 在途+排队等待。
+            logger.info(
+                "[Lwd][perf] rpc-enqueue-done method=%s ts=%.3f",
+                method, _time.monotonic(),
+            )
 
         response_mqs: Sequence[MessageQueue] = self.response_mqs
         if output_rank is not None:
@@ -502,6 +602,12 @@ class MultiprocExecutor(Executor):
         # 16-23, PP rank 2
         # 24-31, PP rank 3
         # so world_size - tp_size = 32 - 8 = 24 should be PP rank = -1 (i.e. 3)
+        if self.parallel_config.lwd_config.enable_lwd:
+            # LWD edge-cloud: only the edge head rank (global rank 0)
+            # produces ModelRunnerOutput over the response mq; cloud-side
+            # results come back via the lwd duplex channels.
+            return 0
+
         return (
             self.world_size
             - self.parallel_config.tensor_parallel_size
@@ -521,6 +627,10 @@ class UnreadyWorkerProcHandle:
     rank: int
     ready_pipe: Connection
     death_writer: Connection | None = None
+    # Node-local index. Under LWD edge-cloud, cloud workers' global ranks
+    # are offset by edge_npu_count, so READY-slot placement by
+    # ``rank % len`` swaps workers there — place by this index instead.
+    local_rank: int | None = None
 
 
 @dataclass
@@ -534,6 +644,9 @@ class WorkerProcHandle:
     # `peer_worker_response_mqs[i]`
     peer_worker_response_mqs: list[MessageQueue | None]
     death_writer: Connection | None = None
+    # LWD 提前收:worker 通信线程上报"哪条 recv 收完了"的 MQ(worker 建
+    # writer,本进程挂 reader)。只有云端点 rank 非 None。
+    irecv_done_mq: MessageQueue | None = None
 
     @classmethod
     def from_unready_handle(
@@ -541,6 +654,7 @@ class WorkerProcHandle:
         unready_handle: UnreadyWorkerProcHandle,
         worker_response_mq: MessageQueue | None,
         peer_worker_response_mqs: list[MessageQueue | None],
+        irecv_done_mq: MessageQueue | None = None,
     ) -> "WorkerProcHandle":
         return cls(
             proc=unready_handle.proc,
@@ -548,6 +662,7 @@ class WorkerProcHandle:
             worker_response_mq=worker_response_mq,
             peer_worker_response_mqs=peer_worker_response_mqs,
             death_writer=unready_handle.death_writer,
+            irecv_done_mq=irecv_done_mq,
         )
 
 
@@ -557,14 +672,26 @@ class WorkerProc:
     READY_STR = "READY"
     rpc_broadcast_mq: MessageQueue | None
     worker_response_mq: MessageQueue | None
+    # LWD 提前收:worker 侧建的上报 MQ(writer),READY 时把 handle 回传引擎
+    irecv_done_mq: MessageQueue | None
 
     def _init_message_queues(
         self, input_shm_handle: Handle, vllm_config: VllmConfig
     ) -> None:
-        if vllm_config.parallel_config.nnodes_within_dp == 1:
-            # Initialize MessageQueue for receiving SchedulerOutput
+        # LWD edge-cloud uses the single-node topology as well: each engine
+        # talks only to its local workers, and cross-side traffic rides the
+        # lwd channels / ZMQ, never these queues. The native cross-node
+        # branch would funnel every worker's output into a single-reader
+        # queue whose reader lives on the edge — unreachable for the cloud
+        # engine — and its same-node test misclassifies workers under the
+        # asymmetric edge/cloud layout.
+        if (vllm_config.parallel_config.nnodes_within_dp == 1
+                or vllm_config.parallel_config.lwd_config.enable_lwd):
+            # Initialize MessageQueue for receiving SchedulerOutput.
+            # ``local_rank`` is the reader slot in the engine's queue
+            # (cloud global ranks are offset by edge_npu_count).
             self.rpc_broadcast_mq = MessageQueue.create_from_handle(
-                input_shm_handle, self.worker.rank
+                input_shm_handle, self.local_rank
             )
 
             # Initializes a message queue for sending the model output
@@ -602,10 +729,20 @@ class WorkerProc:
         is_driver_worker: bool,
     ):
         self.rank = rank
+        # Node-local index: MQ reader slots and RPC reply ownership are
+        # per-instance coordinates (cloud global ranks are offset by the
+        # edge NPU count, so global rank is the wrong key there).
+        self.local_rank = local_rank
+        self._reply_by_local_rank = (
+            vllm_config.parallel_config.lwd_config.enable_lwd
+        )
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
+        # 每个进程只按 rpc_rank(= 本节点 local_rank)取自己那份,长度须覆盖
+        # 本实例的 local_rank 范围;用全局 world_size 在 Lwd 非对称拓扑下会
+        # 与 local_rank 脱钩(world_size=1 而 local_rank 到 3 时 3/4 越界)。
         all_kwargs: list[dict] = [
-            {} for _ in range(vllm_config.parallel_config.world_size)
+            {} for _ in range(vllm_config.parallel_config.local_world_size)
         ]
         all_kwargs[local_rank] = {
             "vllm_config": vllm_config,
@@ -650,6 +787,10 @@ class WorkerProc:
         # Initialize message queues after init_device() since multi-node setups
         # (nnodes_within_dp > 1) require distributed groups to be initialized
         self._init_message_queues(input_shm_handle, vllm_config)
+
+        # LWD 提前收:云端点 worker 在 init_device 里建好了完成上报 MQ(writer),
+        # 取到它并随 READY 载荷回传,引擎据此挂 reader。
+        self.irecv_done_mq = getattr(self.worker, "irecv_done_mq", None)
 
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
@@ -706,7 +847,9 @@ class WorkerProc:
         death_reader.close()
         # Keep death_writer open in parent - when parent exits,
         # death_reader in child will get EOFError
-        return UnreadyWorkerProcHandle(proc, rank, ready_reader, death_writer)
+        return UnreadyWorkerProcHandle(
+            proc, rank, ready_reader, death_writer, local_rank=local_rank
+        )
 
     @staticmethod
     def wait_for_response_handle_ready(
@@ -723,10 +866,16 @@ class WorkerProc:
             else None
             for handle in peer_response_handles
         ]
+        # LWD 提前收:worker 侧建的完成上报 MQ(1 读 1 写),此处挂 reader。
+        irecv_done_handle = handles.get("irecv_done_handle")
+        irecv_done_mq: MessageQueue | None = None
+        if irecv_done_handle is not None:
+            irecv_done_mq = MessageQueue.create_from_handle(irecv_done_handle, 0)
         return WorkerProcHandle.from_unready_handle(
             proc_handle,
             worker_response_mq,
             peer_worker_response_mqs=peer_worker_response_mqs,
+            irecv_done_mq=irecv_done_mq,
         )
 
     @staticmethod
@@ -753,7 +902,16 @@ class WorkerProc:
                     if response["status"] != "READY":
                         raise e
 
-                    idx = unready_proc_handle.rank % len(ready_proc_handles)
+                    # Cloud workers' global ranks are offset by
+                    # edge_npu_count: ``rank % len`` swaps their slots and
+                    # the executor then reads the WRONG worker's response
+                    # queue — place each handle by its node-local index.
+                    _local_rank = unready_proc_handle.local_rank
+                    idx = (
+                        _local_rank
+                        if _local_rank is not None
+                        else unready_proc_handle.rank
+                    ) % len(ready_proc_handles)
                     ready_proc_handles[idx] = WorkerProc.wait_for_response_handle_ready(
                         response, unready_proc_handle
                     )
@@ -865,6 +1023,12 @@ class WorkerProc:
                     "status": WorkerProc.READY_STR,
                     "handle": worker.worker_response_mq.export_handle(),
                     "peer_response_handles": worker.peer_response_handles,
+                    # LWD 提前收:完成上报 MQ 的 handle(仅云端点 worker 非 None)
+                    "irecv_done_handle": (
+                        worker.irecv_done_mq.export_handle()
+                        if worker.irecv_done_mq is not None
+                        else None
+                    ),
                 }
             )
 
@@ -928,15 +1092,41 @@ class WorkerProc:
         worker_response_mq. If the output is an Exception, it is
         converted to a FAILURE response.
         """
+        # LWD: sample_tokens 的采集在主流末尾异步物化 pinned meta,
+        # 发送响应前必须等其落地(此处是输出线程/同步路径的入队点,
+        # 非计算关键路径),保证控制面读到的 meta 是完整的。
+        # 事件由 runner 每步覆写;到期事件 synchronize 为 no-op,无需清理。
+        ready_event = getattr(self.worker, "_lwd_meta_ready_event", None)
+        if ready_event is not None:
+            _t_sync = time.monotonic()
+            ready_event.synchronize()
+            # 探针④:输出线程被 pinned-meta 同步占住的时长(响应腿
+            # 延迟的主要来源嫌疑;~0 即到期事件,大则输出线程被拖)。
+            logger.info(
+                "[Lwd][perf] ready-event-sync dur=%.2fms ts=%.3f",
+                (time.monotonic() - _t_sync) * 1000, time.monotonic(),
+            )
+
         if isinstance(output, AsyncModelRunnerOutput):
             output = output.get_output()
 
+        if getattr(output, "lwd_c2e_meta", None) is not None:
+            logger.info(
+                "[Lwd][trace] worker response enqueued: c2e_meta reqs=%s",
+                getattr(output.lwd_c2e_meta, "req_ids", None),
+            )
         if isinstance(output, Exception):
             result = (WorkerProc.ResponseStatus.FAILURE, str(output))
         else:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
         if (response_mq := self.worker_response_mq) is not None:
             response_mq.enqueue(result)
+            # 探针⑤:响应已写入 response_mq。与上一个 rpc-exec-done
+            # 做差 = 输出序列化+响应入队耗时;与引擎侧
+            # "engine got model_output" 做差 = 响应在途。
+            logger.info(
+                "[Lwd][perf] response-enqueued ts=%.3f", time.monotonic()
+            )
 
     def handle_output(self, output: Any):
         """Handles output from the worker. If async scheduling is enabled,
@@ -966,13 +1156,35 @@ class WorkerProc:
             output = self.async_output_queue.get()
             self.enqueue_output(output)
 
+    def _owns_rpc_reply(self, output_rank: int | None) -> bool:
+        # output_rank is an INSTANCE-LOCAL driver index (_get_output_rank
+        # returns 0 for LWD), while cloud workers' global ranks are offset
+        # by edge_npu_count — without the local-rank fallback no cloud
+        # worker would ever claim the reply and the engine would block on
+        # future.result() until the RPC timeout.
+        if output_rank is None or self.rank == output_rank:
+            return True
+        return self._reply_by_local_rank and self.local_rank == output_rank
+
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
+        _lwd_probe = getattr(
+            getattr(self.worker, "parallel_config", None), "lwd_config", None
+        )
+        _lwd_probe = bool(_lwd_probe and _lwd_probe.enable_lwd)
         while True:
             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
                 indefinite=True
             )
+            if _lwd_probe:
+                # 探针②:dequeue 返回时刻。减引擎 rpc-enqueue-done =
+                # MQ 在途+排队;减上一个 rpc-exec-done = 忙循环空转等待。
+                logger.info(
+                    "[Lwd][perf] rpc-dequeue method=%s ts=%.3f",
+                    method if isinstance(method, str) else "<callable>",
+                    time.monotonic(),
+                )
             try:
                 if isinstance(method, str):
                     func = getattr(self.worker, method)
@@ -980,6 +1192,14 @@ class WorkerProc:
                     func = partial(cloudpickle.loads(method), self.worker)
 
                 output = func(*args, **kwargs)
+                if _lwd_probe:
+                    # 探针③:rpc 执行完毕时刻。减 rpc-dequeue = worker
+                    # 纯执行耗时(含执行内的一切阻塞)。
+                    logger.info(
+                        "[Lwd][perf] rpc-exec-done method=%s ts=%.3f",
+                        method if isinstance(method, str) else "<callable>",
+                        time.monotonic(),
+                    )
             except Exception as e:
                 # Notes have been introduced in python 3.11
                 if hasattr(e, "add_note"):
@@ -987,11 +1207,20 @@ class WorkerProc:
                 logger.exception("WorkerProc hit an exception.")
                 # exception might not be serializable, so we convert it to
                 # string, only for logging purpose.
-                if output_rank is None or self.rank == output_rank:
+                if self._owns_rpc_reply(output_rank):
                     self.handle_output(e)
                 continue
 
-            if output_rank is None or self.rank == output_rank:
+            if self._owns_rpc_reply(output_rank):
+                if getattr(output, "lwd_c2e_meta", None) is not None:
+                    logger.info(
+                        "[Lwd][trace] worker reply claimed: method=%s "
+                        "rank=%d output_rank=%s, c2e_meta reqs=%s",
+                        method if isinstance(method, str) else "<callable>",
+                        self.rank,
+                        output_rank,
+                        getattr(output.lwd_c2e_meta, "req_ids", None),
+                    )
                 self.handle_output(output)
 
     @staticmethod

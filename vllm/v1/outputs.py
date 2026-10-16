@@ -228,6 +228,37 @@ class ECConnectorOutput:
     finished_recving: set[str] | None = None
 
 
+@dataclass
+class LwdC2eMeta:
+    """prefill_only LWD cloud->edge step metadata.
+
+    Carried back to the scheduler on ``ModelRunnerOutput``; the cloud
+    scheduler's control plane forwards it to the edge ahead of the
+    hidden tensor (ZMQ, owned by the control-plane module).  The data
+    plane (DOWN HCCL channel) carries ONLY the hidden tensor — nothing
+    else is packed onto the wire.
+    """
+
+    # Total bf16 element count of the DOWN hidden tensor for this step
+    # (rows_total x hidden_size); the edge pre-posts an exact-size recv
+    # from this number.
+    hidden_num_elements: int
+    # Per-request global-rank info (rank of the sampled token within the
+    # step's logits, i.e. "top-id-th"): one entry per request, in hidden
+    # row order.
+    top_id_ths: list[list[int]]
+    # Per-request draft accept counts (0 for non-spec steps).
+    num_accepted_tokens: list[int]
+    # Request ids in hidden row order (rows are grouped by request).
+    req_ids: list[str]
+
+    # The DOWN channel seqno of this step's hidden packet (channel-global
+    # monotonic, assigned by the cloud worker at send time).  The edge
+    # posts its matching irecv with this exact value — required for
+    # pairing on the tag-less HCCL wire.
+    down_seqno: int = -1
+
+
 # ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use list instead.
 @dataclass
@@ -236,12 +267,15 @@ class ModelRunnerOutput:
     req_ids: list[str]
     # req_id -> index
     req_id_to_index: dict[str, int]
-
     # num_reqs x num_generated_tokens
     # num_generated_tokens is the number of tokens
     # generated in the current step. It can be different for
     # each request due to speculative/jump decoding.
     sampled_token_ids: list[list[int]] = field(default_factory=list)
+
+    # prefill_only LWD cloud->edge step metadata (scheduler forwards it
+    # to the edge via the control plane; None on non-LWD deployments).
+    lwd_c2e_meta: LwdC2eMeta | None = None
 
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs, max_num_logprobs + 1]

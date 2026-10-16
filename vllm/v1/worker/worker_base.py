@@ -313,7 +313,16 @@ class WorkerWrapperBase:
             self.worker = worker_class(**kwargs)
 
     def initialize_from_config(self, kv_cache_configs: list[Any]) -> None:
-        kv_cache_config = kv_cache_configs[self.global_rank]
+        index = self.global_rank
+        if (
+            self.vllm_config is not None
+            and self.vllm_config.parallel_config.lwd_config.enable_lwd
+        ):
+            # LWD edge-cloud: each side's engine only collects its LOCAL
+            # workers' configs, so index by local (rpc) rank instead of the
+            # global rank (cloud global ranks start at edge_npu_count).
+            index = self.rpc_rank
+        kv_cache_config = kv_cache_configs[index]
         assert self.vllm_config is not None
         with set_current_vllm_config(self.vllm_config):
             self.worker.initialize_from_config(kv_cache_config)  # type: ignore

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+import enum
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -27,6 +28,55 @@ else:
     Request = object
 
 
+class LwdBatchType(enum.Enum):
+    LWD_EMBED = "lwd_embed"  # prefill send: token_ids -> embeddings
+    LWD_UNEMBED = "lwd_unembed"  # token recovery: batched hidden + top_id_ths -> tokens
+
+
+@dataclass
+class LwdEmbedBatch:
+    """LWD prefill_only mode edge execute batch"""
+
+    req_ids: list[str] = field(default_factory=list)
+    token_ids: list[list[int]] = field(default_factory=list)
+    # 多模态(逐请求,与 req_ids 对齐;pdmix 混批可含文本+图像混合,
+    # 批级标记不够,必须逐请求):
+    # - prompt_offsets[i]:请求 i 本 chunk 在 prompt 中的起点(边侧
+    #   mm 行切片窗口;与调度 offset 同源);
+    # - has_mrope[i]:请求 i 是否携带 mrope 行(边侧准入时只对 MM
+    #   请求算过 positions);
+    # - mrope_positions[i]:请求 i 本 chunk 的 mrope positions 原始
+    #   字节([3,n] int64,云调度器从 RangeNotify item 透传;无
+    #   mrope 为空 bytes)。仅云侧填充/消费:runner frombuffer 直写
+    #   req_state;边侧不再填充(positions 随控制面 notify 上行,
+    #   数据面 aux 帧退役)。bytes 是 msgspec 原生类型,随 SO 序列
+    #   化到云各 worker 无额外开销。
+    prompt_offsets: list[int] = field(default_factory=list)
+    has_mrope: list[bool] = field(default_factory=list)
+    mrope_positions: list[bytes] = field(default_factory=list)
+
+
+@dataclass
+class LwdUnembedBatch:
+    """LWD prefill_only mode edge token-recovery batch (spec-decode aware)."""
+
+    req_ids: list[str] = field(default_factory=list)
+    num_accept_tokens: list[int] = field(default_factory=list)  # per request: accepted count (<= K)
+    recv_num_elements: int = 0  # total DOWN hidden elements for the whole batch = rows_total * hidden_size
+    out_token_idxs: list[list[int]] = field(default_factory=list)  # per request: generation ordinal of each token (order-preserving emit)
+    top_id_ths: list[list[int]] = field(default_factory=list)  # per request: received Nth most probable token index (position in descending logits)
+    token_ids: list[list[int]] = field(default_factory=list)  # diagnostic bypass: per-request accepted token ids from cloud (skip-sample mode)
+
+
+@dataclass
+class LwdBatch:
+    """LWD prefill_only mode batch dispatched by the scheduler."""
+
+    batch_type: LwdBatchType
+    seqno: int  # every batch has a unique seqno, increasing by 1 on every dispatch.
+    batch_meta: LwdEmbedBatch | LwdUnembedBatch | None
+
+
 @dataclass
 class NewRequestData:
     req_id: str
@@ -38,6 +88,11 @@ class NewRequestData:
     num_computed_tokens: int
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
+    # LWD 占位 embeds 的运输替代:Request 侧 35MB 级零 buffer 不上 MQ
+    # (overflow 慢通道实测单程 240ms+),只带形状/dtype,worker 侧按
+    # 此本地分配。非 LWD 请求两字段恒为 None,行为不变。
+    prompt_embeds_shape: tuple[int, ...] | None = None
+    prompt_embeds_dtype: "torch.dtype | None" = None
     prompt_is_token_ids: list[bool] | None = None
 
     # Only used for v2 model runner.
@@ -50,6 +105,7 @@ class NewRequestData:
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
     ) -> "NewRequestData":
+        lwd_placeholder = getattr(request, "lwd_embeds_placeholder", False)
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
@@ -59,7 +115,19 @@ class NewRequestData:
             block_ids=block_ids,
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
-            prompt_embeds=request.prompt_embeds,
+            prompt_embeds=(
+                None if lwd_placeholder else request.prompt_embeds
+            ),
+            prompt_embeds_shape=(
+                tuple(request.prompt_embeds.shape)
+                if lwd_placeholder and request.prompt_embeds is not None
+                else None
+            ),
+            prompt_embeds_dtype=(
+                request.prompt_embeds.dtype
+                if lwd_placeholder and request.prompt_embeds is not None
+                else None
+            ),
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
         )
@@ -240,6 +308,9 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # LWD batch metadata dispatch to the worker.
+    lwd_batch: LwdBatch | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
@@ -252,6 +323,7 @@ class SchedulerOutput:
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
+            lwd_batch=None,
         )
 
 
