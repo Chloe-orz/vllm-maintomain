@@ -1,105 +1,115 @@
-"""云侧 EngineCore 子类:覆写 socket IO 线程入口,PRE_OUT 循环独立成线程,
-边侧预告与步内元数据经 input_queue 走原生分发;仅 prefill_only 云角色启用。"""
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""Cloud engine core: serves the edge of the same DP rank over the control
+plane. Edge messages are handled on an ingest thread (range notifies feed the
+scheduler and the pre-recv hint, request notifies become native ADDs); step
+metadata is flushed to the edge in post_step."""
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
+
 import torch
 
 from vllm.lwd_logger import lwd_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.engine.core import EngineShutdownState
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
+    LwdCloudScheduler,
+)
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     lwd_spec_factor,
 )
-from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
-    LwdControlPublisher,
-)
-from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
-    LWD_RECV_TIMEOUT_MS,
-    LwdControlSubscriber,
-)
-from vllm.v1.lwd_control.control_communication.lwd_notify import (
+from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
+from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_SAMPLING_DEFAULTS,
-    LwdHelloNotify,
+    LwdCloudParamsNotify,
+    LwdCloudToEdgeMessage,
+    LwdEdgeToCloudMessage,
+    LwdMessage,
     LwdRangeNotify,
     LwdRequestNotify,
-    lwd_encode_cloud_notify,
+    lwd_decode_edge_to_cloud,
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
-from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
-    LwdCloudScheduler,
-)
 from vllm.v1.request import Request
 
+# Sleep between retries of a full outbound queue: step metadata must not be
+# lost, the edge posts its receive of the exact size from it.
+_LWD_SEND_RETRY_SLEEP_S = 0.05
+_LWD_INGEST_JOIN_TIMEOUT_S = 5.0
 
-# 步元数据队满重试小睡:元数据不可丢(边侧据此预挂精确尺寸 recv)
-_LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
+_LwdIngestItem = tuple[LwdPeer, LwdEdgeToCloudMessage]
 
 
 class LwdCloudEngineCore(LwdBaseEngineCore):
-    """云 PO 引擎:PRE_OUT 循环独立成线程,其余全走原生。"""
+    """Cloud PO engine: control plane + ingest thread, the rest is native."""
 
     lwd_scheduler_cls = LwdCloudScheduler
+    scheduler: LwdCloudScheduler
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        # PRE_OUT 接收线程构造期即起,与父线程 socket IO 共用 input_queue
-        # (部署校验在 _lwd_setup_zmq 头部,失败走 EXECUTOR_FAILED 升级)
-        threading.Thread(
-            target=self._lwd_pre_out_loop, name="lwd-pre-out", daemon=True
-        ).start()
-
-    def _lwd_setup_zmq(self) -> None:
-        """介入 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边承载 HELLO 与步元数据;注册 pre-recv hint 发送通道(经 executor 旁路 MQ,不走 busy_loop 消费的 rpc_broadcast_mq)。建站失败走 EXECUTOR_FAILED 升级。"""
-        config = self.lwd_config
-        master_addr = self.vllm_config.parallel_config.master_addr
-        # 部署校验(fail-fast):master_addr 空则 zmq connect 报天书,这里
-        # 给人话;pre_out_host 是随 HELLO 通告给边的唯一事实源,0.0.0.0
-        # 可 bind 但不可通告——不拦会把失败变成边侧 600s HELLO 超时
-        if not master_addr:
-            raise ValueError(
-                "[LWD] prefill_only cloud requires --master-addr "
-                "(POST_OUT connect)"
-            )
-        if config.pre_out_host == "0.0.0.0":
-            raise ValueError(
-                "[LWD] prefill_only cloud pre_out_host=0.0.0.0 is not "
-                "announceable; set a routable IP "
-                "(VLLM_ASCEND_LWD_PRE_OUT_HOST)"
-            )
-        self._lwd_subscriber = LwdControlSubscriber(
-            config.lwd_pre_out_endpoint(), bind=True
-        )
-        self._lwd_publisher = LwdControlPublisher(
-            f"tcp://{master_addr}:{config.post_out_port}",
-            bind=False,
-            encoder=lwd_encode_cloud_notify,
-        )
+    def _lwd_assemble(self) -> None:
+        self._lwd_ingest_thread: threading.Thread | None = None
+        self._lwd_edge: LwdPeer | None = None
         sched_config = self.vllm_config.scheduler_config
-        self._lwd_hello = LwdHelloNotify(
-            pre_out_host=config.pre_out_host,
-            pre_out_port=config.pre_out_port,
-            # 调度三元组供边侧互校(cap/preflight 公式的同源输入)
+        # Scheduling limits the edge checks (same inputs of the cap/preflight
+        # formulas on both sides).
+        self._lwd_cloud_params = LwdCloudParamsNotify(
             max_num_batched_tokens=sched_config.max_num_batched_tokens,
             max_num_seqs=sched_config.max_num_seqs,
             num_speculative_tokens=lwd_spec_factor(self.vllm_config) - 1,
         )
-        # 首拍即通告(边侧可能已 bind 等待)
-        self._lwd_announce()
         self._lwd_register_recv_hint()
-        lwd_logger.info(
-            "[cloud] engine assembled: PRE_OUT bind %s, POST_OUT announce -> "
-            "%s:%s via master %s",
-            config.lwd_pre_out_endpoint(),
-            config.pre_out_host,
-            config.pre_out_port,
-            master_addr,
+        # Edge messages are handled off the IO thread: building a request
+        # allocates its placeholder embeds and the pre-recv hint may block,
+        # which must not delay step metadata going out.
+        self._lwd_ingest_queue: queue.SimpleQueue[_LwdIngestItem | None] = (
+            queue.SimpleQueue()
         )
+        self._lwd_ingest_thread = threading.Thread(
+            target=self._lwd_ingest_loop, name="lwd-cloud-ingest", daemon=True
+        )
+        self._lwd_ingest_thread.start()
+        plane = self._lwd_start_control_plane()
+        lwd_logger.info("[cloud] engine assembled: control plane on %s", plane.endpoint)
+
+    def _lwd_decode(self, payload: bytes) -> LwdMessage:
+        return lwd_decode_edge_to_cloud(payload)
+
+    def _lwd_handle_peer_registered(self, peer: LwdPeer) -> None:
+        """Engine thread: remember the edge and send it the scheduling
+        limits before anything else."""
+        self._lwd_edge = peer
+        self._lwd_send_until_queued(peer, self._lwd_cloud_params)
+        lwd_logger.info(
+            "[cloud] edge %s registered; scheduling limits sent: %s",
+            peer,
+            self._lwd_cloud_params,
+        )
+
+    def _lwd_send_until_queued(
+        self, peer: LwdPeer, message: LwdCloudToEdgeMessage
+    ) -> None:
+        """Retry a full outbound queue until the message is queued; gives up
+        with an error once shutdown is requested, so a stalled edge cannot
+        block it."""
+        while not self._lwd_send(peer, message):
+            if self.shutdown_state != EngineShutdownState.RUNNING:
+                lwd_logger.error(
+                    "[cloud] %s to edge %s dropped: shutting down with the "
+                    "outbound queue full",
+                    type(message).__name__,
+                    peer,
+                )
+                return
+            time.sleep(_LWD_SEND_RETRY_SLEEP_S)
 
     def _lwd_register_recv_hint(self) -> None:
         """[Lwd][pre-recv] 提前收:提示下发通道 = 引擎 -> 云端点 worker
@@ -116,45 +126,40 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             # 阻塞投递:闸门开启时提示是正确性依赖,丢一条就没人提前挂该 recv,
             # 水位不前进,闸门后的批永不下发。
             register_hint_sender(lambda hint, mq=hint_mq: mq.enqueue(hint))
-            lwd_logger.info(
-                "[pre-recv] hint sender registered (PD_mix -> hint MQ)"
-            )
+            lwd_logger.info("[pre-recv] hint sender registered (PD_mix -> hint MQ)")
         else:
             # PD_mix 是唯一调度形态:hint MQ 缺失 = 提示发不出去,闸门永不
             # 放行,必须显式可见
             lwd_logger.warning(
-                "[pre-recv] hint MQ missing: pre-recv gate will "
-                "never open"
+                "[pre-recv] hint MQ missing: pre-recv gate will never open"
             )
 
-    def _lwd_pre_out_loop(self) -> None:
-        """PRE_OUT 接收循环:socket 与门状态在本线程内先建后用(zmq 单线程亲和);超时拍仅作关停响应上限。"""
-        try:
-            self._lwd_setup_zmq()
-        except Exception:
-            lwd_logger.exception("[cloud] PRE_OUT setup failed")
-            self.input_queue.put_nowait((EngineCoreRequestType.EXECUTOR_FAILED, b""))
-            return
-        while True:
-            msg = self._lwd_subscriber.recv(timeout_ms=LWD_RECV_TIMEOUT_MS)
-            if msg is None:
-                if self._lwd_subscriber.closed:
-                    break
-                continue
-            self._lwd_on_message(msg)
+    def _lwd_dispatch_message(self, peer: LwdPeer, msg: LwdMessage) -> bool:
+        """IO thread: hand range and request notifies to the ingest thread;
+        anything else (incl. abort, not wired yet) is unknown."""
+        if not isinstance(msg, (LwdRangeNotify, LwdRequestNotify)):
+            return False
+        self._lwd_ingest_queue.put((peer, msg))
+        return True
 
-    def _lwd_announce(self) -> None:
-        """首拍 HELLO 通告一次;队满不重试,由边侧等待超时 fail-fast 兜底。"""
-        self._lwd_publisher.publish(self._lwd_hello)
-        lwd_logger.info(
-            "[cloud] HELLO announced: pre_out=%s:%s",
-            self._lwd_hello.pre_out_host, self._lwd_hello.pre_out_port,
-        )
+    def _lwd_ingest_loop(self) -> None:
+        while (item := self._lwd_ingest_queue.get()) is not None:
+            try:
+                self._lwd_handle_edge_message(*item)
+            except Exception as e:
+                lwd_logger.exception(
+                    "[cloud] ingest of %s failed", type(item[1]).__name__
+                )
+                self._lwd_fail(f"ingest of {type(item[1]).__name__}: {e!r}")
+                return
 
-    def _lwd_dispatch_message(self, msg) -> bool:
-        """PRE_OUT 两类分派(本 IO 线程):范围预告入通知队列+下发提前收
-        hint;请求预告转 ADD。abort 通告功能未上,到达即未知帧由公共
-        入口告警丢弃。"""
+    def _lwd_handle_edge_message(
+        self, peer: LwdPeer, msg: LwdEdgeToCloudMessage
+    ) -> None:
+        """Ingest thread: range notify -> notify queue + pre-recv hint;
+        request notify -> native ADD."""
+        # TODO(lwd): several edges per cloud DP rank need requests tracked by
+        # the peer that owns them, issue #8.
         if isinstance(msg, LwdRangeNotify):
             # 范围预告:整条入通知队列(重复预告即重复点名,调度器分类
             # 幂等剔除,无副作用)。预告自带 seqno,出批时作 UP 链配对号。
@@ -163,9 +168,8 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             # [Lwd][pre-recv] 提前收①:预告到达即给云 worker 下发提示(seqno +
             # flat token 数),worker 的通信线程收到就挂精确尺寸的
             # UP irecv(主帧 hash 载荷) —— 不再等这个批的
-            # SchedulerOutput 下发。num_tokens 取 items 逐条目之和
-            # (mixed 恒填 items;顶层字段只描述首条目)。mrope positions
-            # 已随 RangeNotify 走控制面(wire_version>=2),UP 数据面只有
+            # SchedulerOutput 下发。num_tokens 取 items 逐条目之和。
+            # mrope positions 已随 RangeNotify 走控制面,UP 数据面只有
             # 主帧,aux_rows 恒 0——若残留非零,worker 会预挂一条永远收
             # 不到数据的 aux irecv,水位停摆、闸门后的批永不下发。
             from vllm_ascend.distributed.lwd_comm.pre_recv import (
@@ -177,15 +181,17 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             aux_rows = 0
             # 先打点再入队:worker 通信线程 0.5ms 就能取走,若打点在入队之后,
             # 跨进程写日志的次序会让 hint2sub 出现负值,看着像时序错乱。
-            post_irecv_hint(
-                make_recv_hint(msg.seqno, num_tokens, aux_rows)
-            )
-            return True
-        if isinstance(msg, LwdRequestNotify):
+            post_irecv_hint(make_recv_hint(msg.seqno, num_tokens, aux_rows))
+        elif isinstance(msg, LwdRequestNotify):
             request = self._lwd_build_request(msg)
             self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
-            return True
-        return False
+
+    def shutdown(self) -> None:
+        # Before the executor goes: a pre-recv hint blocks on its queue.
+        if self._lwd_ingest_thread is not None:
+            self._lwd_ingest_queue.put(None)
+            self._lwd_ingest_thread.join(_LWD_INGEST_JOIN_TIMEOUT_S)
+        super().shutdown()
 
     def _lwd_build_request(self, req_notify: LwdRequestNotify) -> Request:
         """请求构建(唯一建请求点):采样参数自请求预告重建 + 占位零值
@@ -262,14 +268,11 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         record_irecv_completions(items)
 
     def post_step(self, model_executed: bool) -> None:
-        """步末冲刷待发 c2e(调度器只入列,发布归引擎层;两条步路径的
-        原生尾部都会走到本钩子)。队满小睡重试,关停退出。"""
-        for notify in self.scheduler.pending_c2e:
-            while not self._lwd_publisher.closed:
-                if self._lwd_publisher.publish(notify):
-                    break
-                time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)
-        self.scheduler.pending_c2e.clear()
+        """Flush pending c2e to the edge at the end of the step (the
+        scheduler only queues them; both native step paths reach this hook)."""
+        if self.scheduler.pending_c2e:
+            assert self._lwd_edge is not None, "c2e produced before any edge"
+            for notify in self.scheduler.pending_c2e:
+                self._lwd_send_until_queued(self._lwd_edge, notify)
+            self.scheduler.pending_c2e.clear()
         super().post_step(model_executed)
-
-

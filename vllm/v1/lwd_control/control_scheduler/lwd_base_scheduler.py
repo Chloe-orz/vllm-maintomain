@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Lwd 边/云调度器公共基类:相位谓词与可见集调度原语(三队列剔除-
 调度-拼回)。
 
@@ -18,7 +21,7 @@ from vllm.v1.request import Request
 def lwd_spec_factor(vllm_config) -> int:
     """MTP 预算系数:decode 每请求每步消耗 1+k 个 token(草稿 token 占
     预算与 KV),无 spec 配置恒 1。唯一住处(边云同源,spec 系数以云侧
-    HELLO 通告为准);main 的 vllm/config/lwd 是拓扑快照,无此派生值,
+    LwdCloudParamsNotify 为准);main 的 vllm/config/lwd 是拓扑快照,无此派生值,
     故随调度原语住在基类模块。"""
     spec_config = getattr(vllm_config, "speculative_config", None)
     num_spec_tokens = (
@@ -47,16 +50,11 @@ class LwdBaseScheduler(AsyncScheduler):
             return LwdReqPhase.PREFILL
         return LwdReqPhase.DECODE
 
-    def _lwd_reqs_in_phase(
-        self, phase: LwdReqPhase, *queues
-    ) -> Iterator[Request]:
+    def _lwd_reqs_in_phase(self, phase: LwdReqPhase, *queues) -> Iterator[Request]:
         """按相位扫多队列(已终结请求跳过——账面可能同时满足判据)。"""
         for queue in queues:
             for request in queue:
-                if (
-                    not request.is_finished()
-                    and self._lwd_req_phase(request) is phase
-                ):
+                if not request.is_finished() and self._lwd_req_phase(request) is phase:
                     yield request
 
     def _lwd_new_queue(self, reqs: list[Request]) -> RequestQueue:
@@ -102,9 +100,7 @@ class LwdBaseScheduler(AsyncScheduler):
         self.max_num_running_reqs = max(0, saved_cap - len(saved[0]))
         saved_budget = self.max_num_scheduled_tokens
         if token_budget_cap is not None:
-            self.max_num_scheduled_tokens = min(
-                saved_budget, max(0, token_budget_cap)
-            )
+            self.max_num_scheduled_tokens = min(saved_budget, max(0, token_budget_cap))
         sched_cfg = self.scheduler_config
         saved_threshold = sched_cfg.long_prefill_token_threshold
         if chunk_threshold is not None:

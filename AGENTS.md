@@ -23,8 +23,19 @@ LWD (Layerwise Disaggregated) 是基于 vLLM v1 引擎的边云分布式推理�
   | `vllm/v1/core/sched/phase_scheduler.py` | prefill_only 对照实验臂, 非 LWD 部署使用 |
   | `tools/lwd_check_budget.py`, `log_analyze_tools/lwd_*` | kernel 预算检查 / 日志分析工具 |
 
+- **控制面通信已替换**: 老的 pub/sub `control_communication/` 已由 `vllm/v1/lwd_control/lwd_comm/` (ROUTER/DEALER) 取代, 引擎接入在 `control_scheduler/lwd_base_engine.py`; 设计见 `docs/design/lwd_control_plane.md`. `docs/refactor/lwd_control_*.md` 描述的是替换前的结构.
 - **接入接缝**: 老代码经 `lwd_resolve_engine_cls` (engine 类按角色分流) 与 `lwd_serve_guard` (serve 入口注入云侧调度器) 两个钩子接入 vLLM; 另对 `v1/engine/core.py`、`v1/core/sched/scheduler.py`、`v1/worker/gpu_model_runner.py`、`distributed/parallel_state.py` 有侵入式改动.
 - **已知缺口**: 老代码 docstring 引用的设计文档 `docs/refactor/prefill_only_migration.md` 分支上并不存在, 整改时需补齐.
+- **迁移/替换要一次做到位**: 替换一个模块后, 全仓 grep 旧设计的名字与术语 (类名、函数名、注释里的旧概念, 如 publish/HELLO/接收线程/`wire_version`), 残留的转发层、没人覆写的空默认实现、只为旧结构存在的辅助函数、过时注释, 与替换放在同一个 commit 里清掉, 不留到以后. 例: 控制面替换后删掉了 `_lwd_shutdown_comm` (失败清理已由基类 `shutdown` 统一承担) 与转发层 `_lwd_on_message`.
+
+## LWD 命名约定 (团队规范 7.5 的细化)
+
+- **一个概念一个词, 跨类名/字段/方法/异常/日志/报错文案保持一致.** 例: 控制面里"对端完成握手、可以发送"统一叫 registered (`_registered_peers`, `LwdPeerNotRegisteredError`), 不混用 ready/connected/up; 只有成对的回调 `on_peer_up`/`on_peer_down` 例外.
+- **复用配置框架的词汇, 不自造近义词.** `vllm/config/lwd/topology.py` 里 link = 一对实例 (`instance_links`), connection = 同序号的一对 DP (`LwdConfig.connections`); 参数名与配置字段同名 (`send_queue_max`, 不缩成 `queue_max`).
+- **字段名/参数名跟着类型名走 (vLLM 惯例).** `SchedulerConfig` -> `scheduler_config`; `LwdConfig` -> `lwd_config`; 同一作用域里不让两个不同对象都叫 `config`.
+- **Spec 与 Config 分工.** Config = 用户可写的配置 (YAML/CLI); Spec = 由配置推出、交给运行时组件的描述 (如 `LwdControlPlaneSpec`), 用户不直接写.
+- **名字描述对象本身, 不描述当前实现的局限.** 例: 控制面参数叫 `LwdControlPlaneSpec` 而非 `LwdLinkSpec` (一边多云后一个控制面含多条链路); 值对象的 docstring 不写"远端"之类只在部分调用处成立的限定.
+- **改名后全仓 grep 旧名, 设计文档和报错文案一起改.**
 
 > [!CAUTION]
 > **团队规范区**: 下方由 `TEAM STANDARDS (BEGIN)` 与 `TEAM STANDARDS (END)` 标记圈出的区域是团队规范原文, 仅由 committer 通过评审维护.
