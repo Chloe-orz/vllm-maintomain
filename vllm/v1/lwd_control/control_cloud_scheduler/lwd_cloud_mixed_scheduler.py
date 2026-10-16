@@ -156,14 +156,25 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         """下发前核验:**排程量不得超过已到达量**(design v7 §7 的 W2)。
 
         这是本方案唯一"静默错算"型风险的兜底。``num_scheduled_tokens``
-        大于 ``recv_rows − consumed`` 时不会报错,只会让 runner 从 host 上
-        读一段**还没被写入**的零值区,算出一批零 embedding —— 表现是"输出
-        莫名其妙"而不是崩溃,极难定位。所以这里逐请求核验并把差异报全:
+        超出已到达量时不会报错,只会让 runner 从 host 上读一段**还没被写入**
+        的零值区,算出一批零 embedding —— 表现是"输出莫名其妙"而不是崩溃,
+        极难定位。所以这里逐请求核验并把差异报全:
 
-        1. 该请求本步是否真的被排了(排了才有下面的量);
-        2. ``scheduled ≤ recv_rows − consumed``;
-        3. 该请求是否**根本没到数据却被排**(``recv_rows == 0``)—— 那说明
-           可见集谓词(§5.3.1b)失效,这是最严重的一档。
+        1. 该请求是否**根本没到数据却被排**(``recv_rows == 0``)—— 那说明
+           可见集谓词(§5.3.1b)失效,这是最严重的一档;
+        2. 本步排程量是否落在**已到达**的行数之内。
+
+        **判据里绝不能再出现"已消费行数"**(真机踩过):
+        ``consumed`` 是 **worker 侧的存储读指针**,由 ``_lwd_stage_requests_to_device``
+        在同一步的 harvest 阶段推进,而 harvest 跑在 ``_prepare_inputs`` 内、
+        **早于**本核验。拿它做减法,调度器看到的必然是"已经搬完了"的
+        值 ⇒ ``avail == 0`` ⇒ 第一批就被误判成越界(真机实录:
+        ``recv_rows=15 consumed=15`` 却报 "only 0 have arrived")。
+
+        "取数区间必须落在已写入范围内"是**另一件事**,由 worker 的 stager
+        几何校验负责(``LwdReqEmbed.read_range``,见
+        ``_pre_recv_host_stage_check.py`` §5)。两处判据分开,各自看自己
+        能权威看到的量 —— 这也是 §7 表格里的分工。
         """
         ledger = getattr(self, "lwd_recv_rows", None) or {}
         for item, w in zip(windowed, windows):
@@ -171,12 +182,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             got = int(out.num_scheduled_tokens.get(rid, 0))
             if got == 0:
                 continue
-            request = self.requests.get(rid)
-            if request is None:
-                continue
             recv_rows = int(ledger.get(rid, 0))
-            consumed = request.num_computed_tokens - item.offset
-            avail = recv_rows - consumed
             if recv_rows <= 0:
                 raise RuntimeError(
                     f"[Lwd][cloud-sched] W2 VIOLATION req={rid} seqno="
@@ -184,12 +190,15 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                     f"plane reported recv_rows=0 (该请求不该进 batch —— 可见集"
                     f"谓词 `recv_rows > 0` 失效)"
                 )
-            if got > avail:
+            # 该请求在本批里最多能排到 recv_rows(= 已写入的最高行)。
+            # 不减 consumed:那是 worker 侧的读指针,与本核验并发推进。
+            if item.offset + got > recv_rows:
                 raise RuntimeError(
                     f"[Lwd][cloud-sched] W2 VIOLATION req={rid} seqno="
-                    f"{notify.seqno}: native scheduled {got} rows but only "
-                    f"{avail} have arrived (recv_rows={recv_rows} "
-                    f"consumed={consumed} window={w} prompt={item.num_tokens} "
+                    f"{notify.seqno}: native scheduled rows "
+                    f"[{item.offset}, {item.offset + got}) but only "
+                    f"{recv_rows} have arrived "
+                    f"(window={w} prompt={item.num_tokens} "
                     f"offset={item.offset} decode_exact={decode_exact})"
                 )
 
@@ -374,18 +383,20 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             # 而 runner 只会读到零值区 ⇒ **算出一批零 embedding 且不报错**。
             # 只挡"完全没数据"这一档就够了:到了但不够预算,由下发规则
             # (min(avail, budget))处理。
+            #
+            # **判据只用数据面事实**:``recv_rows > item.offset`` 表示"这个
+            # chunk 的起点之后已经有行写入"。早先这里写的是
+            # ``recv_rows - request.num_computed_tokens``,那个量在请求被排程
+            # 之后会被原生推进,与 worker 侧的推进并不同步 —— 一旦水位领先,
+            # 一个数据已到的请求会被**假性挡掉**而饿死。数据面与算力进度是
+            # 两件事,闸门只该问前者。
             ledger = getattr(self, "lwd_recv_rows", None) or {}
             gated: list = []
             for item in items:
                 rid = item.request_id
                 recv_rows = int(ledger.get(rid, 0))
-                request = self.requests.get(rid)
-                if request is None:
-                    gated.append(item)
-                    continue
-                if recv_rows - request.num_computed_tokens <= 0:
-                    # recv_rows == 0(完全没到)= 等待;已到但算完 =
-                    # 该项其实已交付,下一处 all_done 逻辑会消费掉队首。
+                if recv_rows <= item.offset:
+                    # 这个 chunk 还一行都没到:本步不进 batch。
                     continue
                 gated.append(item)
             if len(gated) != len(items):
