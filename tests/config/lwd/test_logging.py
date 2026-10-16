@@ -18,6 +18,11 @@ def test_log_contains_complete_selected_config_without_reading_key_contents(
 ) -> None:
     raw = topology_payload("s3_cloud_share_1dp.yaml")
     raw["feature_ctrl"] = {"enable_early_recv": True, "enable_scramble": True}
+    raw["control_plane"] = {
+        "send_queue_max": 17,
+        "hello_retry_interval_s": 1.5,
+        "handshake_timeout_s": 90.0,
+    }
     path = tmp_path / "topology.yaml"
     key = tmp_path / "tenant.key"
     key.write_text("local-key-content-must-not-be-logged")

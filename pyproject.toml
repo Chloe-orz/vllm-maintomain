@@ -142,7 +142,6 @@ ignore-hidden = false
 extend-ignore-identifiers-re = [".*[Uu][Ee][0-9][Mm][0-9].*"]
 
 [tool.typos.default.extend-identifiers]
-top_id_ths = "top_id_ths"
 a63ede7 = "a63ede7"
 bbc5b7ede = "bbc5b7ede"
 NOOPs = "NOOPs"
@@ -159,6 +158,8 @@ FoPE = "FoPE"
 k_ot = "k_ot"
 view_seperator = "view_seperator"
 inverse_std_variences = "inverse_std_variences"
+# LWD wire field: rank ("Nth") of each received token among the logits
+top_id_ths = "top_id_ths"
 
 [tool.typos.default.extend-words]
 Hel = "Hel"
