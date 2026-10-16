@@ -105,6 +105,9 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         # 摘除台账只活在调度器进程里,worker 的暂存池看不到,所以必须随批
         # 捎带过去;每步排空(通知是幂等的,重复送达只会重复一个 no-op)。
         self._lwd_abort_pending: list[str] = []
+        # 诊断:seqno -> 该 notify 已被下发过几步(见 _lwd_window_steps)。
+        # 单独存表而**不挂在 notify 上** —— msgspec.Struct 不可赋值。
+        self._lwd_window_step_counts: dict[int, int] = {}
         # 窗口预算基数:原生 token_budget 用的就是这个实例属性(§3.2.1 常量口径)。
         self._lwd_kv_block_size: int = max(int(getattr(self, "block_size", 1)), 1)
         logger.info(
@@ -413,6 +416,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 queue = self.prefill_notify_queue
                 if queue and queue[0] is notify:
                     queue.popleft()
+                    self._lwd_forget_window_steps(notify.seqno)
                 notify = None
             elif unknown or gated_out_all:
                 # 暂时状态,本步不下发,预告**留在队首**:
@@ -433,6 +437,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 queue = self.prefill_notify_queue
                 if queue and queue[0] is notify:
                     queue.popleft()
+                    self._lwd_forget_window_steps(notify.seqno)
                 logger.info(
                     "[Lwd][host-stage] notify seqno=%d released: live_rows=0 "
                     "(all items consumed or aborted)",
@@ -700,7 +705,9 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         # 身份弹队首,避免错弹替换后的新队首。
         # 判据是"该批所有请求都算完了"(v7:不再有窗口台账,唯一权威是原生
         # 水位 —— 数据没到的行本步根本不会被下发)。
-        all_done = all(
+        # **必须显式要求 items 非空**:`all([])` 恒为 True,空 items 会把它
+        # 误判成"都算完了"而弹掉一个还没做完的 notify。
+        all_done = bool(items) and all(
             self.requests[item.request_id].num_computed_tokens
             >= item.offset + item.num_tokens
             for item in items
@@ -710,6 +717,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             queue = self.prefill_notify_queue
             if queue and queue[0] is notify:
                 queue.popleft()
+                self._lwd_forget_window_steps(notify.seqno)
             for item in items:
                 self._lwd_dropped.discard(item.request_id)
         else:
@@ -777,11 +785,23 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         return total
 
     def _lwd_window_steps(self, notify: LwdRangeNotify) -> int:
-        """该 notify 已被下发过几步(诊断:steps 大 = KV 长期紧)。"""
-        return int(getattr(notify, "_lwd_window_steps", 0))
+        """该 notify 已被下发过几步(诊断:steps 大 = KV 长期紧)。
+
+        **计数存在调度器自己的表里,不挂在 notify 上**:``LwdRangeNotify`` 是
+        ``msgspec.Struct``,给它赋任意属性会抛 AttributeError(真机实录,
+        直接把引擎打崩)。表以 seqno 为键,与 notify 一一对应(一个 seqno =
+        一个 chunk 批),所以不需要 notify 可哈希。
+        """
+        return int(self._lwd_window_step_counts.get(notify.seqno, 0))
 
     def _lwd_note_window_step(self, notify: LwdRangeNotify) -> None:
-        notify._lwd_window_steps = self._lwd_window_steps(notify) + 1
+        self._lwd_window_step_counts[notify.seqno] = (
+            self._lwd_window_steps(notify) + 1
+        )
+
+    def _lwd_forget_window_steps(self, seqno: int) -> None:
+        """notify 出队(下发完 / 失效丢弃)后清计数,防长期运行无限增长。"""
+        self._lwd_window_step_counts.pop(seqno, None)
 
     def _lwd_drop_request_from_chunks(self, request_id: str) -> int:
         """把一个被 abort 的请求从逐请求台账里摘成"永不消费"。
