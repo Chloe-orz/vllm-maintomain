@@ -301,22 +301,31 @@ class LwdCloudEngineCore(EngineCoreProc):
                 aux_rows = 0
                 # host 暂存(design v7 §4.3)要在"挂 recv"的时刻就知道逐请求
                 # 行表:暂存池按它把整块接收载荷拆到各请求自己的 buffer。
-                # offset 必须在场 —— 一个请求跨多个批到达时,第 2 段要落到
-                # 正确的 prompt 位置,否则会覆盖第 1 段。
+                #
+                # ★ 两套坐标都要给,别合成一个:
+                #   * ``offsets``        = 该请求这段行在**本批载荷内**的起点;
+                #   * ``prompt_offsets`` = 它在**自己 prompt 内**的起点。
+                # 这里 ``LwdRangeItem.offset`` 是 **prompt 坐标**(调度器就是拿
+                # 它与 ``request.num_computed_tokens`` 对账的),所以它属于后者。
+                # 批内布局由 worker/stager 按行数自行累加得出 —— 曾经把 prompt
+                # 坐标当批内布局传给 stager,后果是"批里第二个请求"的写入偏移
+                # 算成 0,数据写到自己 buffer 之外。
                 req_ids = [item.request_id for item in items]
                 rows = [item.num_tokens for item in items]
-                offsets = [item.offset for item in items]
+                prompt_offsets = [item.offset for item in items]
                 # 先打点再入队:worker 通信线程 0.5ms 就能取走,若打点在入队之后,
                 # 跨进程写日志的次序会让 hint2sub 出现负值,看着像时序错乱。
                 logger.info(
                     "[Lwd][pre-recv] HINT seqno=%d num_tokens=%d aux_rows=%d "
-                    "ts=%.3f",
-                    msg.seqno, num_tokens, aux_rows, time.monotonic(),
+                    "prompt_offsets=%s ts=%.3f",
+                    msg.seqno, num_tokens, aux_rows, prompt_offsets,
+                    time.monotonic(),
                 )
                 post_irecv_hint(
                     make_recv_hint(
                         msg.seqno, num_tokens, aux_rows,
-                        req_ids=req_ids, rows=rows, offsets=offsets,
+                        req_ids=req_ids, rows=rows,
+                        prompt_offsets=prompt_offsets,
                     )
                 )
             return
