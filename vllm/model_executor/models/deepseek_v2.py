@@ -107,6 +107,7 @@ from .utils import (
     PPMissingLayer,
     get_pp_missing_layer_names,
     is_pp_missing_parameter,
+    lwd_skips_module,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -1260,9 +1261,14 @@ class DeepseekV2Model(nn.Module):
             prefix=f"{prefix}.layers",
         )
 
-        if get_pp_group().is_last_rank:
+        if get_pp_group().is_last_rank and not lwd_skips_module(
+            vllm_config, maybe_prefix(prefix, "norm")
+        ):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
+            # Not on the last PP rank, or an LWD edge that only unembeds the
+            # cloud's already-normed hidden states (this covers GLM-5.x DSA:
+            # GlmMoeDsaForCausalLM is DeepseekV2ForCausalLM).
             self.norm = PPMissingLayer()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
