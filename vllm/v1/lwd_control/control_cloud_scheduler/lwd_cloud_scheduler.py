@@ -24,16 +24,16 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefill_notify_queue import (
     LwdPrefillNotifyQueue,
 )
-from vllm.v1.lwd_control.control_communication.lwd_notify import (
-    LWD_NOT_FINISHED,
-    LwdC2eNotify,
-    LwdRangeItem,
-    LwdRangeNotify,
-)
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
     LwdReqPhase,
     lwd_spec_factor,
+)
+from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
+    LWD_NOT_FINISHED,
+    LwdC2eNotify,
+    LwdRangeItem,
+    LwdRangeNotify,
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 
@@ -43,7 +43,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # prefill 通知队列:IO 线程投递边侧批量 RangeNotify,本线程每步
+        # prefill 通知队列:引擎 ingest 线程投递边侧批量 RangeNotify,本线程每步
         # 至多消费队首一条;预告自带 seqno 即本批 UP 链配对号。引擎侧经
         # self.scheduler.prefill_notify_queue 借引用投递/清扫(线程纪律
         # 归通知队列)

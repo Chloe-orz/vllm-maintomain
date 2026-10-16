@@ -4,7 +4,7 @@ The LWD (layerwise disaggregated) control plane carries scheduling metadata betw
 
 ## Motivation
 
-The previous implementation on branch `prefill_only_chunked_prefill_mm` used two one-way PUSH/PULL pipes: PRE_OUT from edge to cloud, and POST_OUT from cloud to edge. It had these problems:
+The previous implementation (`vllm/v1/lwd_control/control_communication/`, from branch `prefill_only_chunked_prefill_mm`) used two one-way PUSH/PULL pipes: PRE_OUT from edge to cloud, and POST_OUT from cloud to edge. It had these problems:
 
 - The cloud announced itself with a HELLO that was never acknowledged.
 - Ports were fixed at 5558 and 5559, so a second DP rank failed with `EADDRINUSE`.
@@ -43,6 +43,7 @@ flowchart LR
 | Transport | `lwd_transport.py` | ROUTER and DEALER sockets, framing |
 | Control plane | `lwd_control_plane.py` | IO thread, outbound queue, peer resolution, public API |
 | Factory | `lwd_control_plane_factory.py` | Maps `VllmConfig.lwd_config` to the control plane of one DP rank |
+| Engine integration | `control_scheduler/lwd_base_engine.py`, `control_edge_scheduler/lwd_edge_engine.py`, `control_cloud_scheduler/lwd_cloud_engine.py` | Starting the plane, handing its events to the engine thread, sending scheduler messages |
 
 The link passes business payloads through as bytes. The only coupling between the two layers is `LWD_MESSAGE_VERSION`, which the handshake checks so that both sides speak the same message set. Only the factory reads `LwdConfig`; the layers below take endpoints and ids as arguments.
 
@@ -154,6 +155,50 @@ flowchart LR
 - Backpressure only covers the link: it fires when the peer's IO thread or the network stalls. The engines hand inbound messages to unbounded queues (`input_queue`, the edge `unembed_notify_queue`, the cloud `LwdPrefillNotifyQueue`), so a slow engine does not back up the link.
 - One held payload blocks every peer of the plane; with one peer per plane today this only affects that peer.
 
+## Engine integration
+
+`LwdBaseEngineCore` (`vllm/v1/lwd_control/control_scheduler/lwd_base_engine.py`) owns the control plane of its DP rank; `LwdEdgeEngineCore` and `LwdCloudEngineCore` add the role behavior.
+
+- `run_engine_core` reads the global DP size before `reconfigure_for_independent_dp_rank()` resets it to 1 and passes it as `lwd_dp_size`. MoE engines with data parallelism are rejected.
+- Once the engine is built, `_lwd_assemble()` starts the plane on the engine thread, which therefore owns the sender. READY has already reached the frontend at that point, as with the earlier pub/sub engines. If assembly fails, the engine shuts itself down and startup fails.
+- Edge startup blocks until the cloud accepts the handshake and sends `LwdCloudParamsNotify`, both within one `handshake_timeout_s`. `max_num_batched_tokens` and `max_num_seqs` must match the cloud; the speculative factor is adopted from the cloud.
+- The cloud sends `LwdCloudParamsNotify` to an edge before anything else, as soon as it registers.
+
+```mermaid
+sequenceDiagram
+    participant EE as edge engine thread
+    participant EI as edge IO thread
+    participant CI as cloud IO thread
+    participant CE as cloud engine thread
+    EE->>EI: start, wait_until_ready
+    EI->>CI: hello
+    CI-->>EI: accept
+    CI->>CE: (WAKEUP, peer up)
+    CE->>CI: LwdCloudParamsNotify
+    CI-->>EI: LwdCloudParamsNotify
+    EI->>EE: wake startup, check limits
+    EE->>CI: LwdRequestNotify, LwdRangeNotify
+    CE->>EI: LwdC2eNotify (post_step)
+```
+
+Callbacks run on the IO thread and only hand events over:
+
+| Event on the IO thread | Hand-over | Handled by |
+| --- | --- | --- |
+| `on_peer_up` | `(WAKEUP, _LwdPeerUp)` on `input_queue` | engine thread; the cloud sends its scheduling limits |
+| Edge receives `LwdCloudParamsNotify` | event | edge startup |
+| Edge receives `LwdC2eNotify` | scheduler `unembed_notify_queue` + `WAKEUP` | `schedule()` |
+| Cloud receives `LwdRangeNotify` / `LwdRequestNotify` | ingest thread | range: `prefill_notify_queue` + pre-recv hint; request: built there, then native `ADD` |
+| Malformed payload or unknown type | dropped with a warning | — |
+| Handler exception, `on_fatal` | `(EXECUTOR_FAILED, _LwdControlPlaneFailed)` | engine thread raises; the engine fails |
+
+The cloud ingest thread keeps request building (placeholder embeds) and the pre-recv hint, which may block, off the IO thread, so step metadata to the edge is not delayed behind them. `input_queue` FIFO puts a peer-up before any request of that peer.
+
+Sending:
+
+- Edge: `LwdRangeNotify` (scheduler) and `LwdRequestNotify` (`add_request`) retry a full queue 5 times over about 3 s, then raise. A scheduled batch is never dropped: scheduling already advanced its progress, so a lost chunk would desynchronize the cloud.
+- Cloud: `LwdC2eNotify` (flushed in `post_step`) and the scheduling limits retry until queued, and give up only once shutdown is requested.
+
 ## Failure semantics
 
 | Event | Behavior |
@@ -172,7 +217,7 @@ flowchart LR
 | Same edge process reconnects after a network blip | Same identity, so `ROUTER_HANDOVER` resumes the session at once. Payloads in flight during the gap are lost: the edge DEALER (`IMMEDIATE`) discards its queue on disconnect and the cloud drops payloads to the missing connection |
 | IO thread crashes | `on_fatal` fires and the plane stops |
 
-The link never stops the engine on its own. Shutdown is idempotent: it stops the IO thread, discards queued payloads and terminates the context. If the IO thread does not exit within 5 s, the context is destroyed.
+The plane never stops the engine on its own; the engine turns `on_fatal` into a failure (see [Engine integration](#engine-integration)). Shutdown is idempotent: it stops the IO thread, discards queued payloads and terminates the context. If the IO thread does not exit within 5 s, the context is destroyed.
 
 ## Tunables
 
@@ -206,13 +251,12 @@ control_plane:
 
 ## Roadmap
 
-This change delivers the link, the handshake, the business messages and the factory. Each follow-up below keeps the interface above.
+This change delivers the link, the handshake, the business messages, the factory, backpressure and the engine integration. Each follow-up below keeps the interface above.
 
 | Follow-up | Content |
 | --- | --- |
 | Peer loss detection | Per-session application heartbeats, `on_peer_down`; a lease decides a new session: rejected while the registered one is alive (duplicate), accepted once it expires (restart) |
 | Several edges per cloud DP rank | Session table on the cloud, per-peer outbound queues and failure isolation; enables `cloud_share` |
 | Several clouds per edge DP rank | Several links per edge plane; enables `lwd_cluster` |
-| Engine integration | Engine cores start the plane from `vllm_config.lwd_config`, with the scheduler migration |
 | Tests | API-level tests through the factory once configuration and schedulers settle |
 | Lifecycle | Reconnect after a cloud restart without losing payloads in flight, flushing queued payloads at shutdown, discovery, authentication |

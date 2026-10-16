@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""云侧 prefill 通知队列:IO 线程投递、调度主线程消费的线程接缝。
+"""云侧 prefill 通知队列:引擎 ingest 线程投递、调度主线程消费的线程接缝。
 
 并发纪律唯一住处——一把锁串行全部操作,替代原先散在引擎与调度器
 注释里的"deque 单操作原子 / 赋值整体替换 / 对象身份弹队"契约。
 锁临界区无 IO:append/peek/pop_front 每步 O(1),purge O(n) 仅
-abort 时发生。条目(items 列表)在 purge 中就地重建,消费方经
-_notify_items 取列表快照,与替换前语义一致。
+abort 时发生。条目(items 列表)在 purge 中就地重建,消费方取
+list(notify.items) 快照。
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from __future__ import annotations
 import threading
 from collections import deque
 
-from vllm.v1.lwd_control.control_communication.lwd_notify import LwdRangeNotify
+from vllm.v1.lwd_control.lwd_comm.lwd_messages import LwdRangeNotify
 
 
 class LwdPrefillNotifyQueue:
@@ -30,7 +30,7 @@ class LwdPrefillNotifyQueue:
             return len(self._queue)
 
     def append(self, notify: LwdRangeNotify) -> None:
-        """IO 线程投递:每条预告整条入队(重复预告即重复点名,调度器
+        """ingest 线程投递:每条预告整条入队(重复预告即重复点名,调度器
         分类幂等剔除,无副作用;预告自带 seqno,出批时作 UP 链配对号)。"""
         with self._lock:
             self._queue.append(notify)
@@ -50,7 +50,7 @@ class LwdPrefillNotifyQueue:
             return False
 
     def purge(self, request_id: str) -> int:
-        """IO 线程 abort 清扫:逐条目摘除该请求的 item,items 掏空则
+        """abort 清扫(abort 尚未接线):逐条目摘除该请求的 item,items 掏空则
         整条移除。返回摘除 item 数(供日志)。"""
         with self._lock:
             kept: deque[LwdRangeNotify] = deque()

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""边侧调度器:chunk 化 prefill 组批 + 控制面发布(notify/abort/seqno)。
+"""边侧调度器:chunk 化 prefill 组批 + 控制面出口(RangeNotify/seqno)。
 
 边侧只做 embedding(无 decode),请求生命周期全程留原生调度器:
 入队 -> EMBED(chunk 组批/范围预告)-> 嵌入完结转 decode 相位留
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -31,12 +32,6 @@ from vllm.v1.engine import (
     EngineCoreOutputs,
     FinishReason,
 )
-from vllm.v1.lwd_control.control_communication.lwd_notify import (
-    LWD_NOT_FINISHED,
-    LwdC2eNotify,
-    LwdRangeItem,
-    LwdRangeNotify,
-)
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_picker import (
     LwdPrefillCandidate,
     lwd_pick_prefill_batch,
@@ -46,14 +41,21 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdReqPhase,
     lwd_spec_factor,
 )
+from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
+    LWD_NOT_FINISHED,
+    LwdC2eNotify,
+    LwdEdgeToCloudMessage,
+    LwdRangeItem,
+    LwdRangeNotify,
+)
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
-    from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
-        LwdControlPublisher,
-    )
     from vllm.v1.request import Request
+
+LwdSendToCloud = Callable[[LwdEdgeToCloudMessage], None]
+"""Sends one message to the cloud; raises instead of losing it."""
 
 # 云端完成码 -> 边侧终态(前端 reason 走输出通道;ERROR 落 ABORTED)
 _LWD_FINISH_STATUS = {
@@ -72,18 +74,12 @@ _LWD_MAX_PENDING_CHUNKS = 3
 
 
 class LwdEdgeScheduler(LwdBaseScheduler):
-    """纯 prefill 调度语义 + 控制面出口(notify/abort/seqno)。"""
+    """纯 prefill 调度语义 + 控制面出口(RangeNotify/seqno)。"""
 
-    def __init__(
-        self,
-        *args,
-        publisher: LwdControlPublisher | None = None,
-        **kwargs,
-    ) -> None:
-        """The publisher is injected through the constructor and lives as long
-        as the scheduler."""
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.lwd_edge_publisher = publisher
+        # Injected by the engine once the cloud accepted the handshake.
+        self.lwd_send_to_cloud: LwdSendToCloud | None = None
         self._lwd_seqno = 0
         # 前缀缓存:manager 级必须关命中(命中使首条 offset!=0、被命中
         # 块从未写 KV 仍占块池);配置级保留使能以产出哈希链供云侧命中
@@ -92,7 +88,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # = 一个云步消费单位;请求首 token 到账即从其批中消除,批内
         # 全部消除则整条移除——prefill 闸门水位 = len(本表)
         self._lwd_pending_batches: dict[int, set[str]] = {}
-        # c2e 通告队列:接收线程 append,调度步内消费出 UNEMBED 批
+        # c2e 通告队列:控制面 IO 线程 append,调度步内消费出 UNEMBED 批
         self.unembed_notify_queue: deque[LwdC2eNotify] = deque()
         # pending 闸门状态(仅作开/关转换日志用)
         self._lwd_prefill_gate_held: bool = False
@@ -184,18 +180,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             lwd_logger.info("[edge-sched] prefill gate OPEN")
 
     def _lwd_schedule_embed(self) -> SchedulerOutput | None:
-        """Chunked batch + budget clamp + post-step check + RangeNotify publish
-        (the EMBED batch is attached only on success, seqno bound to the
-        publish). None when nothing is dispatchable or the publish fails; the
-        progress of a dropped batch is safe as long as the publish channel
-        never loses messages."""
+        """Chunked batch + budget clamp + RangeNotify, then the EMBED batch
+        (seqno bound to the notify). None when nothing is dispatchable.
+
+        The batch is never dropped once scheduled: scheduling already advanced
+        num_computed_tokens, so a dropped chunk would never be embedded and
+        the next offset would not match the cloud. A notify that cannot be
+        sent raises instead."""
         if not self._lwd_embed_dispatchable():
             return None
         out = self._lwd_schedule_batch()
         if not out.num_scheduled_tokens:
             return None
-        if not self.lwd_edge_notify_range(out):
-            return None
+        self.lwd_edge_notify_range(out)
         return out
 
     def _lwd_schedule_unembed(self) -> SchedulerOutput:
@@ -426,22 +423,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # [Lwd][perf] mrope 全 prompt 计算逐请求耗时(在边引擎主线程上,
         # 期间调度循环停转;MM 劣化归因)
 
-    def lwd_edge_notify_range(self, scheduler_output: SchedulerOutput) -> bool:
-        """Publish one batch RangeNotify (seqno first): a seqno is only taken
-        by a batch that reached the wire, so the publish is atomic for the
-        whole batch. False on failure, and the caller drops the batch."""
+    def lwd_edge_notify_range(self, scheduler_output: SchedulerOutput) -> None:
+        """Send one batch RangeNotify and attach the EMBED batch; a seqno is
+        only taken by a notify that was sent."""
         built = self._lwd_build_range_items(scheduler_output.num_scheduled_tokens)
         if built is None:
-            return True
+            return
         items, req_ids, token_slices, prompt_offsets, has_mrope = built
         seqno = self._lwd_seqno
-        if not self.lwd_edge_publisher.publish(
-            LwdRangeNotify(seqno=seqno, items=items)
-        ):
-            return False
+        assert self.lwd_send_to_cloud is not None, "cloud not connected"
+        self.lwd_send_to_cloud(LwdRangeNotify(seqno=seqno, items=items))
         self._lwd_seqno = seqno + 1
         self._lwd_pending_batches[seqno] = set(req_ids)
-        # 发布成功即组 EMBED 批挂 SO:seqno 是数据面发云张量的配对键
+        # 发送成功即组 EMBED 批挂 SO:seqno 是数据面发云张量的配对键
         # (与云侧 RangeNotify 登记同值),embed 载荷为本批逐请求的
         # token 片段(边 worker 按 req_ids 序扁平化);mrope positions
         # 已随 RangeNotify 走控制面,边 worker 不再组 aux 帧
@@ -455,7 +449,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 has_mrope=has_mrope,
             ),
         )
-        return True
 
     def _lwd_build_range_items(
         self, scheduled: dict[str, int]
@@ -464,7 +457,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         | None
     ):
         """组批内逐请求的 RangeItem 与 EMBED 载荷切片;mrope 逐 chunk
-        列切片序列化为原始字节随 item 走控制面(wire_version>=2)。
+        列切片序列化为原始字节随 item 走控制面。
         无条目返回 None。"""
         items: list[LwdRangeItem] = []
         req_ids: list[str] = []
@@ -541,7 +534,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def _lwd_purge_mrope_positions(self) -> None:
         """对账摘除 mrope positions:请求已出 requests(终结/abort)
-        或嵌入完结转 decode 相位(各 chunk 已全部发布,notify 不再读)。
+        或嵌入完结转 decode 相位(各 chunk 已全部发出,notify 不再读)。
         驻留模型无"嵌入完结即出队"的天然摘除点,收割期统一对账。"""
         for rid in list(self._lwd_mrope_positions_dict):
             request = self.requests.get(rid)

@@ -1,20 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Edge engine core: communication setup (POST_OUT bind, PRE_OUT connected
-lazily), HELLO discovery and cross-check, and the request entry (edge
-admission + announcement to the cloud; communication stays in the engine).
+"""Edge engine core: the control plane to the same-index cloud DP rank, the
+check of the cloud's scheduling limits and the request entry (edge admission +
+announcement to the cloud; communication stays in the engine).
 
 Stepping is the native step_with_batch_queue, adapted at construction: depth
 2, is_pooling_model=True (no native sample_tokens) and an executor proxy (a
 normally completed batch returning None becomes a placeholder).
 
-Construction (injection order and the lifecycle of both channels: see the
-base class): once super() has built the engine, bind POST_OUT, start the
-receiver thread and block until the cloud's first HELLO, which the cloud sends
-once fully initialized; a timeout fails fast. There is no self-healing:
-restart the whole group. After the triple cross-check, the publisher is handed
-to the scheduler.
+Startup blocks until the cloud accepts the handshake and sends its scheduling
+limits, within one handshake timeout; any failure stops the engine. There is
+no self-healing: restart the whole group.
 """
 
 from __future__ import annotations
@@ -26,19 +23,6 @@ from typing import Any
 
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.engine import EngineCoreRequestType
-from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
-    LwdControlPublisher,
-)
-from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
-    LwdControlSubscriber,
-)
-from vllm.v1.lwd_control.control_communication.lwd_notify import (
-    LWD_SAMPLING_DEFAULTS,
-    LwdC2eNotify,
-    LwdHelloNotify,
-    LwdRequestNotify,
-    lwd_decode_cloud_notify,
-)
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_executor_proxy import (
     LwdEdgeExecutorProxy,
 )
@@ -48,6 +32,17 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
 )
+from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import LwdEdgeControlPlane
+from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
+from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
+    LWD_SAMPLING_DEFAULTS,
+    LwdC2eNotify,
+    LwdCloudParamsNotify,
+    LwdEdgeToCloudMessage,
+    LwdMessage,
+    LwdRequestNotify,
+    lwd_decode_cloud_to_edge,
+)
 from vllm.v1.request import Request
 
 # Native batch queue depth: dispatched (embed + unembed) batches not yet
@@ -55,51 +50,38 @@ from vllm.v1.request import Request
 # conservative, validate performance with 2 first.
 LWD_EDGE_BATCH_QUEUE_DEPTH = 2
 
-# A full publish queue is retried for the add-request notify with growing
-# intervals (about 3 s in total); running out fails the request.
-_LWD_ADD_RETRY_STEPS = 5
-_LWD_ADD_RETRY_INTERVAL_S = 0.2
-
-# 运行时旋钮固定值(评审定案:不接收配置/env 注入):HELLO 等待 600s、
-# 发布队列深 1000(与通信层 LWD_PUBLISH_QUEUE_MAX 同值)。诊断层日志
-# 默认关——开关归 lwd_debug 自带的 env 通道,随其移植生效,引擎不再
-# 传播 config 段开关。
-_LWD_HELLO_TIMEOUT_S = 600.0
-_LWD_PUBLISH_QUEUE_MAX = 1000
+# A full outbound queue is retried with growing intervals (about 3 s in
+# total) before failing: by then the cloud stopped reading or is gone.
+_LWD_SEND_RETRY_STEPS = 5
+_LWD_SEND_RETRY_INTERVAL_S = 0.2
 
 
 class LwdEdgeEngineCore(LwdBaseEngineCore):
-    """Edge PO engine: communication setup + HELLO cross-check + native
-    stepping."""
+    """Edge PO engine: control plane + cloud limits check + native stepping."""
 
     lwd_scheduler_cls = LwdEdgeScheduler
     scheduler: LwdEdgeScheduler
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        config = self.lwd_config
-        # 通信面:bind POST_OUT 订阅面 + 延迟连接的 PRE_OUT 发布面;
-        # 云端点由 HELLO 通告决定(边不预知云地址)
-        self._lwd_subscriber = LwdControlSubscriber(
-            config.lwd_post_out_bind_endpoint(),
-            bind=True,
-            decoder=lwd_decode_cloud_notify,
-        )
-        self._lwd_publisher = LwdControlPublisher(
-            None, bind=False, queue_max=_LWD_PUBLISH_QUEUE_MAX
-        )
-        self._lwd_hello_event = threading.Event()
-        self._lwd_subscriber.start(self._lwd_on_message, name="lwd-post-in")
-        if not self._lwd_hello_event.wait(_LWD_HELLO_TIMEOUT_S):
-            self._lwd_shutdown_comm()
+    def _lwd_assemble(self) -> None:
+        self._lwd_cloud_params: LwdCloudParamsNotify | None = None
+        self._lwd_cloud_params_received = threading.Event()
+        plane = self._lwd_start_control_plane()
+        assert isinstance(plane, LwdEdgeControlPlane)
+        # One handshake_timeout_s covers the accept and the limits: it bounds
+        # the wait for a cloud ready to serve.
+        handshake_timeout_s = plane.spec.config.handshake_timeout_s
+        deadline = time.monotonic() + handshake_timeout_s
+        self._lwd_cloud: LwdPeer = plane.wait_until_ready(handshake_timeout_s)
+        if not self._lwd_cloud_params_received.wait(
+            max(0.0, deadline - time.monotonic())
+        ):
             raise RuntimeError(
-                f"[LWD] edge engine init failed: no cloud HELLO within "
-                f"{_LWD_HELLO_TIMEOUT_S}s on POST_OUT "
-                f"(bind {config.lwd_post_out_bind_endpoint()}; check cloud "
-                f"master_addr connectivity and POST_OUT port)"
+                f"[LWD] edge engine init failed: cloud {self._lwd_cloud} at "
+                f"{plane.endpoint} accepted the handshake but sent no scheduling "
+                f"limits within {handshake_timeout_s}s"
             )
-        self._lwd_cross_check_hello()
-        self.scheduler.lwd_edge_publisher = self._lwd_publisher
+        self._lwd_check_cloud_params()
+        self.scheduler.lwd_send_to_cloud = self._lwd_send_to_cloud
         # Native batch queue stepping (step/step_with_batch_queue untouched):
         # 1. depth 2, rebuilding the deque so its maxlen matches and
         #    appendleft on a full queue cannot silently evict a batch in
@@ -113,29 +95,22 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self.step_fn = self.step_with_batch_queue
         self.model_executor = LwdEdgeExecutorProxy(self.model_executor)
         lwd_logger.info(
-            "[edge] engine assembled: POST_OUT bind %s, PRE_OUT "
-            "discovered, native batch-queue stepping depth=%d",
-            config.lwd_post_out_bind_endpoint(),
+            "[edge] engine assembled: cloud %s at %s, native batch-queue "
+            "stepping depth=%d",
+            self._lwd_cloud,
+            plane.endpoint,
             self.batch_queue_size,
         )
 
-    def _lwd_dispatch_message(self, msg) -> bool:
-        """POST_OUT dispatch (receiver thread, entry in the base class): HELLO
-        -> retarget PRE_OUT (the only source of the cloud endpoint; retried
-        while the queue is full); c2e -> scheduler notify queue + WAKEUP;
-        anything else is unknown and dropped with a warning by the entry."""
-        if isinstance(msg, LwdHelloNotify):
-            endpoint = f"tcp://{msg.pre_out_host}:{msg.pre_out_port}"
-            lwd_logger.info("[hello] cloud discovered: PRE_OUT -> %s", endpoint)
-            self._lwd_peer_hello = msg
-            while not self._lwd_publisher.retarget(endpoint):
-                if self._lwd_subscriber.closed:
-                    break
-                lwd_logger.warning(
-                    "[hello] PRE_OUT retarget deferred (queue full), retrying"
-                )
-                threading.Event().wait(0.05)
-            self._lwd_hello_event.set()
+    def _lwd_decode(self, payload: bytes) -> LwdMessage:
+        return lwd_decode_cloud_to_edge(payload)
+
+    def _lwd_dispatch_message(self, peer: LwdPeer, msg: LwdMessage) -> bool:
+        """Cloud limits -> wake the startup wait; c2e -> scheduler notify
+        queue + WAKEUP; anything else is unknown."""
+        if isinstance(msg, LwdCloudParamsNotify):
+            self._lwd_cloud_params = msg
+            self._lwd_cloud_params_received.set()
             return True
         if isinstance(msg, LwdC2eNotify):
             self.scheduler.unembed_notify_queue.append(msg)
@@ -143,14 +118,13 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             return True
         return False
 
-    def _lwd_cross_check_hello(self) -> None:
-        """HELLO cross-check. (max_num_batched_tokens, max_num_seqs) must match
-        the cloud: both feed the cap/preflight formulas, and a mismatch makes
-        the cloud hold prefills behind decodes forever without any error, so
-        it shuts down and fails fast. The speculative factor is adopted from
-        the cloud and liveness re-checked with it; mrope models shut down on an
-        old wire version."""
-        hello = self._lwd_peer_hello
+    def _lwd_check_cloud_params(self) -> None:
+        """(max_num_batched_tokens, max_num_seqs) must match the cloud: both
+        feed the cap/preflight formulas, and a mismatch makes the cloud hold
+        prefills behind decodes forever without any error. The speculative
+        factor is adopted from the cloud and liveness re-checked with it."""
+        params = self._lwd_cloud_params
+        assert params is not None
         sched = self.vllm_config.scheduler_config
         spec_config = getattr(self.vllm_config, "speculative_config", None)
         local = (
@@ -159,12 +133,11 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             getattr(spec_config, "num_speculative_tokens", None) or 0,
         )
         remote = (
-            hello.max_num_batched_tokens,
-            hello.max_num_seqs,
-            hello.num_speculative_tokens,
+            params.max_num_batched_tokens,
+            params.max_num_seqs,
+            params.num_speculative_tokens,
         )
         if local[:2] != remote[:2]:
-            self._lwd_shutdown_comm()
             raise RuntimeError(
                 f"[LWD] edge/cloud scheduling config mismatch: "
                 f"(max_num_batched_tokens, max_num_seqs) edge={local[:2]} != "
@@ -177,7 +150,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             # start the draft machinery), so it adopts the cloud's.
             spec_factor = remote[2] + 1
             lwd_logger.warning(
-                "[hello] adopt cloud spec_factor=%d over edge local %d",
+                "[cloud-params] adopt cloud spec_factor=%d over edge local %d",
                 spec_factor,
                 local[2] + 1,
             )
@@ -188,7 +161,6 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 - self.scheduler.max_num_running_reqs * spec_factor
                 < 1
             ):
-                self._lwd_shutdown_comm()
                 raise RuntimeError(
                     f"[LWD] deadlock config: with the cloud spec_factor="
                     f"{spec_factor} the cap is always < 1 (budget "
@@ -196,7 +168,20 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                     f"{self.scheduler.max_num_running_reqs} x {spec_factor}); "
                     f"increase max_num_batched_tokens or decrease max_num_seqs"
                 )
-        lwd_logger.info("[hello] scheduling triple verified: %s", local)
+        lwd_logger.info("[cloud-params] scheduling limits verified: %s", local)
+
+    def _lwd_send_to_cloud(self, message: LwdEdgeToCloudMessage) -> None:
+        """Send to the cloud, retrying a full outbound queue; raises once the
+        retries run out instead of losing the message."""
+        for attempt in range(_LWD_SEND_RETRY_STEPS):
+            if self._lwd_send(self._lwd_cloud, message):
+                return
+            time.sleep(_LWD_SEND_RETRY_INTERVAL_S * (attempt + 1))
+        raise RuntimeError(
+            f"[LWD] {type(message).__name__} to cloud {self._lwd_cloud} not "
+            f"sent: outbound queue still full after {_LWD_SEND_RETRY_STEPS} "
+            f"retries (cloud stalled or gone?)"
+        )
 
     # ------------------------------------------------------------------ #
     # 引擎接口覆写                                                        #
@@ -215,10 +200,8 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         super().abort_requests(request_ids)
 
     def _lwd_notify_request(self, request: Request) -> None:
-        """Announce the request to the cloud (the engine's only communication
-        point), packing the sampling fields from the shared table; a full queue
-        is retried with short backoffs, then RuntimeError is raised (back to
-        the frontend through add_request)."""
+        """Announce the request to the cloud, packing the sampling fields from
+        the shared table."""
         sampling_params = request.sampling_params
         assert sampling_params is not None, "admission rejects pooling requests"
         values: dict[str, Any] = {
@@ -227,19 +210,12 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         if values["max_tokens"] is None:
             values["max_tokens"] = LWD_SAMPLING_DEFAULTS["max_tokens"]
         values["stop_token_ids"] = list(values["stop_token_ids"] or [])
-        message = LwdRequestNotify(
-            request_id=request.request_id,
-            num_prompt_tokens=request.num_prompt_tokens,
-            block_hashes=list(request.block_hashes),
-            eos_token_id=sampling_params.eos_token_id,
-            **values,
-        )
-        for attempt in range(_LWD_ADD_RETRY_STEPS):
-            if self._lwd_publisher.publish(message):
-                return
-            time.sleep(_LWD_ADD_RETRY_INTERVAL_S * (attempt + 1))
-        raise RuntimeError(
-            f"[LWD] add-request notify for {request.request_id} dropped: "
-            f"publish queue full after {_LWD_ADD_RETRY_STEPS} retries "
-            f"(cloud PRE_OUT consumption stalled?)"
+        self._lwd_send_to_cloud(
+            LwdRequestNotify(
+                request_id=request.request_id,
+                num_prompt_tokens=request.num_prompt_tokens,
+                block_hashes=list(request.block_hashes),
+                eos_token_id=sampling_params.eos_token_id,
+                **values,
+            )
         )

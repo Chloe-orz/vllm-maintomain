@@ -3,8 +3,8 @@
 
 """Control scheduling layer: edge/cloud scheduler and engine core bases.
 
-Depends on `control_communication` in one direction only. The edge and cloud
-schedulers subclass `LwdBaseScheduler` (an AsyncScheduler); engine access
-lives in the two engine cores (`lwd_edge_engine` / `lwd_cloud_engine`) built
-on `LwdBaseEngineCore`.
+Depends on `lwd_comm` in one direction only. The edge and cloud schedulers
+subclass `LwdBaseScheduler` (an AsyncScheduler); engine access lives in the
+two engine cores (`lwd_edge_engine` / `lwd_cloud_engine`) built on
+`LwdBaseEngineCore`.
 """

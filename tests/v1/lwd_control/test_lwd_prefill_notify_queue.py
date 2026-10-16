@@ -10,7 +10,7 @@ import threading
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefill_notify_queue import (
     LwdPrefillNotifyQueue,
 )
-from vllm.v1.lwd_control.control_communication.lwd_notify import (
+from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdRangeItem,
     LwdRangeNotify,
 )

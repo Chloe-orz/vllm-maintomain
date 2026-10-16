@@ -40,11 +40,6 @@ class LwdRangeNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-a
     Duplicates are idempotent per (request_id, offset).
     """
 
-    # TODO(lwd): drop the top-level request_id/offset/num_tokens once the
-    # migrated cloud schedulers read `items` only; they mirror items[0].
-    request_id: str
-    offset: int
-    num_tokens: int
     seqno: int
     """Batch number pairing the batch with its data-plane transfer."""
     items: list[LwdRangeItem] = []
@@ -77,6 +72,26 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call
     eos_token_id: int | None = None
     """Resolved by the edge tokenizer; the cloud cannot derive it. None leaves
     `max_tokens` as the only stop condition on the cloud."""
+
+
+LWD_SAMPLING_FIELDS: tuple[tuple[str, object], ...] = (
+    ("max_tokens", 16),
+    ("temperature", 1.0),
+    ("top_p", 1.0),
+    ("top_k", 0),
+    ("min_p", 0.0),
+    ("seed", None),
+    ("repetition_penalty", 1.0),
+    ("presence_penalty", 0.0),
+    ("frequency_penalty", 0.0),
+    ("ignore_eos", False),
+    ("stop_token_ids", []),
+    ("min_tokens", 0),
+)
+"""(field, default) of the `SamplingParams` arguments `LwdRequestNotify`
+carries; the edge packs and the cloud rebuilds them from this one table.
+`eos_token_id` is not a `SamplingParams` argument and travels on its own."""
+LWD_SAMPLING_DEFAULTS = dict(LWD_SAMPLING_FIELDS)
 
 
 class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
@@ -122,12 +137,13 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg
 
 LwdEdgeToCloudMessage: TypeAlias = LwdRequestNotify | LwdRangeNotify | LwdAbortNotify
 LwdCloudToEdgeMessage: TypeAlias = LwdCloudParamsNotify | LwdC2eNotify
+LwdMessage: TypeAlias = LwdEdgeToCloudMessage | LwdCloudToEdgeMessage
 
 _LWD_EDGE_TO_CLOUD_DECODER = msgspec.msgpack.Decoder(LwdEdgeToCloudMessage)
 _LWD_CLOUD_TO_EDGE_DECODER = msgspec.msgpack.Decoder(LwdCloudToEdgeMessage)
 
 
-def lwd_encode_message(message: LwdEdgeToCloudMessage | LwdCloudToEdgeMessage) -> bytes:
+def lwd_encode_message(message: LwdMessage) -> bytes:
     return msgspec.msgpack.encode(message)
 
 

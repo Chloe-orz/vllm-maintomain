@@ -103,7 +103,7 @@ def test_diag_package_purity():
     banned = (
         "control_edge_scheduler",
         "control_cloud_scheduler",
-        "control_communication",
+        "lwd_comm",
         "control_scheduler",
         "LwdBypassFuture",
         "LwdStubModelOutput",
@@ -154,13 +154,13 @@ def test_has_work_override_lives_in_base_engine():
 
 
 def test_message_dispatch_skeleton_in_base_engine():
-    """接收线程消息入口统一在基类:入口 _lwd_on_message + 未知帧告警
+    """接收线程消息入口统一在基类:入口 _lwd_on_payload + 未知帧告警
     丢弃住基类;两侧引擎只实现 _lwd_dispatch_message 钩子(评审:与
     cloud 的分派一起提取到基类)。"""
     base_engine = (
         VLLM_DIR / "v1" / "lwd_control" / "control_scheduler" / "lwd_base_engine.py"
     ).read_text()
-    assert "def _lwd_on_message" in base_engine
+    assert "def _lwd_on_payload" in base_engine
     assert "drop unexpected frame" in base_engine
     for sub in (
         "control_edge_scheduler/lwd_edge_engine.py",
@@ -168,7 +168,7 @@ def test_message_dispatch_skeleton_in_base_engine():
     ):
         text = (VLLM_DIR / "v1" / "lwd_control" / sub).read_text()
         assert "def _lwd_dispatch_message" in text, sub
-        assert "def _lwd_on_message" not in text, sub
+        assert "def _lwd_on_payload" not in text, sub
 
 
 def test_review_deleted_code_stays_deleted():
