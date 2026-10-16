@@ -691,7 +691,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         # 零值区,算出一批零 embedding 而**不报任何错**。这里逐请求核验
         #     native_scheduled ≤ recv_rows − consumed
         # 并把"原生 prefill 总量 == Σwindows"一并核验(多排即越界)。
-        self._lwd_verify_w2(out, notify, windowed, windows, decode_exact)
+        self._lwd_verify_w2(out, notify, items, windows, decode_exact)
         prefill_ids = [item.request_id for item in items]
         native_prefill = sum(
             int(out.num_scheduled_tokens.get(rid, 0)) for rid in prefill_ids
