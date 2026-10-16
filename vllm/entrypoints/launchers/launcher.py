@@ -25,6 +25,7 @@ from vllm.tool_parsers import ToolParserManager
 from vllm.tracing import instrument
 from vllm.utils.network_utils import find_process_using_port, is_valid_ipv6_address
 from vllm.utils.system_utils import set_ulimit
+from vllm.v1.lwd.probe import run_lwd_probe
 from vllm.version import __version__ as VLLM_VERSION
 
 from .utils.constants import (
@@ -109,6 +110,11 @@ async def serve_http(
         else None
     )
     server_task = loop.create_task(server.serve(sockets=[sock] if sock else None))
+    lwd_probe_task = (
+        loop.create_task(run_lwd_probe(server, engine_client))
+        if engine_client is not None
+        else None
+    )
 
     ssl_cert_refresher = (
         None
@@ -137,6 +143,9 @@ async def serve_http(
 
     async def handle_shutdown() -> None:
         await shutdown_event.wait()
+
+        if lwd_probe_task is not None:
+            lwd_probe_task.cancel()
 
         if engine_client is not None:
             timeout = engine_client.vllm_config.shutdown_timeout
@@ -182,6 +191,10 @@ async def serve_http(
         shutdown_task.cancel()
         if watchdog_task is not None:
             watchdog_task.cancel()
+        if lwd_probe_task is not None:
+            lwd_probe_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await lwd_probe_task
 
 
 async def watchdog_loop(server: uvicorn.Server, engine: EngineClient):
