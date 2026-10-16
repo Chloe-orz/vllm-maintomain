@@ -190,14 +190,20 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                     f"plane reported recv_rows=0 (该请求不该进 batch —— 可见集"
                     f"谓词 `recv_rows > 0` 失效)"
                 )
-            # 该请求在本批里最多能排到 recv_rows(= 已写入的最高行)。
-            # 不减 consumed:那是 worker 侧的读指针,与本核验并发推进。
+            # 该请求已累计收到的最高行号(recv_rows 按 prompt 起点计数,
+            # 不是相对本 chunk)。本步要算到 ``item.offset + got``,不能越过它。
+            #
+            # **别写成 ``item.offset + got > recv_rows`` 的等价变形去减 offset**:
+            # 续传 chunk 的 offset > 0,而它前面的行早已计入 recv_rows,减掉
+            # offset 就会把"前面已经收到的部分"漏算 —— 真机实录:一个
+            # offset=1164/已收 2346 的续传请求被误判成越界
+            # ("only 2346 have arrived" 而它算的区间 [1164, 3510) 其实合法)。
             if item.offset + got > recv_rows:
                 raise RuntimeError(
                     f"[Lwd][cloud-sched] W2 VIOLATION req={rid} seqno="
                     f"{notify.seqno}: native scheduled rows "
                     f"[{item.offset}, {item.offset + got}) but only "
-                    f"{recv_rows} have arrived "
+                    f"{recv_rows} have arrived in total "
                     f"(window={w} prompt={item.num_tokens} "
                     f"offset={item.offset} decode_exact={decode_exact})"
                 )
