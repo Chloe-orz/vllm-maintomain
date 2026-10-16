@@ -152,7 +152,10 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             apply_admission_cap=False,
         )
 
-    def _lwd_verify_w2(self, out, notify, windowed, windows, decode_exact) -> None:
+    def _lwd_verify_w2(
+        self, out, notify, windowed, windows, decode_exact,
+        eff_starts=None,
+    ) -> None:
         """下发前核验:**排程量不得超过已到达量**(design v7 §7 的 W2)。
 
         这是本方案唯一"静默错算"型风险的兜底。``num_scheduled_tokens``
@@ -177,7 +180,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         能权威看到的量 —— 这也是 §7 表格里的分工。
         """
         ledger = getattr(self, "lwd_recv_rows", None) or {}
-        for item, w in zip(windowed, windows):
+        for k, (item, w) in enumerate(zip(windowed, windows)):
             rid = item.request_id
             got = int(out.num_scheduled_tokens.get(rid, 0))
             if got == 0:
@@ -191,21 +194,25 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                     f"谓词 `recv_rows > 0` 失效)"
                 )
             # 该请求已累计收到的最高行号(recv_rows 按 prompt 起点计数,
-            # 不是相对本 chunk)。本步要算到 ``item.offset + got``,不能越过它。
+            # 不是相对本 chunk)。本步要算到 ``start + got``,不能越过它。
+            # ``start`` 取**本步生效起点**(部分消费时比 item.offset 大),
+            # 它由调用方通过 eff_starts 平行传入 —— **不能**回写 item.offset
+            # 来达到同样效果:那个字段是载荷尺寸协议(见 _schedule_mixed)。
             #
-            # **别写成 ``item.offset + got > recv_rows`` 的等价变形去减 offset**:
+            # **别写成 ``start + got > recv_rows`` 的等价变形去减 offset**:
             # 续传 chunk 的 offset > 0,而它前面的行早已计入 recv_rows,减掉
             # offset 就会把"前面已经收到的部分"漏算 —— 真机实录:一个
             # offset=1164/已收 2346 的续传请求被误判成越界
             # ("only 2346 have arrived" 而它算的区间 [1164, 3510) 其实合法)。
-            if item.offset + got > recv_rows:
+            start = int(eff_starts[k]) if eff_starts else item.offset
+            if start + got > recv_rows:
                 raise RuntimeError(
                     f"[Lwd][cloud-sched] W2 VIOLATION req={rid} seqno="
                     f"{notify.seqno}: native scheduled rows "
-                    f"[{item.offset}, {item.offset + got}) but only "
+                    f"[{start}, {start + got}) but only "
                     f"{recv_rows} have arrived in total "
-                    f"(window={w} prompt={item.num_tokens} "
-                    f"offset={item.offset} decode_exact={decode_exact})"
+                    f"(window={w} chunk_rows={item.num_tokens} "
+                    f"chunk_offset={item.offset} decode_exact={decode_exact})"
                 )
 
     def _lwd_kv_rows_capacity(self, decode_blocks: int) -> int:
@@ -474,7 +481,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 # 取代原来的 _lwd_preflight_ok 整批三检:三检里的"token 预算"
                 # 并入 budget 公式,"KV 块数"改成行级逐 item 算,"并发名额"
                 # 是请求级的、由原生准入在首次进 running 时查一次。
-                windows, windowed, decode_exact, _budget, reason = (
+                windows, windowed, eff_starts, decode_exact, _budget, reason = (
                     self._lwd_windowed_admission(notify, items, decode_ids)
                 )
                 if not windows:
@@ -496,7 +503,8 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                     # 步后核验、提交台账并写 LwdEmbedBatch。
                     self._lwd_note_window_step(notify)
                     out = self._schedule_mixed(
-                        notify, windowed, decode_ids, windows, decode_exact
+                        notify, windowed, decode_ids, windows, decode_exact,
+                        eff_starts,
                     )
                     self._lwd_attach_abort_notice(
                         out, self._lwd_take_abort_pending()
@@ -603,6 +611,10 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         ledger = getattr(self, "lwd_recv_rows", None) or {}
         windows: list[int] = []
         windowed: list[LwdRangeItem] = []
+        #: 与 ``windowed`` 平行的"本步生效起点"(prompt 行号)。部分消费时它
+        #: 比 ``item.offset`` 大 —— 但那**只**用于本步的下发与核验,
+        #: 绝不回写 ``item``(见下)。
+        eff_starts: list[int] = []
         capped_by_budget = False
         for item in items:
             rid = item.request_id
@@ -625,10 +637,43 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             #    少了这一步就会下发比本批实际数据更多的行 —— 真机实录:
             #    1168 + 2342 的 prompt 在第二块上算出 3510 窗口,而原生只排了
             #    2342,W2 当场炸(native prefill=2342 Σwindows=3510)。
+            start = item.offset
+            left = item.num_tokens
+            # ---- 部分消费:已算过的前缀要跳过,但**不能改 item 的几何** ----
+            # ``item.offset``/``item.num_tokens`` 不只是调度输入,它们同时是
+            # **载荷尺寸协议**:云 worker 按它们分配 recv 缓冲、算 P2P numel
+            # (HCCL 两端必须相等),runner 按它们定注入起点、切 mrope 字节
+            # (``_lwd_slice_mrope_window`` 的 stride 就是 chunk_rows)。
+            # 早先这里直接写了回 ``item``,后果是注入起点被抬到 1080、mrope
+            # 按 28 行去切 —— 精度测试表现为**输出被截断/空白**(数据本身没乱
+            # 所以没有乱码)。所以本步生效的区间只放在**平行的表**里。
+            if request.num_computed_tokens > start:
+                skipped = request.num_computed_tokens - start
+                if skipped >= left:
+                    # 整块都已算完(重放/迟到预告):本步没有可下的行。
+                    continue
+                logger.info(
+                    "[Lwd][cloud-sched] partial chunk seqno=%d req=%s: "
+                    "rows [%d,%d) already computed, dispatching the "
+                    "remaining %d of %d",
+                    notify.seqno, rid, start,
+                    request.num_computed_tokens, left - skipped, left,
+                )
+                start += skipped
+                left -= skipped
+            elif request.num_computed_tokens < start:
+                # 原生水位还没到块起点:块被跳过/预告重复(>)或乱序(<)。
+                raise RuntimeError(
+                    f"[Lwd][cloud-sched] chunk offset mismatch "
+                    f"req={rid} seqno={notify.seqno}: "
+                    f"notify offset={item.offset} != cloud computed="
+                    f"{request.num_computed_tokens} "
+                    f"(chunk 断流/重复/乱序)"
+                )
             arrived = recv_rows - request.num_computed_tokens
-            available = min(arrived, item.num_tokens)
+            available = min(arrived, left)
             if available <= 0:
-                # 这个 chunk 还一行都没到,或这一段已经算完:本步不给行。
+                # 这一段还一行都没到,或已经算完:本步不给行。
                 continue
             n = min(available, room)
             # ---- 与原生块对齐(否则原生会把窗口再截一次)----
@@ -644,6 +689,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             if not spans_all and n > BS:
                 n = n // BS * BS
                 if n < 1:
+                    # 对齐后一行都不剩:留给下一步,且不占预算卡住后面的请求
                     continue
             if n < available:
                 capped_by_budget = True
@@ -651,6 +697,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 break  # 保序:后面的一并留到下步
             windows.append(n)
             windowed.append(item)
+            eff_starts.append(start)
             room -= n
             if room < 1:
                 break
@@ -676,7 +723,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             room, decode_exact, decode_blocks,
             self.kv_cache_manager.block_pool.get_num_free_blocks(), reason,
         )
-        return windows, windowed, decode_exact, room, reason
+        return windows, windowed, eff_starts, decode_exact, room, reason
 
     def _schedule_mixed(
         self,
@@ -685,6 +732,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         decode_ids: list[str],
         windows: list[int],
         decode_exact: int,
+        eff_starts: list[int] | None = None,
     ) -> SchedulerOutput:
         """混排步:decode 集 + 本批**本步可取的行**同批下发。
 
@@ -711,7 +759,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             notify.seqno, [item.request_id for item in items],
             sum(item.num_tokens for item in items), windows,
         )
-        for item in items:
+        for k, item in enumerate(items):
             if item.has_mrope and not item.mrope_positions:
                 raise RuntimeError(
                     f"[Lwd][cloud-sched] mrope payload missing "
@@ -721,47 +769,35 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                     f"{LWD_WIRE_VERSION}),两侧必须同版本部署"
                 )
             request = self.requests[item.request_id]
-            # ---- 部分消费:把已算过的前缀从本 chunk 里扣掉 ----
+            # ---- 本 item 是否还有"本步要算的行" ----
             #
             # ``item`` 描述的是一整块 ``[offset, offset+num_tokens)``,而这块
             # 可能**只被消费了一部分**:KV 紧张时原生把我们的窗口截短(真机实录
-            # 1108 → 1080),``num_computed_tokens`` 于是落在块**内部**而不是
-            # 块起点。这时再拿原始 offset 对账就会炸:
-            #
-            #   chunk offset mismatch req=..: notify offset=0 != cloud computed=1080
-            #   (chunk 断流/重复/乱序)   ← 其实既没断流也没乱序
-            #
-            # 正确的处理不是报错,而是把这一块当成"从 1080 行开始的剩余 28 行"
-            # 继续下发(数据就在 host 上),让 num_computed 补到块的终点;下一次
-            # 预告的 offset 自然会对上。``num_computed > 块起点`` 说明这一段
-            # **已经算过**,所以只需右移起点,不必重新搬数据。
-            start = item.offset
-            left = item.num_tokens
-            if request.num_computed_tokens > start:
-                skipped = request.num_computed_tokens - start
-                if skipped >= left:
-                    # 整块都已算完(重放/迟到预告):本步没有可下的行。
-                    continue
-                logger.info(
-                    "[Lwd][cloud-sched] partial chunk seqno=%d req=%s: "
-                    "rows [%d,%d) already computed, dispatching the "
-                    "remaining %d of %d",
-                    notify.seqno, item.request_id,
-                    start, request.num_computed_tokens,
-                    left - skipped, left,
-                )
-                start += skipped
-                left -= skipped
-                item.offset = start
-                item.num_tokens = left
-            elif request.num_computed_tokens < start:
-                # 原生水位还没到块起点:块被跳过/预告重复(>)或乱序(<)。
+            # 1108 → 1080),``num_computed_tokens`` 于是落在块**内部**。这时
+            # 不能再拿原始 offset 对账(那会误报"乱序"),但**也绝不能把修正
+            # 写回 item** —— ``item.offset``/``num_tokens`` 同时是载荷尺寸协议:
+            # 云 worker 按它分配 recv 缓冲并算 P2P numel(HCCL 两端必须相等),
+            # runner 按它定注入起点、按 ``num_tokens`` 切 mrope 字节。
+            # 早先这里回写了 item,精度测试立刻表现为**输出截断/空白**
+            # (注入起点被抬到 1080、mrope 按剩余 28 行去切;数据本身没乱,
+            # 所以没有乱码)。本步生效区间一律走平行的 ``eff_starts``。
+            start = int(eff_starts[k]) if eff_starts else item.offset
+            if request.num_computed_tokens < item.offset:
+                # 原生水位**还没到块起点**:块被跳过/预告重复(>)或乱序(<),
+                # 这才是真正该当场炸的情况。
                 raise RuntimeError(
                     f"[Lwd][cloud-sched] chunk offset mismatch "
                     f"req={item.request_id} seqno={notify.seqno}: "
                     f"notify offset={item.offset} != cloud computed="
                     f"{request.num_computed_tokens} "
                     f"(chunk 断流/重复/乱序)"
+                )
+            if start + windows[k] > item.offset + item.num_tokens:
+                raise RuntimeError(
+                    f"[Lwd][cloud-sched] window overruns the chunk "
+                    f"req={item.request_id} seqno={notify.seqno}: "
+                    f"[{start}, {start + windows[k]}) not within chunk "
+                    f"[{item.offset}, {item.offset + item.num_tokens})"
                 )
         req_ids = decode_ids + [item.request_id for item in items]
         saved_budget = self.max_num_scheduled_tokens
@@ -782,7 +818,8 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         # 零值区,算出一批零 embedding 而**不报任何错**。这里逐请求核验
         #     native_scheduled ≤ recv_rows − consumed
         # 并把"原生 prefill 总量 == Σwindows"一并核验(多排即越界)。
-        self._lwd_verify_w2(out, notify, items, windows, decode_exact)
+        self._lwd_verify_w2(out, notify, items, windows, decode_exact,
+                            eff_starts)
         prefill_ids = [item.request_id for item in items]
         native_prefill = sum(
             int(out.num_scheduled_tokens.get(rid, 0)) for rid in prefill_ids
