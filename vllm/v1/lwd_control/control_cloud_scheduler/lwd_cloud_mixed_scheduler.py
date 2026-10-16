@@ -606,7 +606,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 notify.seqno, room, decode_exact, decode_blocks,
                 self.kv_cache_manager.block_pool.get_num_free_blocks(),
             )
-            return [], [], decode_exact, 0, "budget"
+            return [], [], [], decode_exact, 0, "budget"
 
         ledger = getattr(self, "lwd_recv_rows", None) or {}
         windows: list[int] = []
