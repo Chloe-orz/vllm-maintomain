@@ -97,11 +97,11 @@ class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
     """云->边发现通告(POST_OUT,首拍一次);pre_out_* 是边侧连接云端点的
     唯一事实源,pre_out_host 须为边可路由真实 IP(0.0.0.0 不可作通告值)。
 
-    调度三元组(max_num_batched_tokens/max_num_seqs/num_speculative_
-    tokens)供边侧互校:三者是 cap/preflight 公式两侧的同源输入,
-    不一致不会让链路报错,只会让 preflight 恒 hold、prefill 被 decode
-    静默串行(真机实录:边 factor=1 云 factor=4 时 chunk 8191 +
-    decode 4 > 预算 8192)。0 = 旧版未携带,边侧仅告警不拦截。"""
+    调度配置(max_num_batched_tokens/max_num_seqs)供边侧互校:两者是
+    边侧批上限与云侧调度的同源输入,不一致不会让链路报错,只会让批
+    尺寸越过云侧 staging 几何上限或名额失配。num_speculative_tokens
+    仅为 wire 兼容保留,边侧不再使用(host 暂存后边侧不再为云 decode
+    预留预算)。0 = 旧版未携带,边侧仅告警不拦截。"""
 
     pre_out_host: str
     pre_out_port: int

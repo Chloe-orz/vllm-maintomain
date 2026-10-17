@@ -6,13 +6,16 @@ chunk 混排语义:边侧按 c = min(剩余 prompt, chunk 单元) 切块组批
 一条批量 RangeNotify,与全部 decode 态请求混排一个批下发:
 
   - **可见集谓词**:`recv_rows − num_computed <= 0` 的请求本步不进 batch
-    (数据面没到就算 = 读零占位、静默错算;落点是既有的临时可见集机制,
-    原生 scheduler.py 一行不改);
+    (数据面没到就算 = 读零占位、静默错算;落点是既有的临时可见集机制);
+    原生 scheduler.py 仅新增一处可选钩子:读取请求对象上的
+    `lwd_window_cap` 属性做 per-request 取小,不设置时对原生行为零影响;
   - 放行先做 offset 对账(item.offset == 云侧 num_computed,chunk
     断流/重复/乱序即 fail-fast);
-  - **按请求下发**:每请求本步行数 = `min(已收 − 已算, 剩余预算)`,靠
-    `max_num_scheduled_tokens = decode_exact + Σ该值` 交给原生 —— 原生没有
-    per-request 钩子,这个总预算配合 FIFO 前缀序精确等于逐请求取小;
+  - **按请求下发**:每请求本步行数 = `min(已收 − 已算, 剩余预算)`,通过
+    挂在请求对象上的 `lwd_window_cap` 属性交给原生 —— 原生 running/
+    waiting 循环算 `num_new_tokens` 时对它取 min(总预算
+    `max_num_scheduled_tokens = decode_exact + Σ该值` 压缩保留为总量
+    上界;只靠它 + FIFO 前缀序不等于逐请求取小,真机实录 seqno=101);
   - **下发前 W2 核验**:逐请求 `num_scheduled ≤ recv_rows − consumed`。
     超了不会报错,只会算出一批零 embedding —— 本方案唯一的"静默错算"型
     风险,必须当场炸;
@@ -23,9 +26,9 @@ chunk 混排语义:边侧按 c = min(剩余 prompt, chunk 单元) 切块组批
 (以及 `_lwd_preflight_ok` / `_lwd_verify_full_admission` / 块对齐)整套删除,
 按"本方案就是唯一方案"的原则不留兼容分支。
 
-前置约束:spec decode(MTP)预算已按 1+k 系数对齐(边 cap 与本类
-preflight),但端到端未经真机验证(eagle 纯度判据失真风险,台账
-P3-3/设计 M-8);
+前置约束:spec decode(MTP)的 decode 预算按 decode_exact 逐请求精确
+记账(草稿 token 同样占预算),但端到端未经真机验证(eagle 纯度
+判据失真风险,台账 P3-3/设计 M-8);
 不兼容云侧抢占重算(占位 embeds 无法本地重 prefill)与 prefix caching
 (命中使 num_computed 起点 >0,触发 offset 对账 fail-fast;且被命中
 chunk 的 UP send 无人消费 = 通道打洞,chunk 化后硬前提,设计 §8-C3)
@@ -68,19 +71,9 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         # [Lwd][sched] 调度批日志步计数(饿死分析:RangeNotify 到达 ->
         # 混排步消费的间隔与中间插入的 decode-only 步数)
         self._lwd_sched_step = 0
-        # MTP 预算系数:decode 每请求每步消耗 1+k 个 token(草稿 token
-        # 占预算与 KV);k = num_speculative_tokens(配置解析期已求值,
-        # 缺省 None 按 0),无 spec 配置即 1
-        spec_config = getattr(self.vllm_config, "speculative_config", None)
-        num_spec = (
-            getattr(spec_config, "num_speculative_tokens", None) or 0
-        )
-        self._lwd_spec_factor: int = 1 + num_spec
         logger.info(
             "[Lwd] cloud mixed scheduler: chunked-prefill batches mixed "
-            "with decode (one notify consumed per step at most, "
-            "spec_factor=%d)",
-            self._lwd_spec_factor,
+            "with decode (one notify consumed per step at most)"
         )
         # spec 接受率累计器(引擎进程内直出):LWD 云前端没有注册请求,
         # 前端 stats 链(output_processor 丢弃未知请求输出 + lifespan
@@ -801,18 +794,23 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 )
         req_ids = decode_ids + [item.request_id for item in items]
         saved_budget = self.max_num_scheduled_tokens
-        # 把单步 token 预算压到 decode 的**精确**需求 + 本步 prefill 可取的行数。
-        # 这是本方案唯一的"逐请求上界"手段:原生没有 per-request 钩子
-        # (num_new_tokens = request.num_tokens − num_computed,只被
-        # long_prefill_token_threshold 与 token_budget 削),但
-        # `Σmin(avail_i, room) + decode_exact` 与原生 FIFO 前缀序组合出的
-        # 结果**精确**等于逐请求取小 —— 只要原生不会"跳过前面的请求去排后面的"。
-        # 万一它真那样排,下面的 W2 会当场炸,而不是静默算脏数据。
+        # 逐请求上界:把每个 windowed 请求本步可排的行数挂到请求对象上,
+        # 原生 running/waiting 循环算 num_new_tokens 时对它有 min —— 不能
+        # 只靠"压缩总预算 + FIFO 前缀序":那个组合不等于逐请求取小,池化
+        # 预算会被排在前面的请求超领(真机实录 seqno=101:窗口 8 行,原生
+        # 按整条 prompt 剩余排了 138 行,把 decode_exact 的份额吃掉)。
+        # 预算压缩保留为总量上界,双保险。
+        for k, item in enumerate(items):
+            self.requests[item.request_id].lwd_window_cap = windows[k]
         self.max_num_scheduled_tokens = decode_exact + sum(windows)
         try:
             out = self._lwd_schedule_for_visible_reqs(req_ids)
         finally:
             self.max_num_scheduled_tokens = saved_budget
+            for item in items:
+                request = self.requests.get(item.request_id)
+                if request is not None:
+                    request.lwd_window_cap = None
         # ---- W2(design v7 §7):本方案唯一"静默错算"型风险的兜底 ----
         # 下发的行数绝不能超过**已到达**的行数:超了就会读 host 上还没写过的
         # 零值区,算出一批零 embedding 而**不报任何错**。这里逐请求核验

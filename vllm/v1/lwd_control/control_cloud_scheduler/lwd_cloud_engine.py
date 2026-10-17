@@ -148,7 +148,8 @@ class LwdCloudEngineCore(EngineCoreProc):
         self._lwd_hello = LwdHelloNotify(
             pre_out_host=config.pre_out_host,
             pre_out_port=config.pre_out_port,
-            # 调度三元组供边侧互校(cap/preflight 公式的同源输入)
+            # 调度配置供边侧互校(批上限/名额的同源输入);
+            # num_speculative_tokens 仅为 wire 兼容保留,边侧不再使用
             max_num_batched_tokens=sched_config.max_num_batched_tokens,
             max_num_seqs=sched_config.max_num_seqs,
             num_speculative_tokens=(
