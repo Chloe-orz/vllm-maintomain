@@ -7,7 +7,7 @@ The data plane spans two repositories:
 | Part | Location | Knows about |
 | --- | --- | --- |
 | Rank groups | `vllm/distributed/lwd/lwd_parallel_groups.py` | `LwdParallelGroupsSpec`: the groups every process builds, derived from the topology |
-| vLLM groups | `_initialize_lwd_model_parallel` in `vllm/distributed/parallel_state.py` | TP/PP/DCP/PCP/DP/EP groups of the shared world |
+| vLLM groups | `_lwd_initialize_model_parallel` in `vllm/distributed/parallel_state.py` | TP/PP/DCP/PCP/DP/EP groups of the shared world |
 | Ascend groups | `vllm_ascend/distributed/lwd_data_plane/lwd_parallel_groups.py`, called from `init_ascend_model_parallel` | MC2 and dynamic EPLB groups |
 | Channels | `vllm_ascend/distributed/lwd_data_plane/lwd_wire.py` | UP/DOWN groups, streams and warmup per DP connection |
 | Comm service | `vllm_ascend/distributed/lwd_data_plane/{service,channel,future,types}.py` | Async send/recv submission, per-channel seqno FIFO, completion futures |
@@ -48,7 +48,7 @@ flowchart LR
 | PP / DCP / PCP / DP | `[0]`, `[1]`, ..., `[5]` |
 | UP, DOWN | `[0, 2]` |
 
-Group creation is a world collective, so every process derives the same `LwdParallelGroupsSpec` from the same topology and creates the groups in the same order: the vLLM groups in `initialize_model_parallel`, then the Ascend groups in `init_ascend_model_parallel`, then the channel groups in `init_lwd_duplex_channels`. Configs the data plane cannot host (an unsupported topology or parallel feature, or a tensor parallel size other than the DP rank count) are rejected by `check_lwd_parallel_config` in `VllmConfig.__post_init__`; the edge and the cloud read the same topology, so both fail at startup, before any worker joins the world.
+Group creation is a world collective, so every process derives the same `LwdParallelGroupsSpec` from the same topology and creates the groups in the same order: the vLLM groups in `initialize_model_parallel`, then the Ascend groups in `init_ascend_model_parallel`, then the channel groups in `init_lwd_duplex_channels`. Configs the data plane cannot host (an unsupported topology or parallel feature, or a tensor parallel size other than the DP rank count) are rejected by `lwd_check_parallel_config` in `VllmConfig.__post_init__`; the edge and the cloud read the same topology, so both fail at startup, before any worker joins the world.
 
 ### No two-stage pipeline
 

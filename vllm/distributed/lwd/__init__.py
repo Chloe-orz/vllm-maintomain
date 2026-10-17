@@ -6,12 +6,12 @@ from .lwd_parallel_groups import (
     LwdChannelEndpoints,
     LwdParallelGroupsSpec,
     LwdRankGroup,
-    check_lwd_parallel_config,
+    lwd_check_parallel_config,
 )
 
 __all__ = [
     "LwdChannelEndpoints",
     "LwdParallelGroupsSpec",
     "LwdRankGroup",
-    "check_lwd_parallel_config",
+    "lwd_check_parallel_config",
 ]

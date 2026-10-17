@@ -120,7 +120,7 @@ class LwdParallelGroupsSpec:
         return None
 
 
-def check_lwd_parallel_config(vllm_config: "VllmConfig") -> None:
+def lwd_check_parallel_config(vllm_config: "VllmConfig") -> None:
     """Reject at config time what the shared HCCL world cannot host.
 
     Every process reads the same topology, so both sides fail at startup,

@@ -2012,7 +2012,7 @@ def initialize_model_parallel(
 
     config = get_current_vllm_config()
     if config.lwd_config is not None:
-        _initialize_lwd_model_parallel(config, tensor_model_parallel_size, backend)
+        _lwd_initialize_model_parallel(config, tensor_model_parallel_size, backend)
         return
     data_parallel_size = config.parallel_config.data_parallel_size
     enable_elastic_ep = config.parallel_config.enable_elastic_ep
@@ -2284,21 +2284,21 @@ def initialize_model_parallel(
     )
 
 
-def _initialize_lwd_model_parallel(
-    config: "VllmConfig", tensor_model_parallel_size: int, backend: str | None
+def _lwd_initialize_model_parallel(
+    vllm_config: "VllmConfig", tensor_model_parallel_size: int, backend: str | None
 ) -> None:
     """Build the groups of the HCCL world shared by the LWD edge and cloud.
 
     The edge and cloud rank counts differ, so the native uniform rank grid
     does not apply; the groups come from the topology instead, see
     `LwdParallelGroupsSpec`. The config was checked by
-    `check_lwd_parallel_config`; here only the launched world is checked.
+    `lwd_check_parallel_config`; here only the launched world is checked.
     """
     from vllm.distributed.lwd import LwdParallelGroupsSpec
 
-    parallel_config = config.parallel_config
-    assert config.lwd_config is not None
-    spec = LwdParallelGroupsSpec.from_topology(config.lwd_config.topology)
+    parallel_config = vllm_config.parallel_config
+    assert vllm_config.lwd_config is not None
+    spec = LwdParallelGroupsSpec.from_topology(vllm_config.lwd_config.topology)
     world_size = torch.distributed.get_world_size()
     if world_size != spec.world_size:
         raise ValueError(
@@ -2345,7 +2345,7 @@ def _initialize_lwd_model_parallel(
     _DP = init_model_parallel_group(
         singleton_groups, local_rank, backend, group_name="dp"
     )
-    if config.model_config is None or config.model_config.is_moe:
+    if vllm_config.model_config is None or vllm_config.model_config.is_moe:
         _EP = init_model_parallel_group(
             tp_groups,
             local_rank,
