@@ -9,9 +9,9 @@ The data plane spans two repositories:
 | Rank groups | `vllm/distributed/lwd/lwd_parallel_groups.py` | `LwdParallelGroupsSpec`: the groups every process builds, derived from the topology |
 | vLLM groups | `_lwd_initialize_model_parallel` in `vllm/distributed/parallel_state.py` | TP/PP/DCP/PCP/DP/EP groups of the shared world |
 | Ascend groups | `vllm_ascend/distributed/lwd_data_plane/lwd_parallel_groups.py`, called from `init_ascend_model_parallel` | MC2 and dynamic EPLB groups |
-| Channels | `vllm_ascend/distributed/lwd_data_plane/lwd_wire.py` | UP/DOWN groups, streams and warmup per DP connection |
-| Comm service | `vllm_ascend/distributed/lwd_data_plane/{service,channel,future,types}.py` | Async send/recv submission, per-channel seqno FIFO, completion futures |
-| Payload scramble | `vllm_ascend/distributed/lwd_data_plane/payload_scramble.py` | Obfuscating the hidden states on the wire |
+| Channels | `vllm_ascend/distributed/lwd_data_plane/lwd_channels.py` | UP/DOWN groups, streams and warmup per DP connection |
+| Transfers | `vllm_ascend/distributed/lwd_data_plane/{lwd_data_plane,lwd_transfer_queue,lwd_transfer_future,lwd_types}.py` | `LwdDataPlane`: async send/recv submission; `LwdTransferQueue`: per-channel seqno FIFO; `LwdTransferFuture`: completion futures |
+| Payload scramble | `vllm_ascend/distributed/lwd_data_plane/lwd_payload_scrambler.py` | `LwdPayloadScrambler`: obfuscating the hidden states on the wire |
 
 ## Communication domains
 
@@ -48,7 +48,7 @@ flowchart LR
 | PP / DCP / PCP / DP | `[0]`, `[1]`, ..., `[5]` |
 | UP, DOWN | `[0, 2]` |
 
-Group creation is a world collective, so every process derives the same `LwdParallelGroupsSpec` from the same topology and creates the groups in the same order: the vLLM groups in `initialize_model_parallel`, then the Ascend groups in `init_ascend_model_parallel`, then the channel groups in `init_lwd_duplex_channels`. Configs the data plane cannot host (an unsupported topology or parallel feature, or a tensor parallel size other than the DP rank count) are rejected by `lwd_check_parallel_config` in `VllmConfig.__post_init__`; the edge and the cloud read the same topology, so both fail at startup, before any worker joins the world.
+Group creation is a world collective, so every process derives the same `LwdParallelGroupsSpec` from the same topology and creates the groups in the same order: the vLLM groups in `initialize_model_parallel`, then the Ascend groups in `init_ascend_model_parallel`, then the channel groups in `lwd_init_channels`. Configs the data plane cannot host (an unsupported topology or parallel feature, or a tensor parallel size other than the DP rank count) are rejected by `lwd_check_parallel_config` in `VllmConfig.__post_init__`; the edge and the cloud read the same topology, so both fail at startup, before any worker joins the world.
 
 ### No two-stage pipeline
 
@@ -72,9 +72,9 @@ TODO(lwd): give each DP connection its own communication domain, built from rend
 | UP | edge → cloud | prompt embeddings of one prefill batch, plus an optional mrope-positions aux frame | edge scheduler batch |
 | DOWN | cloud → edge | c2e packet of one cloud step: final hidden states, top-k and accepted counts | cloud worker step |
 
-HCCL P2P has no tags: ops on one communicator pair up in posting order. `LwdCommService` therefore keeps one FIFO per `(channel, op)` and posts a request to HCCL only once all lower seqnos have been posted; out-of-order submissions are held. A seqno skipped on both sides (an aborted request) is stepped over so that one abort does not block the channel. The receiver allocates an exact-size buffer from the size announced on the control plane, since HCCL P2P needs matching sizes on both ends.
+HCCL P2P has no tags: ops on one communicator pair up in posting order. `LwdDataPlane` therefore keeps one `LwdTransferQueue` per `(channel, op)` and posts a request to HCCL only once all lower seqnos have been posted; out-of-order submissions are held. A seqno skipped on both sides (an aborted request) is stepped over so that one abort does not block the channel. The receiver allocates an exact-size buffer from the size announced on the control plane, since HCCL P2P needs matching sizes on both ends.
 
-Every wire op is issued on its channel's NPU stream and followed by an event; `LwdCommFuture.done()` queries that event without blocking. Both channels are warmed up at initialization in a fixed order (UP, then DOWN), so the first real message cannot rendezvous on different channels on the two sides.
+Every channel op is issued on its channel's NPU stream and followed by an event; `LwdTransferFuture.done()` queries that event without blocking. Both channels are warmed up at initialization in a fixed order (UP, then DOWN), so the first real message cannot rendezvous on different channels on the two sides.
 
 UP takes two hops on the cloud: the channel delivers to the cloud endpoint rank, and the cloud worker broadcasts the rows within its TP group on the compute stream.
 
