@@ -16,9 +16,10 @@ chunk 混排语义:边侧按 c = min(剩余 prompt, chunk 单元) 切块组批
     waiting 循环算 `num_new_tokens` 时对它取 min(总预算
     `max_num_scheduled_tokens = decode_exact + Σ该值` 压缩保留为总量
     上界;只靠它 + FIFO 前缀序不等于逐请求取小,真机实录 seqno=101);
-  - **下发前 W2 核验**:逐请求 `num_scheduled ≤ recv_rows − consumed`。
-    超了不会报错,只会算出一批零 embedding —— 本方案唯一的"静默错算"型
-    风险,必须当场炸;
+  - **下发前 W2 核验**:逐请求 `start + got ≤ recv_rows` 且 `got ≤ 窗口`。
+    超了不会报错,只会算出一批零 embedding 或越过 chunk 边界打乱注入
+    几何 —— 本方案唯一的"静默错算"型风险,必须当场炸;KV/预算截断
+    导致的**少排**是合法行为,只告警不核验;
   - 出队判据是 `live_rows`(唯一权威 = 原生水位,不是第二本台账)。
 
 注:`long_prefill_token_threshold` **不再被覆写**。v4 用它复现边侧 chunk
@@ -101,48 +102,9 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         # 诊断:seqno -> 该 notify 已被下发过几步(见 _lwd_window_steps)。
         # 单独存表而**不挂在 notify 上** —— msgspec.Struct 不可赋值。
         self._lwd_window_step_counts: dict[int, int] = {}
-        # 窗口预算基数:原生 token_budget 用的就是这个实例属性(§3.2.1 常量口径)。
-        self._lwd_kv_block_size: int = max(int(getattr(self, "block_size", 1)), 1)
         logger.info(
-            "[Lwd][host-stage] windowed consume armed: BS=%d base=%d",
-            self._lwd_kv_block_size, self.max_num_scheduled_tokens,
-        )
-
-    # ------------------------------------------------------------------ #
-    # KV 只读探针(照抄原生口径,不做任何分配)                             #
-    # ------------------------------------------------------------------ #
-    def _lwd_blocks_needed(self, request, num_tokens: int) -> int:
-        """该请求算到 ``num_tokens`` 为止需要**新分配**多少 KV 块。
-
-        直接复用原生的 ``coordinator.get_num_blocks_to_allocate`` —— **不**
-        接着调 ``allocate_new_blocks``,所以是纯读探针(不占块、不改状态)。
-        这是本方案唯一一处读原生内部函数的地方,口径必须与原生一致:
-
-        * ``apply_admission_cap=False``:该参数是"全序列准入闸门"
-          (``full_sequence_must_fit=True``)专用的;逐步分配路径必须保持
-          False,否则预测值与 ``allocate_new_blocks`` 不一致
-          (``kv_cache_coordinator`` 里写明的约束)。
-        * ``new_computed_blocks=EMPTY``(首阶段不算前缀命中,§10.2):需求被
-          高估 ⇒ 窗口偏小 ⇒ 只少算、不越界。running 请求在该函数里走快路径
-          并断言无新命中,所以对 decode 是**精确**的。
-        """
-        coordinator = self.kv_cache_manager.coordinator
-        empty = self.kv_cache_manager.empty_kv_cache_blocks.blocks
-        total_computed = min(
-            request.num_computed_tokens, self.max_model_len
-        )
-        num_tokens_main_model = total_computed + num_tokens
-        return coordinator.get_num_blocks_to_allocate(
-            request_id=request.request_id,
-            num_tokens=min(
-                num_tokens_main_model + self.num_lookahead_tokens,
-                self.max_model_len,
-            ),
-            new_computed_blocks=empty,
-            num_encoder_tokens=0,
-            total_computed_tokens=total_computed,
-            num_tokens_main_model=num_tokens_main_model,
-            apply_admission_cap=False,
+            "[Lwd][host-stage] windowed consume armed: base=%d",
+            self.max_num_scheduled_tokens,
         )
 
     def _lwd_verify_w2(
@@ -158,7 +120,12 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
 
         1. 该请求是否**根本没到数据却被排**(``recv_rows == 0``)—— 那说明
            可见集谓词(§5.3.1b)失效,这是最严重的一档;
-        2. 本步排程量是否落在**已到达**的行数之内。
+        2. 本步排程量是否落在**已到达**的行数之内;
+        3. 本步排程量是否越过**窗口**(``got > w``)—— 即 ``lwd_window_cap``
+           钩子失守。越过窗口 = 越过本 chunk 边界,runner 的注入几何
+           (mrope 按 chunk_rows 切窗)会静默错乱,而逐请求"已到达"核验
+           不一定拦得住(后续 chunk 可能已随累计水位到达,真机实录
+           seqno=101)。窗口判据在 cap 机制正常时恒真,是纯看门狗。
 
         **判据里绝不能再出现"已消费行数"**(真机踩过):
         ``consumed`` 是 **worker 侧的存储读指针**,由 ``_lwd_stage_requests_to_device``
@@ -178,6 +145,13 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             got = int(out.num_scheduled_tokens.get(rid, 0))
             if got == 0:
                 continue
+            if got > w:
+                raise RuntimeError(
+                    f"[Lwd][cloud-sched] W2 VIOLATION req={rid} seqno="
+                    f"{notify.seqno}: native scheduled {got} rows beyond "
+                    f"the window w={w} (lwd_window_cap 钩子失守 —— 越过本 "
+                    f"chunk 边界会破坏 runner 的注入几何,宁可当场炸)"
+                )
             recv_rows = int(ledger.get(rid, 0))
             if recv_rows <= 0:
                 raise RuntimeError(
@@ -207,11 +181,6 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                     f"(window={w} chunk_rows={item.num_tokens} "
                     f"chunk_offset={item.offset} decode_exact={decode_exact})"
                 )
-
-    def _lwd_kv_rows_capacity(self, decode_blocks: int) -> int:
-        """扣掉 decode 之后 prefill 还能用多少行(decode 优先,§3.2.1)。"""
-        free = self.kv_cache_manager.block_pool.get_num_free_blocks()
-        return max(free - decode_blocks, 0) * self._lwd_kv_block_size
 
     def update_from_output(self, scheduler_output, model_runner_output):
         """先累计 spec 接受率(镜像原生 update_from_output 的统计分支),
@@ -359,9 +328,12 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
     # 注:``_lwd_preflight_ok``(整批三检)与 ``_lwd_verify_full_admission``
     # ("禁止部分准入")已按 §3.3.2 删除。它们的三项检查各有新落点:
     #   * token 预算 -> 并入 ``_lwd_windowed_admission`` 的 budget 公式;
-    #   * KV 块数   -> 行级逐 item 算,且用原生口径(``_lwd_blocks_needed``);
+    #   * KV 块数   -> 完全交给原生(waiting 循环 allocate_slots 失败即
+    #     break,请求留队下步重试,天然是"KV 不足则 defer");曾有的
+    #     ``_lwd_blocks_needed`` 只读探针因高估幻影压力已删除;
     #   * 并发名额  -> 请求级,由原生准入在 item 首次进 running 时查一次;
-    #   * 步后核验  -> "排程量 == 本步窗口"(§3.4 W2,在 _schedule_mixed 内)。
+    #   * 步后核验  -> 逐请求 W2(§3.4,在 _schedule_mixed 内);原生少排
+    #     是合法行为(KV/预算截断),不再做总量相等核验。
 
     # ------------------------------------------------------------------ #
     # 调度主体(见 docs/design/lwd_host_staging.md §5)                     #
@@ -518,9 +490,8 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         不逐字复刻就会留下余量,使末位截断块被超排(真机实录:
         decode 请求被守卫跳过消耗 0,末位块 604 被排成 608)。
 
-        返回 ``(decode_exact, {req_id: d_i})``。**同一份 d_i 同时喂给
-        token 账与 KV 块账**(§6.1 第 4 步)——这是"两个口径逐请求一致"
-        的落地方式:不存在"扣了 token 没扣块"的漏算。
+        返回 ``(decode_exact, {req_id: d_i})``。d_i 现在只喂 token 账
+        (KV 块账已交还原生);per_req 保留给调用方做诊断。
         """
         per_req: dict[str, int] = {}
         decode_exact = 0
@@ -551,7 +522,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         return decode_exact, per_req
 
     def _lwd_windowed_admission(self, notify: LwdRangeNotify, items, decode_ids):
-        """第 (4)(5) 步:算 decode 的 token/块账,再逐 item 求**本步下发量**。
+        """第 (4)(5) 步:算 decode 的 token 账,再逐 item 求**本步下发量**。
 
         下发规则(design v7 §5.3,提问方指定):
 
@@ -567,37 +538,29 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         那一段 —— ``item.num_tokens`` 是自限块 ``min(剩余 prompt, chunk 单元)``
         的长度。一个被切成 1168 + 2342 的 prompt,在处理第二块时
         ``recv_rows`` 已是 3510,若只与预算取小就会算出 3510 行;而这一批
-        只带了 2342 行,原生按批内容只排 2342,于是:
+        只带了 2342 行。窗口越过本 chunk 边界还会破坏 runner 的注入几何
+        (mrope 按 chunk_rows 切窗)。
 
-            RuntimeError: [Lwd][cloud-sched] W2 violated seqno=2:
-            native prefill=2342 Σwindows=3510
-
-        取小之后,``window`` 永不超出本批实际携带的行数,原生保持 FIFO 前缀
-        序时二者精确相等;万一序不一致,原生最多排到 ``Σitem.num_tokens``,
-        而 W2 会在下发后当场炸 —— 不会静默算脏数据(§7)。
+        窗口经 ``lwd_window_cap`` 逐请求挂给原生(见 _schedule_mixed)作
+        唯一上界;原生少排(块对齐截尾/KV 分配失败)是合法行为,下一步
+        按 num_computed 重算即可。
 
         返回 ``(windows, windowed_items, decode_exact, budget, reason)``;
         ``windows`` 为空表示本步不排 prefill(纯 decode)。
         """
-        BS = self._lwd_kv_block_size
-        decode_exact, per_req = self._lwd_decode_tokens(decode_ids)
+        decode_exact, _per_req = self._lwd_decode_tokens(decode_ids)
 
-        # decode 先占 KV(§5.6):块账用原生函数逐请求算,不用粗估。
-        decode_blocks = 0
-        for rid, d_i in per_req.items():
-            req = self.requests[rid]
-            decode_blocks += self._lwd_blocks_needed(req, d_i)
-
-        # 本步可用的 KV 行数;预算同时受"单步 token 上限 − decode"约束
-        kv_rows = self._lwd_kv_rows_capacity(decode_blocks)
-        cfg_room = self.max_num_scheduled_tokens - decode_exact
-        room = min(cfg_room, kv_rows)
+        # room 只剩 token 账:单步上限扣掉 decode 的精确需求(decode 优先,
+        # §3.2.1)。KV 完全交给原生:waiting 循环 allocate_slots 失败即
+        # break,请求留队下步重试 —— 天然是"KV 不足则 defer",且按真实
+        # 分配逐请求块取整(曾有只读探针按此预估,因高估幻影压力饿死
+        # prefill 而删除)。
+        room = self.max_num_scheduled_tokens - decode_exact
         if room < 1:
             logger.info(
                 "[Lwd][host-stage] WINDOW seqno=%d empty: room=%d "
-                "(decode_exact=%d decode_blocks=%d free=%d)",
-                notify.seqno, room, decode_exact, decode_blocks,
-                self.kv_cache_manager.block_pool.get_num_free_blocks(),
+                "(decode_exact=%d)",
+                notify.seqno, room, decode_exact,
             )
             return [], [], [], decode_exact, 0, "budget"
 
@@ -627,9 +590,9 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             #    它跑到前面不会改动这里(踩过的是**另一处**,见 _lwd_verify_w2)。
             # ② 再与 ``item.num_tokens`` 取小:``recv_rows`` 是**跨全部 chunk
             #    累计**的高水位,而本批只携带 ``item.num_tokens`` 行(自限块)。
-            #    少了这一步就会下发比本批实际数据更多的行 —— 真机实录:
-            #    1168 + 2342 的 prompt 在第二块上算出 3510 窗口,而原生只排了
-            #    2342,W2 当场炸(native prefill=2342 Σwindows=3510)。
+            #    少了这一步窗口就会越过本批实际携带的行数,破坏 runner 的
+            #    注入几何 —— 真机实录:1168 + 2342 的 prompt 在第二块上
+            #    算出过 3510 窗口,而本批只带了 2342 行。
             start = item.offset
             left = item.num_tokens
             # ---- 部分消费:已算过的前缀要跳过,但**不能改 item 的几何** ----
@@ -669,21 +632,6 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 # 这一段还一行都没到,或已经算完:本步不给行。
                 continue
             n = min(available, room)
-            # ---- 与原生块对齐(否则原生会把窗口再截一次)----
-            # 原生在 prefill 阶段做块对齐切分:只要**算完这一窗后还没越过
-            # 最后一个整块**(``num_computed + n < num_tokens - num_tokens %
-            # BS``),它就把 ``n`` 向下取整到 BS 的倍数。我们按"整块倍数"下发,
-            # 这个取整就成了恒等变换,窗口与原生实际排程量必然一致;
-            # 反之未对齐的窗口会被原生悄悄削掉尾巴(真机实录 1108 → 1080),
-            # 让"原生已算量"落在块内部,下一步对账全部错位。
-            # 整条剩余 prompt 可以一次装下时**不要**取整:那正是原生不取整的
-            # 情形(它要"把最后几行一起算掉"),取整反而会逼出一次多余的下发。
-            spans_all = n >= request.num_tokens - request.num_computed_tokens
-            if not spans_all and n > BS:
-                n = n // BS * BS
-                if n < 1:
-                    # 对齐后一行都不剩:留给下一步,且不占预算卡住后面的请求
-                    continue
             if n < available:
                 capped_by_budget = True
             if n < 1:
@@ -696,16 +644,17 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 break
         reason = (
             "none" if not windows
-            else ("kv" if kv_rows <= cfg_room else "cfg")
+            else ("budget" if capped_by_budget else "cfg")
         )
-        if capped_by_budget:
-            reason = f"{reason}+budget"
+        # 注:原生少排(块对齐截尾、KV 分配失败)是合法的 —— 窗口经
+        # ``lwd_window_cap`` 逐请求挂上界,原生在自己的预算/对齐规则内
+        # 自由截短,下一步按 num_computed 重算即可,无需对齐核验。
         # 日志里把三个量都摊开:到达量、本 chunk 长度、最终窗口。真机上
         # "窗口 > 本批实际行数"就是从这里看出来的(avail 曾是跨 chunk 累计值),
         # 只打 windows 看不出这层关系。
         logger.info(
             "[Lwd][host-stage] WINDOW seqno=%d windows=%s avail=%s chunk=%s "
-            "room_left=%d decode_exact=%d decode_blocks=%d free=%d reason=%s",
+            "room_left=%d decode_exact=%d reason=%s",
             notify.seqno, windows,
             [
                 int(ledger.get(it.request_id, 0))
@@ -713,8 +662,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 for it in windowed
             ],
             [it.num_tokens for it in windowed],
-            room, decode_exact, decode_blocks,
-            self.kv_cache_manager.block_pool.get_num_free_blocks(), reason,
+            room, decode_exact, reason,
         )
         return windows, windowed, eff_starts, decode_exact, room, reason
 
@@ -815,17 +763,23 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         # 下发的行数绝不能超过**已到达**的行数:超了就会读 host 上还没写过的
         # 零值区,算出一批零 embedding 而**不报任何错**。这里逐请求核验
         #     native_scheduled ≤ recv_rows − consumed
-        # 并把"原生 prefill 总量 == Σwindows"一并核验(多排即越界)。
+        # 有 lwd_window_cap 在,它恒真,纯看门狗。**少排不核验**:原生在
+        # 自己的预算/块对齐/KV 规则内截短窗口是合法行为(KV 分配失败即
+        # waiting break,天然 defer),下一步按 num_computed 重算即可。
         self._lwd_verify_w2(out, notify, items, windows, decode_exact,
                             eff_starts)
         prefill_ids = [item.request_id for item in items]
         native_prefill = sum(
             int(out.num_scheduled_tokens.get(rid, 0)) for rid in prefill_ids
         )
-        if native_prefill != sum(windows):
-            raise RuntimeError(
-                f"[Lwd][cloud-sched] W2 violated seqno={notify.seqno}: "
-                f"native prefill={native_prefill} Σwindows={sum(windows)}"
+        if native_prefill < sum(windows):
+            # 合法但值得观测:几乎只在原生 KV 分配失败时出现 —— 这正是
+            # "KV 开始不够"的信号,比盯着 free 块数可靠。
+            logger.warning(
+                "[Lwd][cloud-sched] native under-scheduled seqno=%d: "
+                "native prefill=%d < Σwindows=%d (native-side truncation, "
+                "typically KV pressure; the remainder is retried next step)",
+                notify.seqno, native_prefill, sum(windows),
             )
         # 消费队首:abort 清扫(IO 线程)可能整体替换过 deque,按对象
         # 身份弹队首,避免错弹替换后的新队首。
