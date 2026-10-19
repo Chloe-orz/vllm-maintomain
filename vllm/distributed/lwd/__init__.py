@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""YAML adapter for the shared bootstrap world from LWD PR #33."""
+"""Read distributed initialization parameters from the LWD topology."""
 
 from typing import TYPE_CHECKING
 
@@ -13,16 +13,13 @@ if TYPE_CHECKING:
 
 
 def get_lwd_rank_groups(config: "LwdConfig") -> list[list[int]]:
-    if (
-        config.topology.deployment.scene != "single_instance"
-        or len(config.connections) != 1
-    ):
-        raise ValueError("[LWD] no-PP bootstrap requires single_instance DP=1")
-    connection = config.connections[0]
-    groups = [list(connection.edge.ranks), list(connection.cloud.ranks)]
-    if groups[0] + groups[1] != list(range(config.topology.deployment.hccl_world_size)):
-        raise ValueError("[LWD] bootstrap ranks must be contiguous, edge first")
-    return groups
+    if config.topology.deployment.scene != "single_instance":
+        raise ValueError("[LWD] no-PP bootstrap requires single_instance")
+    # Edge DPs share an allocation; each physical Worker joins the world once.
+    edge_groups = [connection.edge.ranks for connection in config.connections]
+    cloud_groups = [connection.cloud.ranks for connection in config.connections]
+    allocations = dict.fromkeys(edge_groups + cloud_groups)
+    return [list(ranks) for ranks in allocations]
 
 
 def get_lwd_init_method(config: "LwdConfig") -> str:
@@ -32,24 +29,33 @@ def get_lwd_init_method(config: "LwdConfig") -> str:
         raise ValueError("[LWD] VLLM_LWD_WIRE_STORE_PORT must be an integer") from exc
     if not 1 <= port <= 65535:
         raise ValueError("[LWD] VLLM_LWD_WIRE_STORE_PORT must be in [1, 65535]")
-    return get_distributed_init_method(config.connections[0].edge.addr, port)
+    root = next(
+        dp
+        for connection in config.connections
+        for dp in (connection.edge, connection.cloud)
+        if 0 in dp.ranks
+    )
+    return get_distributed_init_method(root.addr, port)
 
 
-def get_lwd_distributed_args(config: "VllmConfig", rank: int) -> tuple[int, int, str]:
-    lwd, parallel = config.lwd_config, config.parallel_config
-    assert lwd is not None
-    groups = get_lwd_rank_groups(lwd)
-    ranks = groups[0 if lwd.role == "edge" else 1]
-    if (
-        parallel.tensor_parallel_size != len(ranks)
-        or parallel.pipeline_parallel_size != 1
-        or parallel.data_parallel_size != 1
-        or parallel.prefill_context_parallel_size != 1
-        or parallel.decode_context_parallel_size != 1
-        or parallel.nnodes != 1
-        or parallel.enable_elastic_ep
-    ):
-        raise ValueError("[LWD] no-PP requires local TP=YAML ranks, PP=DP=PCP=DCP=1")
-    if not 0 <= rank < len(ranks):
-        raise ValueError("[LWD] local worker rank is outside its YAML allocation")
-    return sum(map(len, groups)), ranks[rank], get_lwd_init_method(lwd)
+def get_lwd_distributed_args(
+    config: "VllmConfig", tp_rank: int
+) -> tuple[int, int, str]:
+    """Map the executor's TP rank to the global rank assigned by YAML."""
+    lwd_config = config.lwd_config
+    parallel_config = config.parallel_config
+    assert lwd_config is not None
+    if lwd_config.topology.deployment.scene != "single_instance":
+        raise ValueError("[LWD] no-PP bootstrap requires single_instance")
+
+    dp_idx = parallel_config.data_parallel_index
+    ranks = lwd_config.instance.dp[dp_idx].ranks
+    if parallel_config.tensor_parallel_size != len(ranks):
+        raise ValueError("[LWD] local TP size must match YAML ranks")
+
+    global_rank = ranks[tp_rank]
+    return (
+        lwd_config.topology.deployment.hccl_world_size,
+        global_rank,
+        get_lwd_init_method(lwd_config),
+    )
