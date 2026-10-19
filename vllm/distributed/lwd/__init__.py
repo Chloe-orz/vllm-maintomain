@@ -4,13 +4,12 @@
 
 from typing import TYPE_CHECKING
 
+from vllm import envs
 from vllm.utils.network_utils import get_distributed_init_method
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.config.lwd import LwdConfig
-
-LWD_WIRE_STORE_PORT = 29600
 
 
 def get_lwd_rank_groups(config: "LwdConfig") -> list[list[int]]:
@@ -27,9 +26,13 @@ def get_lwd_rank_groups(config: "LwdConfig") -> list[list[int]]:
 
 
 def get_lwd_init_method(config: "LwdConfig") -> str:
-    return get_distributed_init_method(
-        config.connections[0].edge.addr, LWD_WIRE_STORE_PORT
-    )
+    try:
+        port = envs.VLLM_LWD_WIRE_STORE_PORT
+    except ValueError as exc:
+        raise ValueError("[LWD] VLLM_LWD_WIRE_STORE_PORT must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("[LWD] VLLM_LWD_WIRE_STORE_PORT must be in [1, 65535]")
+    return get_distributed_init_method(config.connections[0].edge.addr, port)
 
 
 def get_lwd_distributed_args(config: "VllmConfig", rank: int) -> tuple[int, int, str]:

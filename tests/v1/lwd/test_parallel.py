@@ -46,14 +46,33 @@ def config_for(role: str, edge: int = 1, cloud: int = 8) -> SimpleNamespace:
 @pytest.mark.parametrize(
     "role,rank,global_rank", [("edge", 0, 0), ("cloud", 0, 1), ("cloud", 7, 8)]
 )
+@pytest.mark.parametrize("port", [None, 29700])
 def test_both_sides_share_bootstrap_address_but_keep_local_device_rank(
-    role: str, rank: int, global_rank: int
+    role: str,
+    rank: int,
+    global_rank: int,
+    port: int | None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert get_lwd_distributed_args(config_for(role), rank) == (
+    monkeypatch.delenv("VLLM_LWD_WIRE_STORE_PORT", raising=False)
+    if port is not None:
+        monkeypatch.setenv("VLLM_LWD_WIRE_STORE_PORT", str(port))
+    config = config_for(role)
+    assert get_lwd_distributed_args(config, rank) == (
         9,
         global_rank,
-        "tcp://76.76.26.18:29600",
+        f"tcp://76.76.26.18:{port if port is not None else 29600}",
     )
+
+
+@pytest.mark.parametrize("port", ["0", "-1", "65536", "invalid", ""])
+def test_invalid_wire_store_env_fails_before_rendezvous(
+    port: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_LWD_WIRE_STORE_PORT", port)
+    with pytest.raises(ValueError, match="VLLM_LWD_WIRE_STORE_PORT"):
+        get_lwd_distributed_args(config_for("edge"), 0)
 
 
 @pytest.mark.parametrize(
