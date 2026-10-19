@@ -119,7 +119,7 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         故此处直接取。"""
         hint_mq = getattr(self.model_executor, "lwd_recv_hint_mq", None)
         if hint_mq is not None:
-            from vllm_ascend.distributed.lwd_pre_recv import (
+            from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
                 register_hint_sender,
             )
 
@@ -172,7 +172,7 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             # mrope positions 已随 RangeNotify 走控制面,UP 数据面只有
             # 主帧,aux_rows 恒 0——若残留非零,worker 会预挂一条永远收
             # 不到数据的 aux irecv,水位停摆、闸门后的批永不下发。
-            from vllm_ascend.distributed.lwd_pre_recv import (
+            from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
                 make_recv_hint,
                 post_irecv_hint,
             )
@@ -248,7 +248,7 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         done_mq = getattr(self.model_executor, "lwd_irecv_done_mq", None)
         if done_mq is None:
             return
-        from vllm_ascend.distributed.lwd_pre_recv import (
+        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
             record_irecv_completions,
         )
 
