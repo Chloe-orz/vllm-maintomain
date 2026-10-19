@@ -26,6 +26,7 @@ c = min(剩余, chunk 单元 C) 切块,批 = 续传 chunk 优先 + waiting FCFS
 
 from __future__ import annotations
 
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -70,7 +71,13 @@ _LWD_ADD_RETRY_INTERVAL_S = 0.2
 # 即该 chunk 已消费;未消费 chunk 数达到上限即停止新开 prefill——请求
 # 在边侧 waiting 攒批(picker FCFS 前缀天然组多请求批),云侧 pending
 # 排空后闸门自开。
-_LWD_MAX_PENDING_CHUNKS = 2
+# host 暂存后云侧把接收囤在 host pinned 上,闸门可以放宽:默认 6,
+# 可用 VLLM_ASCEND_LWD_MAX_PENDING_CHUNKS 覆盖;云侧在飞 recv 上限
+# (VLLM_ASCEND_LWD_MAX_INFLIGHT_RECV)必须不小于它,否则 recv 挂不满,
+# 闸门放宽不生效。
+_LWD_MAX_PENDING_CHUNKS = int(
+    os.environ.get("VLLM_ASCEND_LWD_MAX_PENDING_CHUNKS", "6")
+)
 
 
 class LwdEdgeScheduler(LwdBaseScheduler):
