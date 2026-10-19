@@ -504,28 +504,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 continue
             # _update_after_schedule 已乐观推进 num_computed,起点需回退本步量
             offset = request.num_computed_tokens - num_tokens
-            # 多模态:准入时预算了整 prompt positions 的请求,各 chunk
-            # 恒携带 mrope(key 在即恒真);[3,N] 切本 chunk 列并序列化
-            # 为原始字节随 item 走控制面(wire_version>=2,数据面 aux
-            # 帧已退役)
-            positions = self._lwd_mrope_positions_dict.get(request_id)
-            req_has_mrope = positions is not None
-            mrope_bytes = b""
-            if req_has_mrope:
-                assert positions is not None
-                mrope_bytes = (
-                    positions[:, offset : offset + num_tokens]
-                    .contiguous()
-                    .numpy()
-                    .tobytes()
-                )
+            # mrope positions 自 wire_version 3 起随 LwdRequestNotify 全量
+            # 一次下发,不再按 chunk 切列携带(云侧调度已改为 arrival 驱动,
+            # 无 chunk 概念);has_mrope 标记保留(诊断/日志用),字节留空。
+            req_has_mrope = request_id in self._lwd_mrope_positions_dict
             items.append(
                 LwdRangeItem(
                     request_id=request_id,
                     offset=offset,
                     num_tokens=num_tokens,
                     has_mrope=req_has_mrope,
-                    mrope_positions=mrope_bytes,
+                    mrope_positions=b"",
                 )
             )
             req_ids.append(request_id)
@@ -599,6 +588,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if publisher is None:
             return
         sp = sampling_params
+        # 全量 mrope positions(wire_version 3):准入时已按全 prompt 算好,
+        # 随元数据一次下发;云侧调度改为 arrival 驱动后不再按 chunk 携带。
+        mrope_bytes = b""
+        positions = self._lwd_mrope_positions_dict.get(request_id)
+        if positions is not None:
+            mrope_bytes = positions.numpy().tobytes()
         message = LwdRequestNotify(
             request_id=request_id,
             num_prompt_tokens=num_prompt_tokens,
@@ -606,6 +601,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 sp.max_tokens if sp is not None and sp.max_tokens is not None else 16
             ),
             block_hashes=block_hashes if block_hashes is not None else [],
+            mrope_positions=mrope_bytes,
             temperature=sp.temperature if sp is not None else 1.0,
             top_p=sp.top_p if sp is not None else 1.0,
             top_k=sp.top_k if sp is not None else 0,

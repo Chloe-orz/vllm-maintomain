@@ -285,18 +285,16 @@ class LwdCloudEngineCore(EngineCoreProc):
                 len(items), sum(item.num_tokens for item in items),
                 msg.seqno,
             )
-            # 每条预告都整条入队(重复预告即重复点名,剔除-调度-拼回幂等,
-            # 无副作用;PRE_OUT 只 append,调度主线程单独 popleft,deque
-            # 单操作原子;预告自带 seqno,出批时作 UP 链配对号)
-            self.scheduler.prefill_notify_queue.append(msg)
+            # wire_version 3 起调度改为 arrival 驱动:预告**不再入调度
+            # 队列**,只驱动数据面提前收(下面的 hint)。调度器按
+            # ``recv_rows > num_computed`` 自行决定给谁下发多少行。
             # [Lwd][pre-recv] 提前收①:预告到达即给云 worker 下发提示(seqno +
             # flat token 数),worker 的通信线程收到就挂精确尺寸的
             # UP irecv(主帧 hash 载荷) —— 不再等这个批的
             # SchedulerOutput 下发。num_tokens 取 items 逐条目之和
-            # (mixed 恒填 items;顶层字段只描述首条目)。mrope positions
-            # 已随 RangeNotify 走控制面(wire_version>=2),UP 数据面只有
+            # (mixed 恒填 items;顶层字段只描述首条目)。UP 数据面只有
             # 主帧,aux_rows 恒 0——若残留非零,worker 会预挂一条永远收
-            # 不到数据的 aux irecv,水位停摆、闸门后的批永不下发。
+            # 不到数据的 aux irecv,水位停摆。
             if self._lwd_early_recv:
                 from vllm_ascend.distributed.lwd_comm.pre_recv import (
                     make_recv_hint,
@@ -437,6 +435,7 @@ class LwdCloudEngineCore(EngineCoreProc):
             # worker 本地分配):35MB 零 buffer 走 MQ overflow 通道实测
             # 单程 240ms+,是 prefill SO 开工延迟的主因。
             request.lwd_embeds_placeholder = True
+            request.lwd_mrope_positions = wire.mrope_positions
             return request
         hash_block_size = resolve_kv_cache_block_sizes(
             self.scheduler.kv_cache_config, self.vllm_config
@@ -459,6 +458,7 @@ class LwdCloudEngineCore(EngineCoreProc):
             block_hasher=block_hasher,
         )
         request.lwd_embeds_placeholder = True  # 同上:占位 embeds 不上 MQ
+        request.lwd_mrope_positions = wire.mrope_positions
         return request
     
     def step_with_batch_queue(self):
@@ -486,10 +486,10 @@ class LwdCloudEngineCore(EngineCoreProc):
     def _lwd_drain_irecv_completions(self) -> None:
         """[Lwd][pre-recv] 提前收③:把 worker 上报的收完项并进水位(每步一次)。
 
-        云 worker 的通信线程每收完一条 UP recv 就上报 (channel, seqno);本处
-        在每步开头排空 done MQ,水位随即成为 PD_mix 闸门
-        (``_lwd_pre_recv_ready``) 的就绪判据 —— 收完的批本步就能下发,
-        没收完的本步只跑 decode。
+        云 worker 的通信线程每收完一条 UP recv 就上报 (channel, seqno +
+        逐请求已收行数);本处在每步开头排空 done MQ,把行数并进
+        ``_lwd_recv_rows`` 台账 —— arrival 驱动的调度器按它决定下一步
+        能给每个请求下发多少行。
         """
         done_mq = getattr(self.model_executor, "lwd_irecv_done_mq", None)
         if done_mq is None:

@@ -117,6 +117,11 @@ class NewRequestData:
     prompt_embeds_shape: tuple[int, ...] | None = None
     prompt_embeds_dtype: "torch.dtype | None" = None
     prompt_is_token_ids: list[bool] | None = None
+    # LWD 全量 mrope positions([3, prompt_len] int64 字节):由
+    # RequestNotify 透传进 Request,调度器在 new_reqs 里随 SO 带给
+    # runner,准入时一次性写入 req_state(替代按 chunk 切窗携带)。
+    # 纯文本/非 LWD 恒为空字节。
+    lwd_mrope_positions: bytes = b""
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None

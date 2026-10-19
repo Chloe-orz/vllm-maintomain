@@ -15,9 +15,12 @@ if TYPE_CHECKING:
 # 控制面协议版本:1 = mrope positions 经数据面 UP aux 帧([n,3] int64
 # 第二 P2P 载荷);2 = mrope positions 经控制面 LwdRangeItem.mrope_
 # positions 原始字节直传(数据面 aux 帧自 mrope 退役;aux 机制本身
-# 保留,供 deepstack 等大数据量载荷扩展)。两侧必须同版本部署:
-# msgspec 容忍未知字段,版本错配时旧端不会报错,只会 mrope 静默缺失。
-LWD_WIRE_VERSION = 2
+# 保留,供 deepstack 等大数据量载荷扩展);3 = 云侧调度改为按请求
+# arrival 驱动(RangeNotify 不再驱动调度,只驱动数据面提前收),
+# mrope positions 随 LwdRequestNotify 全量一次下发。两侧必须同版本
+# 部署:msgspec 容忍未知字段,版本错配时旧端不会报错,只会 mrope
+# 静默缺失。
+LWD_WIRE_VERSION = 3
 
 
 class LwdRangeItem(msgspec.Struct, gc=False):
@@ -85,6 +88,12 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):
     """结束符 id:边侧前端自 tokenizer 解析,云侧占位 prompt 无从
     得知,必须随预告透传;缺省 None = 云侧 EOS 判定落空,仅
     max_tokens 兜底(旧版边侧,additive 兼容)。"""
+
+    mrope_positions: bytes = b""
+    """全量 mrope positions(wire_version 3 起):[3, num_prompt_tokens]
+    int64 CPU 张量的连续字节流,边侧准入时一次算好、随请求预告一次
+    下发 —— 云侧调度按 arrival 驱动后不再按 chunk 携带。空 = 纯文本
+    请求(零路径变化)。"""
 
 
 class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):
