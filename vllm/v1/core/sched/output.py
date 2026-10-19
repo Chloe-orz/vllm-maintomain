@@ -98,13 +98,6 @@ class NewRequestData:
     num_computed_tokens: int
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
-    # LWD placeholder-embeds transport substitute: the request-side
-    # 35MB-scale all-zero buffer stays off the MQ (the overflow slow
-    # path measured 240ms+ one-way); only shape/dtype travel and the
-    # worker allocates locally. Both fields stay None for non-LWD
-    # requests, so behavior is unchanged.
-    prompt_embeds_shape: tuple[int, ...] | None = None
-    prompt_embeds_dtype: "torch.dtype | None" = None
     prompt_is_token_ids: list[bool] | None = None
 
     # Only used for v2 model runner.
@@ -118,7 +111,6 @@ class NewRequestData:
         prefill_token_ids: list[int] | None = None,
         uses_mrope: bool = False,
     ) -> "NewRequestData":
-        lwd_placeholder = getattr(request, "lwd_embeds_placeholder", False)
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
@@ -132,19 +124,7 @@ class NewRequestData:
             block_ids=block_ids,
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
-            prompt_embeds=(
-                None if lwd_placeholder else request.prompt_embeds
-            ),
-            prompt_embeds_shape=(
-                tuple(request.prompt_embeds.shape)
-                if lwd_placeholder and request.prompt_embeds is not None
-                else None
-            ),
-            prompt_embeds_dtype=(
-                request.prompt_embeds.dtype
-                if lwd_placeholder and request.prompt_embeds is not None
-                else None
-            ),
+            prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
         )
