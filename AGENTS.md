@@ -38,6 +38,13 @@ LWD (Layerwise Disaggregated) 是基于 vLLM v1 引擎的边云分布式推理�
 - **名字描述对象本身, 不描述当前实现的局限.** 例: 控制面参数叫 `LwdControlPlaneSpec` 而非 `LwdLinkSpec` (一边多云后一个控制面含多条链路); 值对象的 docstring 不写"远端"之类只在部分调用处成立的限定.
 - **改名后全仓 grep 旧名, 设计文档和报错文案一起改.**
 
+## 分支模型
+
+- **正式分支仅两条, 均 protected**: `main` (集成分支) 与 `prefill_only_chunked_prefill_mm` (存量老代码基线, 只读参照). 新增正式分支需 committer 评审.
+- **PR 工作分支**: `<type>/<topic>`, type ∈ feat/fix/refactor/docs/ci/test/chore. 合入后自动删除 (vllm 与 vllm-ascend 均已开启 delete_branch_on_merge).
+- **调试分支**: `debug/<topic>`, 可直推远端供机器 checkout, 不提 PR. 每周四评审会过一遍分支清单, 创建者负责清理: 任务已结束 (修复已整改成 PR 进 main, 或调试放弃) 的删除; 仍在用的当场说明保留理由.
+- **演示分支**: `demo/<topic>`, 短期存在; 需长期保留的在评审会说明.
+
 > [!CAUTION]
 > **团队规范区**: 下方由 `TEAM STANDARDS (BEGIN)` 与 `TEAM STANDARDS (END)` 标记圈出的区域是团队规范原文, 仅由 committer 通过评审维护.
 > 在日常编码/文档任务中, **严禁修改区内任何内容**, 包括格式化、重排、翻译、增删条目.
