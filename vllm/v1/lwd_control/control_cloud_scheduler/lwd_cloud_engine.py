@@ -162,6 +162,11 @@ class LwdCloudEngineCore(EngineCoreProc):
         self._lwd_announce()
         # 门池:元数据查重与暂存,到达即构建放行;仅本 IO 线程独占
         self._lwd_gate_pending: dict[str, LwdRequestNotify] = {}
+        # 逐请求 prompt 全长(IO 线程本地台账,供 recv hint 的 prompt_lens)。
+        # **绝不**在 IO 线程上读 scheduler.requests:ADD 经 input_queue 异步
+        # 落地,RangeNotify 先于 ADD 是常态(并发下 input_queue 积压),
+        # 直读会 KeyError 打死本线程、控制面停摆(真机实录:并发卡死)。
+        self._lwd_prompt_lens: dict[str, int] = {}
         # [host 暂存 / design v7 §5.2] 逐请求"已收行数"台账:worker 在 D2H
         # 完成时随水位上报捎带过来,调度器按它决定下一步能给这个请求下发多少
         # 行(§5.3 的 min(已收−已算, 预算))。引用交付调度器(IO 线程写 /
@@ -316,11 +321,22 @@ class LwdCloudEngineCore(EngineCoreProc):
                 prompt_offsets = [item.offset for item in items]
                 # 逐请求 prompt 全长:暂存池按它在首个 chunk 就把
                 # per-request host buffer 一次分够(消灭扩容及其与在飞
-                # D2H 的竞态)。
+                # D2H 的竞态)。取自 IO 线程本地台账(元数据先于预告到达,
+                # 协议保证);缺失是协议错误,跳过本条提示 —— 消费点会以
+                # SO meta 兜底补挂,提前收只是少赚一拍,不致命。
                 prompt_lens = [
-                    self.scheduler.requests[item.request_id].num_prompt_tokens
-                    for item in items
+                    self._lwd_prompt_lens.get(rid, 0) for rid in req_ids
                 ]
+                if any(n <= 0 for n in prompt_lens):
+                    logger.error(
+                        "[Lwd][pre-recv] HINT seqno=%d skipped: missing "
+                        "prompt_lens for %s (RangeNotify before metadata — "
+                        "protocol violation)",
+                        msg.seqno,
+                        [r for r in req_ids
+                         if self._lwd_prompt_lens.get(r, 0) <= 0],
+                    )
+                    return
                 # 先打点再入队:worker 通信线程 0.5ms 就能取走,若打点在入队之后,
                 # 跨进程写日志的次序会让 hint2sub 出现负值,看着像时序错乱。
                 logger.info(
@@ -342,6 +358,7 @@ class LwdCloudEngineCore(EngineCoreProc):
             logger.info("[Lwd][cloud-ctrl] AbortNotify req=%s", msg.request_id)
             self._lwd_gate_pending.pop(msg.request_id, None)
             self._lwd_seqno_registry.pop(msg.request_id, None)
+            self._lwd_prompt_lens.pop(msg.request_id, None)
             # 预告队列**不改**:该请求已预告的 chunk 数据已在线上,必须由
             # 调度器先算完再终结(见 LwdBaseScheduler.finish_requests);
             # "请求已不存在"时的条目清理也在那里做。
@@ -355,6 +372,9 @@ class LwdCloudEngineCore(EngineCoreProc):
             return
         logger.info("[Lwd][cloud-ctrl] RequestNotify req=%s", rid)
         self._lwd_gate_pending[rid] = msg
+        # prompt 全长入本地台账:recv hint 的 prompt_lens 从这里取(IO 线程
+        # 读 scheduler.requests 会踩 ADD 未落地的坑,见 __init__ 注释)。
+        self._lwd_prompt_lens[rid] = msg.num_prompt_tokens
         self._lwd_promote(rid)
 
     def _lwd_promote(self, request_id: str) -> None:
@@ -559,6 +579,13 @@ class LwdCloudEngineCore(EngineCoreProc):
         边侧按 num_accepted 取有效前缀。"""
         # [Lwd][perf] cloud-step dt 已由 exec 时长替代(见 step_with_batch_queue
         # 覆写):开始执行→执行结束,不含无请求的空等。
+        # prompt_lens 台账随请求完结清账(防长跑泄漏;abort 路径另有一处)。
+        for outputs in engine_core_outputs.values():
+            for rid in outputs.finished_requests or ():
+                self._lwd_prompt_lens.pop(rid, None)
+            for out in outputs.outputs:
+                if out.finish_reason is not None:
+                    self._lwd_prompt_lens.pop(out.request_id, None)
         carrier = getattr(model_output, "lwd_down_carrier", None)
         if carrier is not None:
             pinned, req_ids, hidden_numel, seqno = carrier
