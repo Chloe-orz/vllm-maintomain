@@ -2,7 +2,7 @@ name: LWD Checklist
 
 on:
   workflow_run:
-    workflows: [LWD Fast, LWD Slow]
+    workflows: [LWD Fast]
     types: [completed]
 
 concurrency:
