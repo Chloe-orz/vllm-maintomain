@@ -831,6 +831,10 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 prompt_offsets=[item.offset for item in items],
                 has_mrope=[item.has_mrope for item in items],
                 mrope_positions=[item.mrope_positions for item in items],
+                prompt_lens=[
+                    self.requests[item.request_id].num_prompt_tokens
+                    for item in items
+                ],
             ),
         )
         return out

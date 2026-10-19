@@ -63,6 +63,9 @@ class LwdEmbedBatch:
     prompt_offsets: list[int] = field(default_factory=list)
     has_mrope: list[bool] = field(default_factory=list)
     mrope_positions: list[bytes] = field(default_factory=list)
+    # 逐请求的 prompt 总行数(消费点补挂 recv 时,暂存池按它把 per-request
+    # host buffer 一次分够全长 —— 提示(hint)路径丢失时的权威兜底)。
+    prompt_lens: list[int] = field(default_factory=list)
 
     # ------------------------------------------------------------------ #
     # 已 abort 的请求(跨进程捎带,design v7 §6.4)                        #

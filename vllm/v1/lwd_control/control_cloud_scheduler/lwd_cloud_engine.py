@@ -314,6 +314,13 @@ class LwdCloudEngineCore(EngineCoreProc):
                 req_ids = [item.request_id for item in items]
                 rows = [item.num_tokens for item in items]
                 prompt_offsets = [item.offset for item in items]
+                # 逐请求 prompt 全长:暂存池按它在首个 chunk 就把
+                # per-request host buffer 一次分够(消灭扩容及其与在飞
+                # D2H 的竞态)。
+                prompt_lens = [
+                    self.scheduler.requests[item.request_id].num_prompt_tokens
+                    for item in items
+                ]
                 # 先打点再入队:worker 通信线程 0.5ms 就能取走,若打点在入队之后,
                 # 跨进程写日志的次序会让 hint2sub 出现负值,看着像时序错乱。
                 logger.info(
@@ -327,6 +334,7 @@ class LwdCloudEngineCore(EngineCoreProc):
                         msg.seqno, num_tokens, aux_rows,
                         req_ids=req_ids, rows=rows,
                         prompt_offsets=prompt_offsets,
+                        prompt_lens=prompt_lens,
                     )
                 )
             return
