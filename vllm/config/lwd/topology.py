@@ -67,6 +67,23 @@ class LwdFeatures:
     enable_scramble: StrictBool = False
 
 
+LwdPositiveSeconds = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
+
+
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class LwdControlPlaneConfig:
+    """Edge-cloud control link tunables, shared by every instance."""
+
+    send_queue_max: Annotated[int, Field(strict=True, ge=1)] = 1000
+    """Outbound messages buffered per DP rank before sending reports
+    backpressure."""
+    hello_retry_interval_s: LwdPositiveSeconds = 5.0
+    """Seconds between edge registration attempts until the cloud answers."""
+    handshake_timeout_s: LwdPositiveSeconds = 1800.0
+    """Seconds an edge waits for its cloud; must cover a full cloud engine
+    startup (weights, KV cache, graph capture)."""
+
+
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LwdCoordination:
     """Prefix-cache coordination block, embedded per instance for cloud_share."""
@@ -80,9 +97,9 @@ class LwdCoordination:
     listen_host: LwdString = "0.0.0.0"
     listen_port: LwdPort = 8100
     # Shared
-    connect_timeout: Annotated[
-        float, Field(strict=True, gt=0, allow_inf_nan=False)
-    ] = 10.0
+    connect_timeout: Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)] = (
+        10.0
+    )
 
     @field_validator("control_url")
     @classmethod
@@ -145,6 +162,7 @@ class LwdTopology:
     edges: Annotated[tuple[LwdInstance, ...], Field(min_length=1)]
     clouds: Annotated[tuple[LwdInstance, ...], Field(min_length=1)]
     instance_links: Annotated[tuple[LwdLink, ...], Field(min_length=1)]
+    control_plane: LwdControlPlaneConfig = Field(default_factory=LwdControlPlaneConfig)
     digest: str = Field(default="", init=False)
     """First 16 hex characters of the source file digest; empty for from_dict."""
 

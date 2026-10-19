@@ -1,28 +1,93 @@
-"""边/云引擎公共基类:调度器注入时序、配置挂载与收发两面生命周期,
-接收线程消息入口与 has_work 状态转换日志的公共骨架。"""
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""Common base of the LWD edge and cloud engine cores: scheduler injection,
+the control plane of the DP rank and the hand-over of its IO thread events to
+the engine thread."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
+import msgspec
+
 from vllm.lwd_logger import lwd_logger
+from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
+    LwdControlPlane,
+    LwdControlSender,
+)
+from vllm.v1.lwd_control.lwd_comm.lwd_control_plane_factory import (
+    lwd_create_control_plane,
+)
+from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
+from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
+    LwdMessage,
+    lwd_encode_message,
+)
+
+
+@dataclass(frozen=True)
+class _LwdPeerUp:
+    """`WAKEUP` payload: `peer` completed the control plane handshake."""
+
+    peer: LwdPeer
+
+
+@dataclass(frozen=True)
+class _LwdControlPlaneFailed:
+    """`EXECUTOR_FAILED` payload naming the control plane as the cause."""
+
+    reason: str
+
+
+class _LwdEngineListener:
+    """Control plane callbacks (IO thread), forwarded to the engine."""
+
+    def __init__(self, engine: LwdBaseEngineCore) -> None:
+        self._engine = engine
+
+    def on_peer_up(self, peer: LwdPeer) -> None:
+        # The sender belongs to the engine thread, so registration is handled
+        # there; input_queue FIFO puts it before any request from `peer`.
+        self._engine.input_queue.put_nowait(
+            (EngineCoreRequestType.WAKEUP, _LwdPeerUp(peer))
+        )
+
+    def on_message(self, peer: LwdPeer, payload: bytes) -> None:
+        try:
+            self._engine._lwd_on_payload(peer, payload)
+        except Exception as e:
+            # Keep the IO thread alive; the engine fails on its own thread.
+            lwd_logger.exception("[comm] handling a payload from %s failed", peer)
+            self._engine._lwd_fail(f"handling a payload from {peer}: {e!r}")
+
+    def on_fatal(self, reason: str) -> None:
+        # The plane has logged the crash.
+        self._engine._lwd_fail(reason)
 
 
 class LwdBaseEngineCore(EngineCoreProc):
-    """边/云 EngineCore 公共基类。
+    """EngineCoreProc of an LWD edge or cloud.
 
-    子类经 lwd_scheduler_cls 声明调度器类;注入必须发生在 super() 之前
-    (super 构建 scheduler 时一次性消费 scheduler_cls,后设无效)。
-    收发两面构造前为 None,关停容忍未建。上游 EngineCore 会对无 KV
-    cache 组的部署禁用 chunked prefill,而 LWD 边侧 chunk 是纯调度
-    记账(执行层只 embed 切片),构造后恢复使开关仅作用于 LWD 引擎。"""
+    Subclasses declare `lwd_scheduler_cls`, injected before `super()`, which
+    builds the scheduler from `scheduler_cls` once. Upstream disables chunked
+    prefill for deployments without KV cache groups, while LWD edge chunks are
+    pure scheduling bookkeeping, so it is restored for LWD engines afterwards.
+    `_lwd_assemble` then sets up the role and starts the control plane; READY
+    has already reached the frontend by then.
+    """
 
     lwd_scheduler_cls: type
 
-    def __init__(self, *args, **kwargs) -> None:
-        self._lwd_publisher = None
-        self._lwd_subscriber = None
-        # has_work 三态上次快照(仅状态转换时打日志;None = 尚未打点)
-        self._lwd_last_has_work_state = None
+    def __init__(self, *args: Any, lwd_dp_size: int, **kwargs: Any) -> None:
+        self._lwd_dp_size = lwd_dp_size
+        self._lwd_control_plane: LwdControlPlane | None = None
+        self._lwd_sender: LwdControlSender | None = None
+        # has_work state at the last transition log; None = not logged yet.
+        self._lwd_last_has_work_state: tuple[bool, bool, bool] | None = None
         vllm_config = kwargs["vllm_config"]
         scheduler_config = vllm_config.scheduler_config
         scheduler_config.scheduler_cls = self.lwd_scheduler_cls
@@ -31,33 +96,93 @@ class LwdBaseEngineCore(EngineCoreProc):
         if not scheduler_config.enable_chunked_prefill and chunked_prefill_wanted:
             scheduler_config.enable_chunked_prefill = True
         self.lwd_config = vllm_config.lwd_config
+        try:
+            self._lwd_assemble()
+        except BaseException:
+            # run_engine_core never gets this engine to shut down, so release
+            # the executor and the control plane before failing startup.
+            self.shutdown()
+            raise
 
-    def _lwd_shutdown_comm(self) -> None:
-        """两面关停(幂等,容忍未建):subscriber 先关断输入。"""
-        if self._lwd_subscriber is not None:
-            self._lwd_subscriber.shutdown()
-        if self._lwd_publisher is not None:
-            self._lwd_publisher.shutdown()
+    def _lwd_assemble(self) -> None:
+        """Role setup once the engine is built, including the control plane."""
+        raise NotImplementedError
+
+    def _lwd_start_control_plane(self) -> LwdControlPlane:
+        """Start this DP rank's control plane; the calling (engine) thread
+        owns its sender."""
+        dp_rank = self.vllm_config.parallel_config.data_parallel_index
+        plane = lwd_create_control_plane(self.lwd_config, dp_rank, self._lwd_dp_size)
+        self._lwd_control_plane = plane
+        self._lwd_sender = plane.start(_LwdEngineListener(self))
+        lwd_logger.info(
+            "[comm] control plane dp%d/%d started on %s",
+            dp_rank,
+            self._lwd_dp_size,
+            plane.endpoint,
+        )
+        return plane
+
+    def _lwd_send(self, peer: LwdPeer, message: LwdMessage) -> bool:
+        """Queue `message` for `peer`; False when the outbound queue is full."""
+        assert self._lwd_sender is not None, "control plane not started"
+        return self._lwd_sender.send(peer, lwd_encode_message(message))
+
+    def _lwd_fail(self, reason: str) -> None:
+        """Any thread: fail the engine on the engine thread, where
+        run_engine_core logs the failure. Callers log the cause."""
+        self.input_queue.put_nowait(
+            (EngineCoreRequestType.EXECUTOR_FAILED, _LwdControlPlaneFailed(reason))
+        )
 
     # ------------------------------------------------------------------ #
-    # 接收线程消息公共入口                                                #
+    # IO thread message entry                                            #
     # ------------------------------------------------------------------ #
-    def _lwd_on_message(self, msg) -> None:
-        """接收线程消息统一入口:子类 _lwd_dispatch_message 分派,返回
-        False 的未知帧统一告警丢弃(两侧引擎不再各写一份)。"""
-        if not self._lwd_dispatch_message(msg):
-            lwd_logger.warning("[comm] drop unexpected frame %r", type(msg))
+    def _lwd_on_payload(self, peer: LwdPeer, payload: bytes) -> None:
+        """Common entry of received payloads: `_lwd_dispatch_message` handles
+        them; malformed payloads and unknown types are dropped here with a
+        warning."""
+        try:
+            msg = self._lwd_decode(payload)
+        except (msgspec.DecodeError, msgspec.ValidationError) as e:
+            lwd_logger.warning("[comm] drop malformed payload from %s: %s", peer, e)
+            return
+        if not self._lwd_dispatch_message(peer, msg):
+            lwd_logger.warning(
+                "[comm] drop unexpected frame %r from %s", type(msg), peer
+            )
 
-    def _lwd_dispatch_message(self, msg) -> bool:
-        """子类分派钩子:True = 已处理;False = 未知帧(入口告警丢弃)。"""
-        return False
+    def _lwd_decode(self, payload: bytes) -> LwdMessage:
+        """Decode a payload sent by the peer role."""
+        raise NotImplementedError
+
+    def _lwd_dispatch_message(self, peer: LwdPeer, msg: LwdMessage) -> bool:
+        """IO thread; must not block. True = handled, False = unknown."""
+        raise NotImplementedError
+
+    def _lwd_handle_peer_registered(self, peer: LwdPeer) -> None:
+        """Engine thread: `peer` completed the handshake."""
 
     # ------------------------------------------------------------------ #
-    # 引擎接口覆写                                                        #
+    # Engine interface overrides                                         #
     # ------------------------------------------------------------------ #
+    def _handle_client_request(
+        self, request_type: EngineCoreRequestType, request: Any
+    ) -> None:
+        if request_type == EngineCoreRequestType.WAKEUP and isinstance(
+            request, _LwdPeerUp
+        ):
+            self._lwd_handle_peer_registered(request.peer)
+        elif request_type == EngineCoreRequestType.EXECUTOR_FAILED and isinstance(
+            request, _LwdControlPlaneFailed
+        ):
+            raise RuntimeError(f"[LWD] control plane failed: {request.reason}")
+        else:
+            super()._handle_client_request(request_type, request)
+
     def has_work(self) -> bool:
-        """原生三源判定 + 状态转换日志(lwd_logger,VLLM_LWD_LOG_LEVEL
-        独立控级,默认静默)。"""
+        """Native three-source check, logging its transitions (lwd_logger,
+        level VLLM_LWD_LOG_LEVEL, silent by default)."""
         state = (
             self.engines_running,
             self.scheduler.has_requests(),
@@ -72,5 +197,7 @@ class LwdBaseEngineCore(EngineCoreProc):
         return any(state)
 
     def shutdown(self) -> None:
-        self._lwd_shutdown_comm()
+        # Also reached after a failed assembly, before the plane exists.
+        if self._lwd_control_plane is not None:
+            self._lwd_control_plane.shutdown()
         super().shutdown()
