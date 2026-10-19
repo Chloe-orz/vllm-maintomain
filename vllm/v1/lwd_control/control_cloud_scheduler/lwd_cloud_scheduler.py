@@ -243,10 +243,10 @@ class LwdCloudScheduler(LwdBaseScheduler):
 
     def _lwd_up_recv_complete(self, notify: LwdRangeNotify) -> bool:
         """提前收闸门:该 seqno 的 UP 数据收完才放行;判据 = 通道水位(FIFO 完成序)。"""
-        from vllm_ascend.distributed.lwd_comm.pre_recv import (
+        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
             is_irecv_complete,
         )
-        from vllm_ascend.distributed.lwd_comm.types import LwdChannelType
+        from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 
         ready = is_irecv_complete(LwdChannelType.UP, notify.seqno)
         # [Lwd][pre-recv] 闸门读数:与 HINT/SUBMIT/DONE/REPORT/POST 用同一单调钟,

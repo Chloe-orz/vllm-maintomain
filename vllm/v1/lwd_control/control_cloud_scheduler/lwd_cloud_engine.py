@@ -119,7 +119,7 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         故此处直接取。"""
         hint_mq = getattr(self.model_executor, "lwd_recv_hint_mq", None)
         if hint_mq is not None:
-            from vllm_ascend.distributed.lwd_comm.pre_recv import (
+            from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
                 register_hint_sender,
             )
 
@@ -172,7 +172,7 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             # mrope positions 已随 RangeNotify 走控制面,UP 数据面只有
             # 主帧,aux_rows 恒 0——若残留非零,worker 会预挂一条永远收
             # 不到数据的 aux irecv,水位停摆、闸门后的批永不下发。
-            from vllm_ascend.distributed.lwd_comm.pre_recv import (
+            from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
                 make_recv_hint,
                 post_irecv_hint,
             )
@@ -194,18 +194,21 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         super().shutdown()
 
     def _lwd_build_request(self, req_notify: LwdRequestNotify) -> Request:
-        """请求构建(唯一建请求点):采样参数自请求预告重建 + 占位零值
-        embeds(prompt 长度即行数,UP 注入直接写该缓冲窗口)。前缀缓存
-        哈希链未随控制面移植(功能另上,届时再挂 block_hasher)。"""
+        """请求构建(唯一建请求点):采样参数自请求预告重建 + 占位 meta
+        embeds(仅形状无 storage,prompt 长度即行数;worker 侧按 is_meta
+        本地重建零缓冲,UP 注入直接写该缓冲窗口)。前缀缓存哈希链未随
+        控制面移植(功能另上,届时再挂 block_hasher)。"""
         sampling_params = self._lwd_build_sampling_params(req_notify)
-        # 不传真实 ids 也不造占位:按原生 prompt-embeds 语义挂零缓冲,
+        # 不传真实 ids 也不造占位:按原生 prompt-embeds 语义挂 meta 占位
+        # (空 storage,pickle 只带元信息,不触 MQ overflow 慢通道),
         # 行数即 prompt 长度;ids=None 时 input_batch 自动把 prompt 段
         # is_token_ids 置 False,M-RoPE 走纯文本直通构造(与扫描结果
         # 逐值一致)。
-        prompt_embeds = torch.zeros(
+        prompt_embeds = torch.empty(
             req_notify.num_prompt_tokens,
             self.vllm_config.model_config.get_hidden_size(),
             dtype=self.vllm_config.model_config.dtype,
+            device="meta",
         )
         request = Request(
             request_id=req_notify.request_id,
@@ -214,10 +217,6 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             sampling_params=sampling_params,
             pooling_params=None,
         )
-        # 占位 embeds 不随 SO 上传运输层(NewRequestData 只带形状,
-        # worker 本地分配):35MB 零 buffer 走 MQ overflow 通道实测
-        # 单程 240ms+,是 prefill SO 开工延迟的主因。
-        request.lwd_embeds_placeholder = True
         return request
 
     @staticmethod
@@ -249,7 +248,7 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         done_mq = getattr(self.model_executor, "lwd_irecv_done_mq", None)
         if done_mq is None:
             return
-        from vllm_ascend.distributed.lwd_comm.pre_recv import (
+        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
             record_irecv_completions,
         )
 
