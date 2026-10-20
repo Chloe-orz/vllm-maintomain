@@ -236,9 +236,8 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         ]
 
     # ------------------------------------------------------------------ #
-    # notify 条目分类与 preflight                                          #
+    # 调度主体(arrival 驱动,design v8)                                    #
     # ------------------------------------------------------------------ #
-    @staticmethod
     def _schedule_impl(self) -> SchedulerOutput:
         # (2) 收集 decode 集(判据:prompt 已算完 = 可采样)。
         decode_ids = self._lwd_collect_decode_requests()
