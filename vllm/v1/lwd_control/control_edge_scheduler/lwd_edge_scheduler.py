@@ -65,11 +65,13 @@ logger = init_logger(__name__)
 _LWD_ADD_RETRY_STEPS = 5
 _LWD_ADD_RETRY_INTERVAL_S = 0.2
 
-# 云侧 pending 上限,按未消费 chunk(seqno)计:一条 seqno = 一个云步
-# 消费单位。边侧记录 seqno -> 批内请求列表,批内全部请求收到首 token
-# 即该 chunk 已消费;未消费 chunk 数达到上限即停止新开 prefill——请求
-# 在边侧 waiting 攒批(picker FCFS 前缀天然组多请求批),云侧 pending
-# 排空后闸门自开。
+# 云侧 pending 上限,按未消费 chunk 计:一条 (engine, seqno) = 一个云步
+# 消费单位(seqno 流 per-engine,单靠 seqno 会跨 engine 撞号)。边侧记录
+# (engine, seqno) -> 批内请求列表,批内全部请求收到首 token 即该 chunk
+# 已消费;计数**每个 engine 各持一份**,某 engine 未消费数达到上限只停
+# 它对这一 engine 新开 prefill(其他 engine 不受影响)——请求在边侧
+# waiting 攒批(picker FCFS 前缀天然组多请求批),该 engine pending 排空
+# 后闸门自开。
 _LWD_MAX_PENDING_CHUNKS = 2
 
 
@@ -376,7 +378,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         schedule 调用(批队列深度循环)天然产出 per-engine 子批。"""
         req_ids, expected, cap = self._lwd_pick_prefill_batch(engine)
         if req_ids:
-            logger.info(
+            logger.debug(
                 "[Lwd][edge-sched] pick batch reqs=%s tokens=%d cap=%d",
                 req_ids, sum(expected.values()), cap,
             )

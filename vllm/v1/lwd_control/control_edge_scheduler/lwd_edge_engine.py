@@ -412,11 +412,12 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 )
                 prefill_work = True
                 h_emb += 1
-            logger.info(
-                "[Lwd][sched] edge harvest kind=%s seqno=%s wait=%.2fms",
-                kind, self._lwd_batch_seqno(kind, payload),
-                (time.monotonic() - t_dispatch) * 1000,
-            )
+            wait_ms = (time.monotonic() - t_dispatch) * 1000
+            if wait_ms > 1.0:
+                logger.info(
+                    "[Lwd][sched] edge harvest kind=%s seqno=%s wait=%.2fms",
+                    kind, self._lwd_batch_seqno(kind, payload), wait_ms,
+                )
         d_emb = 0
         while (len(self._lwd_batch_queue) < LWD_EDGE_BATCH_QUEUE_DEPTH
                and self.scheduler.has_requests()):
@@ -433,12 +434,14 @@ class LwdEdgeEngineCore(EngineCoreProc):
             d_emb += 1
         d_unemb = self._lwd_edge_consume_c2e()
         n_emb, n_unemb = self._lwd_queue_mix()
-        logger.info(
-            "[Lwd][sched] edge step harvest_emb=%d harvest_unemb=%d "
-            "disp_emb=%d disp_unemb=%d queue=%demb/%dunemb c2e_pending=%d",
-            h_emb, h_unemb, d_emb, d_unemb, n_emb, n_unemb,
-            self.lwd_c2e_meta_queue.qsize(),
-        )
+        if (prefill_work or outputs or h_emb or h_unemb
+                or d_emb or d_unemb):
+            logger.info(
+                "[Lwd][sched] edge step harvest_emb=%d harvest_unemb=%d "
+                "disp_emb=%d disp_unemb=%d queue=%demb/%dunemb c2e_pending=%d",
+                h_emb, h_unemb, d_emb, d_unemb, n_emb, n_unemb,
+                self.lwd_c2e_meta_queue.qsize(),
+            )
         if outputs:
             step_outputs = EngineCoreOutputs(
                 outputs=outputs,

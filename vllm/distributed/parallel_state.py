@@ -1766,14 +1766,28 @@ def initialize_model_parallel(
 
     # Lwd 边云模式:边云 rank 数不对称(边共享单实例 + 每云 engine 一组),
     # 排不进原生的均匀 rank 网格,按 Lwd 布局直接构建各并行组后返回。
-    # 布局(以边 1 + 云 2 引擎各 4 卡、cloud_dp=2、world=9 为例):
-    #   TP: [[0], [1,2,3,4], [5,6,7,8]]  边单例;每 engine 4 卡合切一份权重
-    #   PP: [[0,1], [0,5], [2], [3], ...]  边 rank0 与每 engine 首卡成两段
-    #                               流水线对,其余 rank 单例(边 rank0 属于
-    #                               全部 M 对,运行期 PP 操作在 LWD 下不走)
+    #
+    # 通用布局(world = E + M*C,rank 区间):
+    #   rank [0, E)                 边(单实例,通常 E=1)
+    #   rank [E+i*C, E+(i+1)*C)     云 engine i 的 TP 组(i = 0..M-1)
+    # 分组规则:
+    #   TP: 边一组 [0..E-1];每 engine 一组
+    #   PP: M 对 [0, E+i*C], 其余 rank 单例
+    #   DP: 边一组;云各 engine 同位 rank 一组
+    #   EP(仅 MoE): 边一组;全部云 rank 一组
     #   DCP/PCP: 全单例
-    #   DP: 边单例;云各 engine 同位 rank 一组 [[1,5], [2,6], ...]
-    #   EP(仅 MoE): [[0], [1..8]]   边一组;全部云 rank 一组(跨 engine)
+    #
+    # 例 1: 边 1 + 云 1 engine × 4 卡,world=5
+    #   TP: [[0], [1,2,3,4]]
+    #   PP: [[0,1], [2], [3], [4]]
+    #   DP: [[0], [1], [2], [3], [4]]
+    #   EP: [[0], [1,2,3,4]]
+    # 例 2: 边 1 + 云 2 engine × 4 卡,world=9
+    #   TP: [[0], [1,2,3,4], [5,6,7,8]]
+    #   PP: [[0,1], [0,5], [2], [3], [4], [6], [7], [8]]
+    #   DP: [[0], [1,5], [2,6], [3,7], [4,8]]
+    #   EP: [[0], [1,2,3,4,5,6,7,8]]
+    #
     # 所有分组都必须全 rank 集体创建,因此每个 rank 都带完整分组列表。
     if parallel_config.lwd_config.enable_lwd:
         global _TP, _PP, _DCP, _PCP, _DP, _EP

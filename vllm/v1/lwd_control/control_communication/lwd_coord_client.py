@@ -74,7 +74,7 @@ class LwdCoordClient:
                 counts, wave, running = msgspec.msgpack.decode(buf)
             except (msgspec.DecodeError, TypeError, ValueError):
                 continue
-            logger.info(
+            logger.debug(
                 "[Lwd][coord] stats counts=%s wave=%s engines_running=%s",
                 counts, wave, running,
             )
