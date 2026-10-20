@@ -93,6 +93,34 @@ class LwdCloudEngineCore(EngineCoreProc):
         )
         self._lwd_check_host_stage_switch()
         super().__init__(*args, **kwargs)
+        # [Lwd][perf] 段计时:把每步引擎侧时间拆成 drain/sched/submit/
+        # sampleq/update 五段(其余 = 队列等待)。实例属性覆写包装,
+        # 不动原生 core.py;基线与 offload 分支都打,才能对表。
+        self._lwd_segs: dict[str, float] = {}
+        self._lwd_install_step_probes()
+
+    def _lwd_install_step_probes(self) -> None:
+        """实例级包装三个逐步调用点,时长计入 ``_lwd_segs``(毫秒)。"""
+        segs = self._lwd_segs
+
+        def _wrap(obj, attr, key):
+            orig = getattr(obj, attr, None)
+            if orig is None:
+                return
+
+            def _timed(*a, **kw):
+                t = time.monotonic()
+                try:
+                    return orig(*a, **kw)
+                finally:
+                    segs[key] = (time.monotonic() - t) * 1000
+
+            setattr(obj, attr, _timed)
+
+        _wrap(self.scheduler, "schedule", "sched")
+        _wrap(self.scheduler, "update_from_output", "update")
+        _wrap(self.model_executor, "execute_model", "submit")
+        _wrap(self.model_executor, "sample_tokens", "sampleq")
 
     def _lwd_check_host_stage_switch(self) -> None:
         """Fail fast when the cloud would deadlock on a missing switch.
@@ -462,24 +490,40 @@ class LwdCloudEngineCore(EngineCoreProc):
         return request
     
     def step_with_batch_queue(self):
-        """步骤执行时长打点(开始执行→执行结束;不含引擎空等)。"""
+        """步骤执行时长打点(开始执行→执行结束;不含引擎空等)。
+
+        分段:drain=到达排水;sched=调度;submit=execute_model 下发;
+        sampleq=sample_tokens 下发;update=update_from_output;其余
+        (队列等待等)= exec − 各段之和。"""
+        segs = self._lwd_segs
+        segs.clear()
         _t0 = time.monotonic()
         self._lwd_drain_irecv_completions()
+        _t1 = time.monotonic()
         out = super().step_with_batch_queue()
         logger.info(
-            "[Lwd][perf] cloud-step exec=%.2fms",
-            (time.monotonic() - _t0) * 1000,
+            "[Lwd][perf] cloud-step exec=%.2f drain=%.2f sched=%.2f "
+            "submit=%.2f sampleq=%.2f update=%.2fms",
+            (time.monotonic() - _t0) * 1000, (_t1 - _t0) * 1000,
+            segs.get("sched", 0.0), segs.get("submit", 0.0),
+            segs.get("sampleq", 0.0), segs.get("update", 0.0),
         )
         return out
 
     def step(self):
-        """同步步路径同款打点。"""
+        """同步步路径同款打点(分段见 step_with_batch_queue)。"""
+        segs = self._lwd_segs
+        segs.clear()
         _t0 = time.monotonic()
         self._lwd_drain_irecv_completions()
+        _t1 = time.monotonic()
         out = super().step()
         logger.info(
-            "[Lwd][perf] cloud-step exec=%.2fms",
-            (time.monotonic() - _t0) * 1000,
+            "[Lwd][perf] cloud-step exec=%.2f drain=%.2f sched=%.2f "
+            "submit=%.2f sampleq=%.2f update=%.2fms",
+            (time.monotonic() - _t0) * 1000, (_t1 - _t0) * 1000,
+            segs.get("sched", 0.0), segs.get("submit", 0.0),
+            segs.get("sampleq", 0.0), segs.get("update", 0.0),
         )
         return out
 
