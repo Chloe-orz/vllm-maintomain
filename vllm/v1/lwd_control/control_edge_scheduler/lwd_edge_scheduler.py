@@ -66,17 +66,14 @@ logger = init_logger(__name__)
 _LWD_ADD_RETRY_STEPS = 5
 _LWD_ADD_RETRY_INTERVAL_S = 0.2
 
-# 云侧 pending 上限,按未消费 chunk(seqno)计:一条 seqno = 一个云步
-# 消费单位。边侧记录 seqno -> 批内请求列表,批内全部请求收到首 token
-# 即该 chunk 已消费;未消费 chunk 数达到上限即停止新开 prefill——请求
-# 在边侧 waiting 攒批(picker FCFS 前缀天然组多请求批),云侧 pending
-# 排空后闸门自开。
-# host 暂存后云侧把接收囤在 host pinned 上,闸门可以放宽:默认 6,
-# 可用 VLLM_ASCEND_LWD_MAX_PENDING_CHUNKS 覆盖;云侧在飞 recv 上限
-# (VLLM_ASCEND_LWD_MAX_INFLIGHT_RECV)必须不小于它,否则 recv 挂不满,
-# 闸门放宽不生效。
+# 边侧发送队列深度安全网:按"已发送但云侧未收讫"的批数计(摘除由
+# UP send 完成水位驱动,见 lwd_edge_note_send_watermark)。正常时
+# pending ≈ 线路深度(≤ 云侧在飞 recv 上限),闸门不介入;它只在云侧
+# 接收停摆时兜底,防边侧通道上的快照克隆堆爆 NPU。阈值须 ≥ 云侧在飞
+# recv 上限(VLLM_ASCEND_LWD_MAX_INFLIGHT_RECV,默认 8)+ 余量,
+# 否则闸门会抢在线路流控之前误介入。
 _LWD_MAX_PENDING_CHUNKS = int(
-    os.environ.get("VLLM_ASCEND_LWD_MAX_PENDING_CHUNKS", "6")
+    os.environ.get("VLLM_ASCEND_LWD_MAX_PENDING_CHUNKS", "10")
 )
 
 
@@ -116,15 +113,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # awaiting:嵌入完待云结果的 request_id -> 登记时刻(单调钟)。
         # 请求本体已清出调度器,此表是结果路径的唯一生命周期台账。
         self._lwd_awaiting: dict[str, float] = {}
-        # 已收到首个 token 的请求集合:awaiting 中不在此集合的请求 =
-        # 云侧尚未消费到其 prefill(pending_notify 的边侧本地估计,
-        # 免新增协议字段);首个 c2e 到达即标记,完结/abort 时清除。
-        self._lwd_first_token_seen: set[str] = set()
-        # seqno -> 批内 request_id 列表(chunk 粒度 pending 跟踪):
-        # 批内全部请求收到首 token 即整条移除;abort/finish 时按请求摘除,
-        # 摘空即移除(finish 摘除是死锁修复:_lwd_first_token_seen 完结即
-        # 移出,不摘除会让"短请求先完结"的批条目永不清除,pending 攒满
-        # 上限即永卡闸门)。云侧 pending_notify 的边侧本地镜像,免协议改动。
+        # seqno -> 批内 request_id 列表(批粒度 pending 跟踪):摘除改由
+        # UP send 完成水位驱动(lwd_edge_note_send_watermark,语义 = 云侧
+        # 已收讫),与首 token 交付解耦 —— 边侧放行节奏不再挂在云侧计算
+        # 完成上。
         self._lwd_batch_requests: dict[int, list[str]] = {}
         # pending 闸门状态(仅作开/关转换日志用)
         self._lwd_prefill_gate_held: bool = False
@@ -177,11 +169,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             and not self._lwd_has_prefill_chunk_inflight()
         ):
             return SchedulerOutput.make_empty()
-        # 云侧 pending 闸门(组批的产生机制):awaiting 中尚未收到首个
-        # token 的请求数 = 云侧尚未消费到的 prefill(notify 积压的边侧
-        # 本地估计,免协议改动)。超过上限即停止新开 prefill,请求在边
-        # 侧 waiting 攒批(picker FCFS 前缀天然组多请求批),云侧
-        # pending 排空后闸门自开。续传豁免(先收尾再开新)。
+        # 发送队列深度安全网:pending = 已发送但云侧未收讫的批数(摘除由
+        # UP send 完成水位驱动)。正常时 pending ≈ 线路深度,闸门不介入;
+        # 只在云侧接收停摆时兜底 —— 防边侧通道上的快照克隆堆爆 NPU。
+        # 续传豁免(先收尾再开新)。
         if self._lwd_mixed and not self._lwd_has_prefill_chunk_inflight():
             pending_chunks = len(self._lwd_batch_requests)
             if pending_chunks >= _LWD_MAX_PENDING_CHUNKS:
@@ -640,15 +631,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         publisher = self.lwd_edge_publisher
         for request_id in request_ids:
             self._lwd_awaiting.pop(request_id, None)
-            self._lwd_first_token_seen.discard(request_id)
             self._lwd_mrope_positions_dict.pop(request_id, None)
-            seen = self._lwd_first_token_seen
-            for seqno, rids in list(self._lwd_batch_requests.items()):
-                rids = [rid for rid in rids if rid != request_id]
-                if not rids or all(rid in seen for rid in rids):
-                    del self._lwd_batch_requests[seqno]
-                else:
-                    self._lwd_batch_requests[seqno] = rids
             if publisher is None:
                 continue
             if not publisher.publish(LwdAbortNotify(request_id=request_id)):
@@ -659,6 +642,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 logger.info(
                     "[Lwd][edge-notify] AbortNotify req=%s", request_id
                 )
+
+    def lwd_edge_note_send_watermark(self, watermark: int) -> None:
+        """UP send 完成水位(边 worker 随 embed 批结果捎回):seqno ≤ 水位
+        的批云侧已收讫,从 pending 闸门台账摘除。
+
+        HCCL P2P 的 isend 完成 = 数据已落云侧已挂好的 recv buffer,与云侧
+        是否算完无关 —— 摘除语义从"云侧算完"(首 token)改为"云侧收下",
+        边侧放行节奏与云侧计算完成解耦。"""
+        cleared = [
+            seqno for seqno in self._lwd_batch_requests if seqno <= watermark
+        ]
+        for seqno in cleared:
+            del self._lwd_batch_requests[seqno]
 
     def lwd_edge_update_progress(self, executed: dict[str, int]) -> None:
         """步末登记执行量;嵌入完结即转入 awaiting。
@@ -711,31 +707,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 request_id,
             )
             return False
-        self._lwd_first_token_seen.add(request_id)
-        seen = self._lwd_first_token_seen
-        for seqno, rids in list(self._lwd_batch_requests.items()):
-            if all(rid in seen for rid in rids):
-                del self._lwd_batch_requests[seqno]
         if finished:
             del self._lwd_awaiting[request_id]
-            self._lwd_first_token_seen.discard(request_id)
-            # 死锁根因修复:完结请求必须像 abort 一样从批台账摘除。批清除
-            # 判据 all(rid in seen) 要求 seen 只增不减,而上一行的 discard
-            # 让完结请求永久缺席——同批"短请求先完结、长请求首 token 后到"
-            # 时该 seqno 条目永不清除;泄漏条目攒到 _LWD_MAX_PENDING_CHUNKS
-            # 个,prefill gate 永卡 HOLD,边侧停发新 chunk、云侧 mid-prefill
-            # 空转刷 c2e_meta=None(真机实录:bench 泄漏 8 条后全局死锁,
-            # 单请求/无 MTP 时序不踩中故难复现)。
-            for seqno, rids in list(self._lwd_batch_requests.items()):
-                if request_id not in rids:
-                    continue
-                remaining = [rid for rid in rids if rid != request_id]
-                if remaining and not all(
-                    rid in self._lwd_first_token_seen for rid in remaining
-                ):
-                    self._lwd_batch_requests[seqno] = remaining
-                else:
-                    del self._lwd_batch_requests[seqno]
+            # pending 闸门的摘除已改由 UP send 完成水位驱动
+            # (lwd_edge_note_send_watermark),与首 token 交付解耦。
         logger.info(
             "[Lwd][edge-deliver] req=%s tokens=%d finished=%s",
             request_id, len(token_ids), finished,

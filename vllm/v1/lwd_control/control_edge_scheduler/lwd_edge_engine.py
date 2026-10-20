@@ -309,6 +309,14 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 self.scheduler.lwd_edge_update_progress(
                     dict(payload.num_scheduled_tokens)
                 )
+                # UP send 完成水位捎带:embed 批的执行结果里带"云侧已收讫
+                # 到哪"(边 worker 步末快照),喂给 pending 闸门的摘除。
+                if future is not None and future.done():
+                    wm = getattr(
+                        future.result(), "lwd_up_send_watermark", -1
+                    )
+                    if wm is not None and wm >= 0:
+                        self.scheduler.lwd_edge_note_send_watermark(wm)
                 prefill_work = True
                 h_emb += 1
             logger.info(
