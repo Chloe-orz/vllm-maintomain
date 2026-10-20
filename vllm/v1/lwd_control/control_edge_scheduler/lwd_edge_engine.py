@@ -106,6 +106,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
         # 按底层队列序排水,交错收割会连带等错批。t_dispatch 供
         # [Lwd][sched] harvest wait(派发→收割)度量批在队列里的滞留时长
         self._lwd_batch_queue: deque = deque()
+        # 在飞的 embed 批执行 future(收割点只弹队不等待):水位只能在
+        # future 完成后读到,所以挂在这里逐步排空 —— 立刻读会永远读不到
+        # (弹队时 worker 往返还没完成),闸门摘除会永久停摆(真机实录)。
+        self._lwd_embed_futures_inflight: list = []
         hello_event = threading.Event()
         discovery = threading.Thread(
             target=self._receive_thread,
@@ -298,6 +302,20 @@ class LwdEdgeEngineCore(EngineCoreProc):
         finished_reqs: set = set()
         prefill_work = False
         h_emb = h_unemb = 0
+        # UP send 完成水位:embed 批的执行结果只在 future 完成后才可读,
+        # 而收割点只弹队不等待 —— 所以挂起逐步排空,不在弹队时读。
+        kept = []
+        wm_hi = -1
+        for fut in self._lwd_embed_futures_inflight:
+            if fut.done():
+                wm = getattr(fut.result(), "lwd_up_send_watermark", -1)
+                if wm is not None:
+                    wm_hi = max(wm_hi, wm)
+            else:
+                kept.append(fut)
+        self._lwd_embed_futures_inflight = kept
+        if wm_hi >= 0:
+            self.scheduler.lwd_edge_note_send_watermark(wm_hi)
         while self._lwd_batch_queue:
             kind, payload, t_dispatch, future = self._lwd_batch_queue.popleft()
             if kind == "unembed":
@@ -309,14 +327,11 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 self.scheduler.lwd_edge_update_progress(
                     dict(payload.num_scheduled_tokens)
                 )
-                # UP send 完成水位捎带:embed 批的执行结果里带"云侧已收讫
-                # 到哪"(边 worker 步末快照),喂给 pending 闸门的摘除。
-                if future is not None and future.done():
-                    wm = getattr(
-                        future.result(), "lwd_up_send_watermark", -1
-                    )
-                    if wm is not None and wm >= 0:
-                        self.scheduler.lwd_edge_note_send_watermark(wm)
+                # UP send 完成水位捎带在 embed 批的执行结果里,但收割点
+                # 只弹队不等待 —— future 挂到在飞表,步首排空时再读
+                # (立刻读 = 永远读不到,闸门摘除停摆;真机实录)。
+                if future is not None:
+                    self._lwd_embed_futures_inflight.append(future)
                 prefill_work = True
                 h_emb += 1
             logger.info(
@@ -479,6 +494,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
             }
         else:
             result = future.result()
+            # UP send 完成水位随 unembed 结果捎带(decode 期的主要载具)
+            wm = getattr(result, "lwd_up_send_watermark", -1)
+            if result is not None and wm is not None and wm >= 0:
+                self.scheduler.lwd_edge_note_send_watermark(wm)
             # req_ids x sampled_token_ids 按位对齐:worker lm_head 恢复的采样
             # token,即该请求本步的生成内容;后续仅两处流向——
             # lwd_edge_deliver_tokens(调度器只对账 awaiting 生命周期,
