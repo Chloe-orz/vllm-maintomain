@@ -50,6 +50,7 @@ jobs:
       base_tag: ${{ inputs.base_tag }}
       push: ${{ github.event_name == 'schedule' || inputs.push }}
       nightly: ${{ github.event_name == 'schedule' || inputs.update_nightly_tag }}
+    secrets: inherit
 
   a3:
     if: ${{ github.event_name == 'schedule' || inputs.soc_select != 'a2' }}
@@ -61,3 +62,4 @@ jobs:
       base_tag: ${{ inputs.base_tag }}
       push: ${{ github.event_name == 'schedule' || inputs.push }}
       nightly: ${{ github.event_name == 'schedule' || inputs.update_nightly_tag }}
+    secrets: inherit
