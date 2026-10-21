@@ -62,7 +62,11 @@ class LwdBaseScheduler(AsyncScheduler):
 
         waiting/skipped 来源的请求走原生准入窗口(allocate/状态迁移/
         记账一样不少),running 来源的走续跑。拼回:仍被调度的接在隐藏
-        running 之后,被抢占的排 waiting 尾部,被跳过的排 skipped 队首。"""
+        running 之后,被抢占的排 **waiting 队首**(恢复原生
+        ``_preempt_request → prepend_request`` 的语义:跑过又丢了进度的
+        请求优先于从未启动的请求;容器交换期间它被 prepend 到临时队列
+        队首,拼回时必须先于隐藏集接回,否则退化成队尾),被跳过的排
+        skipped 队首。"""
         picked = {self.requests[req_id] for req_id in req_ids}
         from_running = [req for req in self.running if req in picked]
         from_waiting = [req for req in self.waiting if req in picked]
@@ -76,15 +80,31 @@ class LwdBaseScheduler(AsyncScheduler):
         self.running = from_running
         self.waiting = self._lwd_new_queue(from_waiting)
         self.skipped_waiting = self._lwd_new_queue(from_skipped)
+        out: SchedulerOutput | None = None
         try:
             out = super().schedule()
         finally:
-            # 按原队列拼回:running 存活者接尾,waiting 被抢占者排队尾,
-            # skipped 被跳过者排队首
+            # 按原队列拼回:running 存活者接尾,skipped 被跳过者排队首,
+            # waiting 被抢占者插队首(见 docstring)
             post = (self.running, self.waiting, self.skipped_waiting)
             self.running, self.waiting, self.skipped_waiting = saved
             self.running += post[0]
-            self.waiting.extend(post[1])
+            preempted_ids = out.preempted_req_ids if out is not None else set()
+            if preempted_ids:
+                # 原生逐次 prepend ⇒ 临时队列迭代序已是"后被抢的在前";
+                # 逆向逐个 prepend 才能把这个顺序原样搬到保存队列头部
+                # (FCFS 下 prepend_request = appendleft)。
+                preempted = [
+                    r for r in post[1] if r.request_id in preempted_ids
+                ]
+                rest = [
+                    r for r in post[1] if r.request_id not in preempted_ids
+                ]
+                self.waiting.extend(rest)
+                for req in reversed(preempted):
+                    self.waiting.prepend_request(req)
+            else:
+                self.waiting.extend(post[1])
             self.skipped_waiting.prepend_requests(post[2])
         return out
 

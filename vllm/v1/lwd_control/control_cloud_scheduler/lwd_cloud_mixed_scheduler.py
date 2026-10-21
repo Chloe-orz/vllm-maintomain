@@ -20,9 +20,14 @@ recv hint);调度器每步对"已收未算完"的请求直接开窗:
 前置约束:spec decode(MTP)的 decode 预算按 decode_exact 逐请求精确
 记账(草稿 token 同样占预算),但端到端未经真机验证(eagle 纯度
 判据失真风险,台账 P3-3/设计 M-8);
-不兼容云侧抢占重算(占位 embeds 无法本地重 prefill)与 prefix caching
-——部署须保证 KV 充足并关闭缓存,本类的核验只负责把违背变成当场
-报错而非静默错算。
+云侧抢占重算:已支持本地重 prefill —— pinned host 载荷活到请求结束
+(design v7 §6.1),抢占把 num_computed 归零后 recv_rows 台账不动,
+可见集谓词自然对该请求重开整条 prompt 的窗口,runner 在 harvest 前
+把 stager 读指针回退到调度水位(``_lwd_rewind_staged_reads``),注入
+几何与首算逐字相同;被抢请求拼回 waiting 队首(原生语义)。调度侧
+每步多付的只是一次 re-prefill 的预算。仍须关闭 prefix caching(零
+占位 token ids 的块哈希跨请求同值,命中即静默错算),本类的核验
+只负责把违背变成当场报错而非静默错算。
 """
 
 from __future__ import annotations
