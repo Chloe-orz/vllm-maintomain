@@ -45,6 +45,9 @@ from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
 from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
 )
+from vllm.v1.lwd_control.control_communication.lwd_coord_client import (
+    LwdCoordClient,
+)
 from vllm.v1.lwd_debug import LwdDebug, LwdLogBase
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_NOT_FINISHED,
@@ -88,14 +91,21 @@ class LwdEdgeEngineCore(EngineCoreProc):
         vllm_config.scheduler_config.scheduler_cls = LwdEdgeScheduler
         super().__init__(*args, **kwargs)
         config = LwdConfig.from_env_and_config(vllm_config)
+        self._lwd_config = config
         # 层日志总开关:env 已开则不动,config 段开则补开(仅本进程)
         LwdLogBase.set_debug(config.debug)
-        # 通信面:bind POST_OUT 订阅面 + 延迟连接的 PRE_OUT 发布面;
-        # 云端点由 HELLO 通告决定(边不预知云地址)
-        self._edge_receiver = self._lwd_build_post_out(config)
-        self._edge_sender = LwdControlPublisher(
-            None, bind=False, queue_max=config.publish_queue_max
+        # 云 engine 数(= 云侧 data_parallel_size):边侧收齐 M 个 HELLO
+        # 才放行服务;每个 HELLO 携带 engine_index 与各自的 PRE_OUT 端点
+        self._lwd_expected_engines = (
+            vllm_config.parallel_config.lwd_config.cloud_dp_size
         )
+        # 通信面:bind POST_OUT 订阅面(M 个云 engine 来连,fan-in);
+        # PRE_OUT 发布面 per-engine——端点由各 engine 的 HELLO 通告决定
+        # (边不预知云地址),每个新 HELLO 到达即建一条定向 publisher
+        self._edge_receiver = self._lwd_build_post_out(config)
+        self._edge_senders: dict[int, LwdControlPublisher] = {}
+        self._lwd_peer_hellos: dict[int, LwdHelloNotify] = {}
+        self._lwd_coord_client: LwdCoordClient | None = None
         # 云->边唯一载荷队列:生产端接收线程,消费端引擎步;数据面经
         # UNEMBED 批的 lwd_c2e_notifies 拿元数据,不直接读队列
         # (单消费者语义)
@@ -117,17 +127,28 @@ class LwdEdgeEngineCore(EngineCoreProc):
         if not hello_event.wait(config.hello_timeout_s):
             self._lwd_shutdown_planes()
             raise RuntimeError(
-                f"[Lwd] edge engine init failed: no cloud HELLO within "
-                f"{config.hello_timeout_s}s on POST_OUT "
+                f"[Lwd] edge engine init failed: got "
+                f"{len(self._lwd_peer_hellos)}/{self._lwd_expected_engines} "
+                f"cloud HELLOs within {config.hello_timeout_s}s on POST_OUT "
                 f"(bind {config.lwd_post_out_bind_endpoint()}; check cloud "
                 f"master_addr connectivity and POST_OUT port)"
             )
         self._lwd_cross_check_hello()
 
-        self.scheduler.lwd_edge_publisher = self._edge_sender
+        self.scheduler.lwd_edge_publishers = self._edge_senders
+        # FIRST_REQ 唤醒钩子:仅多云(有 coordinator)时接上;单云 None,
+        # 调度器侧跳过
+        self.scheduler.lwd_first_req_hook = (
+            self._lwd_coord_client.send_first_req
+            if self._lwd_coord_client is not None
+            else None
+        )
         logger.info(
-            "[Lwd] edge engine assembled: POST_OUT bind %s, PRE_OUT discovered",
+            "[Lwd] edge engine assembled: POST_OUT bind %s, %d cloud "
+            "engine(s) discovered, coord_client=%s",
             config.lwd_post_out_bind_endpoint(),
+            len(self._edge_senders),
+            self._lwd_coord_client is not None,
         )
 
     # ------------------------------------------------------------------ #
@@ -144,9 +165,11 @@ class LwdEdgeEngineCore(EngineCoreProc):
     def _receive_thread(self, hello_event: threading.Event) -> None:
         """POST_OUT 接收线程体,按消息类型分发。
 
-        HELLO -> retarget PRE_OUT:云端点唯一事实源,首拍一次通告;
-        retarget 队满时无下条 HELLO 可等,须本线程自旋重试到成功
-        (构造期发布队列必空,该路径仅防御性保活)。
+        HELLO -> 登记 engine 身份并建该 engine 的定向 PRE_OUT publisher:
+        云端点唯一事实源,每 engine 首拍一次;重复 HELLO(同 engine_index)
+        忽略(不支持对端重启自愈)。收齐 cloud_dp_size 个才置 hello_event
+        (构造线程放行)。HELLO 携带 coordinator stats 地址时建
+        LwdCoordClient(FIRST_REQ 唤醒 + stats 对账)。
         LwdC2eNotify(云->边唯一载荷)-> 载荷队列(阻塞 put,不可丢)
         + WAKEUP 唤醒主循环:prefill 全部完成后请求转入 awaiting,
         引擎无排程工作、阻塞在 input_queue.get(),载荷只进队列不会
@@ -155,27 +178,43 @@ class LwdEdgeEngineCore(EngineCoreProc):
         其余帧(坏帧已被订阅层丢弃后仍不认识的类型)告警丢弃。
         """
         receiver = self._edge_receiver
-        publisher = self._edge_sender
+        config = self._lwd_config
         while not receiver.closed:
             msg = receiver.recv(timeout_ms=5000)
             if msg is None:
                 continue
             if isinstance(msg, LwdHelloNotify):
+                eng = msg.engine_index
                 endpoint = f"tcp://{msg.pre_out_host}:{msg.pre_out_port}"
-                if not hello_event.is_set():
-                    logger.info(
-                        "[Lwd] cloud discovered via HELLO: PRE_OUT -> %s", endpoint
-                    )
-                # 载荷留存供构造线程互校(调度三元组,见 _lwd_cross_check_hello)
-                self._lwd_peer_hello = msg
-                while not publisher.retarget(endpoint):
-                    if receiver.closed:
-                        break
+                if eng in self._lwd_peer_hellos:
                     logger.warning(
-                        "[Lwd] PRE_OUT retarget deferred (queue full), retrying"
+                        "[Lwd] duplicate HELLO from cloud engine %d ignored", eng
                     )
-                    threading.Event().wait(0.05)
-                hello_event.set()
+                    continue
+                logger.info(
+                    "[Lwd] cloud engine %d discovered via HELLO: PRE_OUT -> %s "
+                    "(%d/%d)",
+                    eng,
+                    endpoint,
+                    len(self._lwd_peer_hellos) + 1,
+                    self._lwd_expected_engines,
+                )
+                self._lwd_peer_hellos[eng] = msg
+                self._edge_senders[eng] = LwdControlPublisher(
+                    endpoint, bind=False, queue_max=config.publish_queue_max
+                )
+                if len(self._lwd_peer_hellos) > self._lwd_expected_engines:
+                    # 配置错配:边侧 --cloud-dp-size 小于云侧实际 engine 数
+                    # (世界已按更大的值建成,控制面不能悄悄少管一个 engine)
+                    logger.error(
+                        "[Lwd] more cloud HELLOs (%d) than expected "
+                        "(--cloud-dp-size=%d); check edge launch config",
+                        len(self._lwd_peer_hellos), self._lwd_expected_engines,
+                    )
+                if msg.coord_stats_addr and self._lwd_coord_client is None:
+                    self._lwd_coord_client = LwdCoordClient(msg.coord_stats_addr)
+                if len(self._lwd_peer_hellos) >= self._lwd_expected_engines:
+                    hello_event.set()
             elif isinstance(msg, LwdC2eNotify):
                 logger.info(
                     "[Lwd][edge-ctrl] C2eNotify reqs=%d down_seqno=%s",
@@ -190,16 +229,18 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 logger.warning("[Lwd] drop unexpected POST_OUT frame %r", type(msg))
 
     def _lwd_shutdown_planes(self) -> None:
-        """两面关停(幂等):receiver 先关断输入,publisher 收尾。"""
+        """两面关停(幂等):receiver 先关断输入,publisher 与 coord 收尾。"""
         receiver = getattr(self, "_edge_receiver", None)
         if receiver is not None:
             receiver.shutdown()
-        publisher = getattr(self, "_edge_sender", None)
-        if publisher is not None:
-            publisher.shutdown()
+        for sender in getattr(self, "_edge_senders", {}).values():
+            sender.shutdown()
+        coord = getattr(self, "_lwd_coord_client", None)
+        if coord is not None:
+            coord.shutdown()
 
     def _lwd_cross_check_hello(self) -> None:
-        """HELLO 调度三元组互校(构造线程)。
+        """逐 engine HELLO 调度三元组互校(构造线程)。
 
         max_num_batched_tokens/max_num_seqs 是边 cap 公式与云 preflight
         的同源输入(设计 §2.2/§5.2 的部署对齐前提),不一致即构造期
@@ -207,74 +248,107 @@ class LwdEdgeEngineCore(EngineCoreProc):
         prefill 被 decode 静默串行(真机实录:边 factor=1/云 factor=4
         时 chunk 8191 + decode 4 > 预算 8192,prefill 积压 280 步)。
         num_speculative_tokens 不一致时以对端为准采纳(边本地取不到
-        合法来源)并告警。对端为旧版(三值全 0)时仅告警不拦截。"""
-        hello = getattr(self, "_lwd_peer_hello", None)
-        if hello is None:
-            return
-        if (
-            self.vllm_config.model_config.uses_mrope
-            and hello.wire_version < LWD_WIRE_VERSION
-        ):
-            self._lwd_shutdown_planes()
-            raise RuntimeError(
-                f"[LWD] edge/cloud wire protocol mismatch: model uses "
-                f"mrope but cloud HELLO wire_version="
-                f"{hello.wire_version} < {LWD_WIRE_VERSION}——云侧仍按数据面"
-                f" aux 帧协议运行,mrope positions 将静默缺失(msgspec 容忍"
-                f"未知字段,旧云不会报错),两侧必须同版本部署"
-            )
-        if hello.max_num_batched_tokens == 0:
-            logger.warning(
-                "[Lwd] peer HELLO carries no scheduling triple "
-                "(legacy peer); edge/cloud config alignment UNCHECKED"
-            )
-            return
-        sched = self.vllm_config.scheduler_config
-        spec_config = getattr(self.vllm_config, "speculative_config", None)
-        local = (
-            sched.max_num_batched_tokens,
-            sched.max_num_seqs,
-            getattr(spec_config, "num_speculative_tokens", None) or 0,
+        合法来源)并告警;多 engine 间 spec 系数必须同值。多 engine
+        (cloud_dp_size>1)要求 wire_version>=3(engine_index/coord 地址),
+        否则端点表无法按身份建立。对端为旧版(三值全 0)时仅告警不拦截。"""
+        hellos: dict[int, LwdHelloNotify] = getattr(
+            self, "_lwd_peer_hellos", {}
         )
-        remote = (
-            hello.max_num_batched_tokens,
-            hello.max_num_seqs,
-            hello.num_speculative_tokens,
-        )
-        if local[:2] != remote[:2]:
-            self._lwd_shutdown_planes()
-            raise RuntimeError(
-                f"[LWD] edge/cloud scheduling config mismatch: "
-                f"(max_num_batched_tokens, max_num_seqs) "
-                f"edge={local[:2]} != cloud={remote[:2]}; "
-                f"cap/preflight 公式两侧同源输入不一致会让 preflight 恒 "
-                f"hold、prefill 被 decode 静默串行——两侧拉起配置须同值"
-            )
-        if local[2] != remote[2]:
-            # spec 系数以云为准:它预留的是云 decode 步的草稿预算,边侧
-            # 本地取不到合法来源(边实例带 spec 配置会拖起 draft 机制)。
-            # 采纳对端值而非 fail-fast——部署上边侧无需再配 spec。
-            logger.warning(
-                "[Lwd] adopt cloud spec_factor=%d over edge local %d "
-                "(edge has no legitimate local source for it)",
-                remote[2] + 1, local[2] + 1,
-            )
-            self.scheduler._lwd_spec_factor = remote[2] + 1
-            # 采纳后复核活性下界(构造期检查用的是本地 factor,见
-            # LwdEdgeScheduler.__init__)
+        if not hellos:
+            return
+        if self._lwd_expected_engines > 1:
+            for eng, hello in hellos.items():
+                if hello.wire_version < LWD_WIRE_VERSION:
+                    self._lwd_shutdown_planes()
+                    raise RuntimeError(
+                        f"[LWD] cloud engine {eng} wire_version="
+                        f"{hello.wire_version} < {LWD_WIRE_VERSION}: 多 DP "
+                        f"部署要求 HELLO 携带 engine_index/coord_stats_addr,"
+                        f"两侧必须同版本部署"
+                    )
+        spec_remote: int | None = None
+        for eng, hello in hellos.items():
             if (
-                self.scheduler.max_num_scheduled_tokens
-                - self.scheduler.max_num_running_reqs * (remote[2] + 1) < 1
+                self.vllm_config.model_config.uses_mrope
+                and hello.wire_version < LWD_WIRE_VERSION
             ):
                 self._lwd_shutdown_planes()
                 raise RuntimeError(
-                    f"[LWD] 死锁配置: 采纳云侧 spec_factor={remote[2] + 1} "
-                    f"后 cap 恒 < 1(预算 {self.scheduler.max_num_scheduled_tokens}"
-                    f" − 满员 {self.scheduler.max_num_running_reqs} × "
-                    f"{remote[2] + 1});请增大 max_num_batched_tokens "
-                    f"或减小 max_num_seqs"
+                    f"[LWD] edge/cloud wire protocol mismatch: model uses "
+                    f"mrope but cloud engine {eng} HELLO wire_version="
+                    f"{hello.wire_version} < {LWD_WIRE_VERSION}——云侧仍按数据面"
+                    f" aux 帧协议运行,mrope positions 将静默缺失(msgspec 容忍"
+                    f"未知字段,旧云不会报错),两侧必须同版本部署"
                 )
-        logger.info("[Lwd] HELLO scheduling triple verified: %s", local)
+            if hello.max_num_batched_tokens == 0:
+                logger.warning(
+                    "[Lwd] peer HELLO (engine %d) carries no scheduling triple "
+                    "(legacy peer); edge/cloud config alignment UNCHECKED",
+                    eng,
+                )
+                continue
+            sched = self.vllm_config.scheduler_config
+            spec_config = getattr(self.vllm_config, "speculative_config", None)
+            local = (
+                sched.max_num_batched_tokens,
+                sched.max_num_seqs,
+                getattr(spec_config, "num_speculative_tokens", None) or 0,
+            )
+            remote = (
+                hello.max_num_batched_tokens,
+                hello.max_num_seqs,
+                hello.num_speculative_tokens,
+            )
+            if local[:2] != remote[:2]:
+                self._lwd_shutdown_planes()
+                raise RuntimeError(
+                    f"[LWD] edge/cloud scheduling config mismatch on engine "
+                    f"{eng}: (max_num_batched_tokens, max_num_seqs) "
+                    f"edge={local[:2]} != cloud={remote[:2]}; "
+                    f"cap/preflight 公式两侧同源输入不一致会让 preflight 恒 "
+                    f"hold、prefill 被 decode 静默串行——两侧拉起配置须同值"
+                )
+            if spec_remote is None:
+                spec_remote = remote[2]
+            elif spec_remote != remote[2]:
+                self._lwd_shutdown_planes()
+                raise RuntimeError(
+                    f"[LWD] cloud engines disagree on num_speculative_tokens: "
+                    f"engine {eng}={remote[2]} vs {spec_remote}; 多 DP 下各"
+                    f" engine 的 spec 配置必须同值"
+                )
+        if spec_remote is not None:
+            spec_config = getattr(self.vllm_config, "speculative_config", None)
+            local_spec = getattr(spec_config, "num_speculative_tokens", None) or 0
+            if local_spec != spec_remote:
+                # spec 系数以云为准:它预留的是云 decode 步的草稿预算,边侧
+                # 本地取不到合法来源(边实例带 spec 配置会拖起 draft 机制)。
+                # 采纳对端值而非 fail-fast——部署上边侧无需再配 spec。
+                logger.warning(
+                    "[Lwd] adopt cloud spec_factor=%d over edge local %d "
+                    "(edge has no legitimate local source for it)",
+                    spec_remote + 1, local_spec + 1,
+                )
+                self.scheduler._lwd_spec_factor = spec_remote + 1
+                # 采纳后复核活性下界(构造期检查用的是本地 factor,见
+                # LwdEdgeScheduler.__init__)
+                if (
+                    self.scheduler.max_num_scheduled_tokens
+                    - self.scheduler.max_num_running_reqs * (spec_remote + 1) < 1
+                ):
+                    self._lwd_shutdown_planes()
+                    raise RuntimeError(
+                        f"[LWD] 死锁配置: 采纳云侧 spec_factor={spec_remote + 1} "
+                        f"后 cap 恒 < 1(预算 "
+                        f"{self.scheduler.max_num_scheduled_tokens}"
+                        f" − 满员 {self.scheduler.max_num_running_reqs} × "
+                        f"{spec_remote + 1});请增大 max_num_batched_tokens "
+                        f"或减小 max_num_seqs"
+                    )
+        logger.info(
+            "[Lwd] HELLO scheduling triple verified on %d engine(s)",
+            len(hellos),
+        )
 
     # ------------------------------------------------------------------ #
     # 引擎接口覆写                                                        #
@@ -338,11 +412,12 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 )
                 prefill_work = True
                 h_emb += 1
-            logger.info(
-                "[Lwd][sched] edge harvest kind=%s seqno=%s wait=%.2fms",
-                kind, self._lwd_batch_seqno(kind, payload),
-                (time.monotonic() - t_dispatch) * 1000,
-            )
+            wait_ms = (time.monotonic() - t_dispatch) * 1000
+            if wait_ms > 1.0:
+                logger.info(
+                    "[Lwd][sched] edge harvest kind=%s seqno=%s wait=%.2fms",
+                    kind, self._lwd_batch_seqno(kind, payload), wait_ms,
+                )
         d_emb = 0
         while (len(self._lwd_batch_queue) < LWD_EDGE_BATCH_QUEUE_DEPTH
                and self.scheduler.has_requests()):
@@ -359,12 +434,14 @@ class LwdEdgeEngineCore(EngineCoreProc):
             d_emb += 1
         d_unemb = self._lwd_edge_consume_c2e()
         n_emb, n_unemb = self._lwd_queue_mix()
-        logger.info(
-            "[Lwd][sched] edge step harvest_emb=%d harvest_unemb=%d "
-            "disp_emb=%d disp_unemb=%d queue=%demb/%dunemb c2e_pending=%d",
-            h_emb, h_unemb, d_emb, d_unemb, n_emb, n_unemb,
-            self.lwd_c2e_meta_queue.qsize(),
-        )
+        if (prefill_work or outputs or h_emb or h_unemb
+                or d_emb or d_unemb):
+            logger.info(
+                "[Lwd][sched] edge step harvest_emb=%d harvest_unemb=%d "
+                "disp_emb=%d disp_unemb=%d queue=%demb/%dunemb c2e_pending=%d",
+                h_emb, h_unemb, d_emb, d_unemb, n_emb, n_unemb,
+                self.lwd_c2e_meta_queue.qsize(),
+            )
         if outputs:
             step_outputs = EngineCoreOutputs(
                 outputs=outputs,

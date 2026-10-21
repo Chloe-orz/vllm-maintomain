@@ -171,10 +171,14 @@ class MultiprocExecutor(Executor):
         success = False
         try:
             if self.parallel_config.lwd_config.enable_lwd:
+                lwd_cfg = self.parallel_config.lwd_config
                 global_start_rank = (
                     0
-                    if self.parallel_config.lwd_config.is_edge_node
-                    else self.parallel_config.lwd_config.edge_npu_count
+                    if lwd_cfg.is_edge_node
+                    # 共享边布局:云 engine i 占 [E + i*C, E + (i+1)*C)。
+                    else lwd_cfg.cloud_engine_rank_base(
+                        self.parallel_config.data_parallel_rank
+                    )
                 )
             else:
                 global_start_rank = (
@@ -341,11 +345,17 @@ class MultiprocExecutor(Executor):
     def _is_driver_worker(self, rank: int) -> bool:
         if self.parallel_config.lwd_config.enable_lwd:
             # Each side's first rank is its own engine's driver worker
-            # (edge rank 0, cloud rank edge_npu_count); the native
+            # (edge rank 0, cloud engine i rank E + i*C); the native
             # ``rank % tp_size`` picks the wrong worker under the
             # edge-first asymmetric layout.
             lwd = self.parallel_config.lwd_config
-            return rank == (0 if lwd.is_edge_node else lwd.edge_npu_count)
+            return rank == (
+                0
+                if lwd.is_edge_node
+                else lwd.cloud_engine_rank_base(
+                    self.parallel_config.data_parallel_rank
+                )
+            )
         return rank % self.parallel_config.tensor_parallel_size == 0
 
     def start_worker_monitor(self, inline=False) -> None:
