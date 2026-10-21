@@ -671,6 +671,28 @@ def make_lwd_layers(
     return start_layer, end_layer, torch.nn.ModuleList(modules)
 
 
+def lwd_skips_module(vllm_config: VllmConfig, path: str) -> bool:
+    """Whether the current LWD role must not build the module at *path*.
+
+    Thin wrapper around :meth:`vllm.config.LwdConfig.skips_module` so model
+    files do not have to reach into the config object themselves.  The module
+    is expected to be replaced with a ``PPMissingLayer`` placeholder, which
+    keeps the name in the module tree (so checkpoint tensors for it are skipped
+    by ``AutoWeightsLoader`` rather than reported as unexpected) while holding
+    no parameters.
+
+    Args:
+        vllm_config: The config of the model being built.
+        path: Dotted module path relative to the model root, e.g.
+            ``model.language_model.model.norm``.
+
+    Returns:
+        ``True`` when the module must not be built on this role.
+    """
+    lwd_config = getattr(vllm_config, "lwd_config", None)
+    return lwd_config is not None and lwd_config.skips_module(path)
+
+
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,

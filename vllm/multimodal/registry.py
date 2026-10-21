@@ -111,6 +111,11 @@ class MultiModalRegistry:
             return False
 
         mm_config = model_config.get_multimodal_config()
+        if mm_config is not None and mm_config.mm_encoder_remote:
+            # Multimodal inputs are encoded by another process (LWD edge). The
+            # processor -- and the tokenizer it loads -- would never be used, so
+            # do not build it just to inspect the supported modalities.
+            return False
         try:
             info = self._create_processing_info(model_config, tokenizer=None)
         except ValueError:
