@@ -187,6 +187,14 @@ class MultiModalConfig:
     This reduces engine startup time but shifts the responsibility to users for
     estimating the peak memory usage of the activation of multimodal encoder and
     embedding cache."""
+    mm_encoder_remote: bool = False
+    """When enabled, multimodal inputs are encoded by a *remote* peer (the LWD
+    edge): this process is fed prompt embeddings and therefore never runs the
+    multimodal processor or its encoder.
+
+    This keeps engine startup from building the HF multimodal processor, which
+    would otherwise load a tokenizer and the processor configs that this role
+    does not use."""
     video_pruning_rate: float | None = Field(default=None, ge=0.0, lt=1.0)
     """Sets pruning rate for video pruning via Efficient Video Sampling.
     Value sits in range [0;1) and determines fraction of media tokens

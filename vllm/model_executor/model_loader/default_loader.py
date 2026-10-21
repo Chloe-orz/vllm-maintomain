@@ -19,6 +19,10 @@ from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_local_expert_ids,
 )
+from vllm.model_executor.model_loader.lwd_weight_filter import (
+    name_is_skipped,
+    parse_skip_keys,
+)
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
@@ -297,14 +301,62 @@ class DefaultModelLoader(BaseModelLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
-        yield from self._get_weights_iterator(primary_weights)
+        yield from self._skip_unbuilt_weights(
+            model, self._get_weights_iterator(primary_weights)
+        )
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source],
             getattr(model, "secondary_weights", ()),
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(source)
+            yield from self._skip_unbuilt_weights(
+                model, self._get_weights_iterator(source)
+            )
+
+    def _skip_unbuilt_weights(
+        self,
+        model: nn.Module,
+        weights: Generator[tuple[str, torch.Tensor], None, None],
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """LWD: skip the weights of modules this role did not build.
+
+        A trimmed LWD role (edge or cloud) holds ``PPMissingLayer`` /
+        ``StageMissingLayer`` placeholders for the modules it never runs.
+        Their tensors are neither materialized nor used, so they are dropped
+        here -- ahead of ``safetensors``' ``get_tensor`` -- instead of being
+        read from disk only to be discarded downstream.  The filter is a no-op
+        outside LWD and when the model has no placeholders.
+        """
+        skip_keys = parse_skip_keys(self._placeholder_module_names(model))
+        if not skip_keys:
+            yield from weights
+            return
+        num_skipped = 0
+        for name, tensor in weights:
+            if name_is_skipped(name, skip_keys):
+                num_skipped += 1
+                continue
+            yield name, tensor
+        if num_skipped:
+            logger.debug(
+                "LWD weight filter: skipped %d tensor(s) of placeholder modules",
+                num_skipped,
+            )
+
+    @staticmethod
+    def _placeholder_module_names(model: nn.Module) -> list[str]:
+        """Names of the model's placeholder modules, or [] when not in LWD."""
+        from vllm.config import get_current_vllm_config_or_none
+        from vllm.model_executor.models.utils import get_pp_missing_layer_names
+
+        config = get_current_vllm_config_or_none()
+        lwd_config = (
+            getattr(config, "lwd_config", None) if config is not None else None
+        )
+        if lwd_config is None or not lwd_config.enabled:
+            return []
+        return get_pp_missing_layer_names(model)
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(

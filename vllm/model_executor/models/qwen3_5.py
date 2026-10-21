@@ -99,6 +99,7 @@ from .utils import (
     _merge_multimodal_embeddings,
     extract_layer_index,
     is_pp_missing_parameter,
+    lwd_skips_module,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -240,9 +241,13 @@ class Qwen3_5Model(Qwen3NextModel):
             ["hidden_states", "residual"], config.hidden_size
         )
 
-        if get_pp_group().is_last_rank:
+        if get_pp_group().is_last_rank and not lwd_skips_module(
+            vllm_config, maybe_prefix(prefix, "norm")
+        ):
             self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
+            # Not on the last PP rank, or an LWD edge that only unembeds the
+            # cloud's already-normed hidden states.
             self.norm = PPMissingLayer()
 
         self.aux_hidden_state_layers: tuple[int, ...] = ()
@@ -575,12 +580,19 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         self.is_multimodal_pruning_enabled = False
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.visual = Qwen3_VisionTransformer(
-                config.vision_config,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "visual"),
-            )
+            if lwd_skips_module(vllm_config, maybe_prefix(prefix, "visual")):
+                # LWD cloud: prompt embeddings arrive over the UP channel, so the
+                # tower never runs. The placeholder keeps the name in the module
+                # tree, so stray tower tensors in a checkpoint are skipped by
+                # AutoWeightsLoader instead of reported as unexpected.
+                self.visual = PPMissingLayer()
+            else:
+                self.visual = Qwen3_VisionTransformer(
+                    config.vision_config,
+                    norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "visual"),
+                )
 
         with self._mark_language_model(vllm_config):
             self.language_model = Qwen3_5ForCausalLM(
@@ -789,12 +801,16 @@ class Qwen3_5MoeForConditionalGeneration(
         self.is_multimodal_pruning_enabled = False
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.visual = Qwen3_VisionTransformer(
-                config.vision_config,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "visual"),
-            )
+            if lwd_skips_module(vllm_config, maybe_prefix(prefix, "visual")):
+                # LWD cloud: see Qwen3_5ForConditionalGeneration above.
+                self.visual = PPMissingLayer()
+            else:
+                self.visual = Qwen3_VisionTransformer(
+                    config.vision_config,
+                    norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "visual"),
+                )
 
         with self._mark_language_model(vllm_config):
             self.language_model = Qwen3_5MoeForCausalLM(

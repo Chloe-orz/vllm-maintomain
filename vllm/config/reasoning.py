@@ -69,6 +69,12 @@ class ReasoningConfig:
             return  # Already initialized
 
         tokenizer = cached_tokenizer_from_config(model_config=model_config)
+        if tokenizer is None:
+            # `skip_tokenizer_init` is set (e.g. the LWD cloud, which receives
+            # already-tokenized requests): there is no tokenizer to derive the
+            # reasoning token ids from, so leave reasoning disabled instead of
+            # failing on a None tokenizer.
+            return
         reasoning_start_str = self.reasoning_start_str
         reasoning_end_str = self.reasoning_end_str
         if self.reasoning_parser is not None and (
