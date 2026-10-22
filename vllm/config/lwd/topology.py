@@ -62,9 +62,16 @@ class LwdDeployment:
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class LwdScramble:
+    enable: StrictBool = False
+    device_id: LwdString | None = None
+    custom_factor: LwdString | None = None
+
+
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LwdFeatures:
     enable_early_recv: StrictBool = False
-    enable_scramble: StrictBool = False
+    scramble: LwdScramble = Field(default_factory=LwdScramble)
 
 
 LwdPositiveSeconds = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
