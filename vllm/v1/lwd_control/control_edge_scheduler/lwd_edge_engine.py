@@ -116,6 +116,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
         # 按底层队列序排水,交错收割会连带等错批。t_dispatch 供
         # [Lwd][sched] harvest wait(派发→收割)度量批在队列里的滞留时长
         self._lwd_batch_queue: deque = deque()
+        # 在飞的 embed 批执行 future(收割点只弹队不等待):水位只能在
+        # future 完成后读到,所以挂在这里逐步排空 —— 立刻读会永远读不到
+        # (弹队时 worker 往返还没完成),闸门摘除会永久停摆(真机实录)。
+        self._lwd_embed_futures_inflight: list = []
         hello_event = threading.Event()
         discovery = threading.Thread(
             target=self._receive_thread,
@@ -240,17 +244,17 @@ class LwdEdgeEngineCore(EngineCoreProc):
             coord.shutdown()
 
     def _lwd_cross_check_hello(self) -> None:
-        """逐 engine HELLO 调度三元组互校(构造线程)。
+        """逐 engine HELLO 调度配置互校(构造线程)。
 
-        max_num_batched_tokens/max_num_seqs 是边 cap 公式与云 preflight
+        max_num_batched_tokens/max_num_seqs 是边侧批上限与云侧调度
         的同源输入(设计 §2.2/§5.2 的部署对齐前提),不一致即构造期
         fail-fast——不一致不会让链路报错,只会让云 preflight 恒 hold、
         prefill 被 decode 静默串行(真机实录:边 factor=1/云 factor=4
         时 chunk 8191 + decode 4 > 预算 8192,prefill 积压 280 步)。
-        num_speculative_tokens 不一致时以对端为准采纳(边本地取不到
-        合法来源)并告警;多 engine 间 spec 系数必须同值。多 engine
+        num_speculative_tokens 仅为 wire 兼容保留,边侧不再使用(host 暂存
+        后边侧不再为云 decode 预留预算,spec 系数无需边云对齐)。多 engine
         (cloud_dp_size>1)要求 wire_version>=3(engine_index/coord 地址),
-        否则端点表无法按身份建立。对端为旧版(三值全 0)时仅告警不拦截。"""
+        否则端点表无法按身份建立。对端为旧版(数值全 0)时仅告警不拦截。"""
         hellos: dict[int, LwdHelloNotify] = getattr(
             self, "_lwd_peer_hellos", {}
         )
@@ -266,7 +270,6 @@ class LwdEdgeEngineCore(EngineCoreProc):
                         f"部署要求 HELLO 携带 engine_index/coord_stats_addr,"
                         f"两侧必须同版本部署"
                     )
-        spec_remote: int | None = None
         for eng, hello in hellos.items():
             if (
                 self.vllm_config.model_config.uses_mrope
@@ -288,65 +291,25 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 )
                 continue
             sched = self.vllm_config.scheduler_config
-            spec_config = getattr(self.vllm_config, "speculative_config", None)
             local = (
                 sched.max_num_batched_tokens,
                 sched.max_num_seqs,
-                getattr(spec_config, "num_speculative_tokens", None) or 0,
             )
             remote = (
                 hello.max_num_batched_tokens,
                 hello.max_num_seqs,
-                hello.num_speculative_tokens,
             )
-            if local[:2] != remote[:2]:
+            if local != remote:
                 self._lwd_shutdown_planes()
                 raise RuntimeError(
                     f"[LWD] edge/cloud scheduling config mismatch on engine "
                     f"{eng}: (max_num_batched_tokens, max_num_seqs) "
-                    f"edge={local[:2]} != cloud={remote[:2]}; "
+                    f"edge={local} != cloud={remote}; "
                     f"cap/preflight 公式两侧同源输入不一致会让 preflight 恒 "
                     f"hold、prefill 被 decode 静默串行——两侧拉起配置须同值"
                 )
-            if spec_remote is None:
-                spec_remote = remote[2]
-            elif spec_remote != remote[2]:
-                self._lwd_shutdown_planes()
-                raise RuntimeError(
-                    f"[LWD] cloud engines disagree on num_speculative_tokens: "
-                    f"engine {eng}={remote[2]} vs {spec_remote}; 多 DP 下各"
-                    f" engine 的 spec 配置必须同值"
-                )
-        if spec_remote is not None:
-            spec_config = getattr(self.vllm_config, "speculative_config", None)
-            local_spec = getattr(spec_config, "num_speculative_tokens", None) or 0
-            if local_spec != spec_remote:
-                # spec 系数以云为准:它预留的是云 decode 步的草稿预算,边侧
-                # 本地取不到合法来源(边实例带 spec 配置会拖起 draft 机制)。
-                # 采纳对端值而非 fail-fast——部署上边侧无需再配 spec。
-                logger.warning(
-                    "[Lwd] adopt cloud spec_factor=%d over edge local %d "
-                    "(edge has no legitimate local source for it)",
-                    spec_remote + 1, local_spec + 1,
-                )
-                self.scheduler._lwd_spec_factor = spec_remote + 1
-                # 采纳后复核活性下界(构造期检查用的是本地 factor,见
-                # LwdEdgeScheduler.__init__)
-                if (
-                    self.scheduler.max_num_scheduled_tokens
-                    - self.scheduler.max_num_running_reqs * (spec_remote + 1) < 1
-                ):
-                    self._lwd_shutdown_planes()
-                    raise RuntimeError(
-                        f"[LWD] 死锁配置: 采纳云侧 spec_factor={spec_remote + 1} "
-                        f"后 cap 恒 < 1(预算 "
-                        f"{self.scheduler.max_num_scheduled_tokens}"
-                        f" − 满员 {self.scheduler.max_num_running_reqs} × "
-                        f"{spec_remote + 1});请增大 max_num_batched_tokens "
-                        f"或减小 max_num_seqs"
-                    )
         logger.info(
-            "[Lwd] HELLO scheduling triple verified on %d engine(s)",
+            "[Lwd] HELLO scheduling config verified on %d engine(s)",
             len(hellos),
         )
 
@@ -399,6 +362,22 @@ class LwdEdgeEngineCore(EngineCoreProc):
         finished_reqs: set = set()
         prefill_work = False
         h_emb = h_unemb = 0
+        # UP send 完成水位:embed 批的执行结果只在 future 完成后才可读,
+        # 而收割点只弹队不等待 —— 所以挂起逐步排空,不在弹队时读。
+        # 水位是通道级(seqno 流 per-engine),在飞表按 (future, engine)
+        # 存档,排空时逐 engine 取 max 分别回报。
+        kept = []
+        wm_by_engine: dict[int, int] = {}
+        for fut, eng in self._lwd_embed_futures_inflight:
+            if fut.done():
+                wm = getattr(fut.result(), "lwd_up_send_watermark", -1)
+                if wm is not None and wm >= 0:
+                    wm_by_engine[eng] = max(wm_by_engine.get(eng, -1), wm)
+            else:
+                kept.append((fut, eng))
+        self._lwd_embed_futures_inflight = kept
+        for eng, wm in wm_by_engine.items():
+            self.scheduler.lwd_edge_note_send_watermark(eng, wm)
         while self._lwd_batch_queue:
             kind, payload, t_dispatch, future = self._lwd_batch_queue.popleft()
             if kind == "unembed":
@@ -410,6 +389,14 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 self.scheduler.lwd_edge_update_progress(
                     dict(payload.num_scheduled_tokens)
                 )
+                # UP send 完成水位捎带在 embed 批的执行结果里,但收割点
+                # 只弹队不等待 —— future 挂到在飞表(带 engine),步首
+                # 排空时再读(立刻读 = 永远读不到,闸门摘除停摆;真机实录)。
+                if future is not None:
+                    batch = getattr(payload, "lwd_batch", None)
+                    self._lwd_embed_futures_inflight.append(
+                        (future, int(getattr(batch, "engine_index", 0) or 0))
+                    )
                 prefill_work = True
                 h_emb += 1
             wait_ms = (time.monotonic() - t_dispatch) * 1000
@@ -575,6 +562,13 @@ class LwdEdgeEngineCore(EngineCoreProc):
             }
         else:
             result = future.result()
+            # UP send 完成水位随 unembed 结果捎带(decode 期的主要载具)
+            wm = getattr(result, "lwd_up_send_watermark", -1)
+            if result is not None and wm is not None and wm >= 0:
+                # 水位按来源 engine 限定(通道级 seqno 流)
+                self.scheduler.lwd_edge_note_send_watermark(
+                    int(getattr(notify, "engine_index", 0) or 0), wm
+                )
             # req_ids x sampled_token_ids 按位对齐:worker lm_head 恢复的采样
             # token,即该请求本步的生成内容;后续仅两处流向——
             # lwd_edge_deliver_tokens(调度器只对账 awaiting 生命周期,

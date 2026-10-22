@@ -277,6 +277,11 @@ class ModelRunnerOutput:
     # to the edge via the control plane; None on non-LWD deployments).
     lwd_c2e_meta: LwdC2eMeta | None = None
 
+    # LWD edge embed 批捎带的 UP send 完成水位(该批 execute 返回时已
+    # 完成的最高 UP seqno;通道 FIFO ⇒ 单水位即精确)。边侧引擎按它
+    # 摘除 pending 闸门条目(语义 = 云侧已收讫)。非 LWD 恒为 -1。
+    lwd_up_send_watermark: int = -1
+
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs]
