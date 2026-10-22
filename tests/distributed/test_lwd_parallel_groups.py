@@ -41,7 +41,14 @@ def _topology(
                 "edges_num": len(edges),
                 "clouds_num": len(clouds),
             },
-            "feature_ctrl": {"enable_early_recv": False, "enable_scramble": False},
+            "feature_ctrl": {
+                "enable_early_recv": False,
+                "scramble": {
+                    "enable": False,
+                    "device_id": None,
+                    "custom_factor": None,
+                },
+            },
             "edges": [_instance(i, dps, cloud=False) for i, dps in enumerate(edges)],
             "clouds": [_instance(i, dps, cloud=True) for i, dps in enumerate(clouds)],
             "instance_links": [{"edge": e, "cloud": c} for e, c in links],

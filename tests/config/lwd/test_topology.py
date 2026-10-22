@@ -86,7 +86,7 @@ def test_invalid_topology_fails_before_runtime(fault: str, match: str) -> None:
     [
         (("deployment", "mode"), False),
         (("deployment", "hccl_world_size"), "10"),
-        (("feature_ctrl", "enable_scramble"), "false"),
+        (("feature_ctrl", "scramble", "enable"), "false"),
         (("edges", 0, "dp", 0, "dp_idx"), True),
         (("edges", 0, "dp", 0, "ranks"), ["0"]),
         (("edges", 0, "dp", 0, "ctrl_port"), 6020),

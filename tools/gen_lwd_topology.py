@@ -161,7 +161,10 @@ def build_topology(
             "edges_num": len(edges),
             "clouds_num": len(clouds),
         },
-        "feature_ctrl": {"enable_early_recv": False, "enable_scramble": False},
+        "feature_ctrl": {
+            "enable_early_recv": False,
+            "scramble": {"enable": False, "device_id": None, "custom_factor": None},
+        },
         "edges": edges,
         "clouds": clouds,
         "instance_links": links,
@@ -219,6 +222,16 @@ def main() -> None:
     parser.add_argument("--enable-early-recv", action="store_true")
     parser.add_argument("--enable-scramble", action="store_true")
     parser.add_argument(
+        "--scramble-device-id",
+        default=None,
+        help="Payload scramble: shared device-pair fingerprint",
+    )
+    parser.add_argument(
+        "--scramble-custom-factor",
+        default=None,
+        help="Payload scramble: business factor shared by both peers",
+    )
+    parser.add_argument(
         "--tenant-key-file",
         default="/run/secrets/edge-cloud-tenant-key",
         help="cloud_share only: tenant key file path on edge side",
@@ -231,7 +244,9 @@ def main() -> None:
     parser.add_argument(
         "--control-url",
         default=None,
-        help="cloud_share only: edge->cloud control service URL; auto-derived if omitted",
+        help=(
+            "cloud_share only: edge->cloud control service URL; auto-derived if omitted"
+        ),
     )
     parser.add_argument(
         "--connect-timeout",
@@ -271,7 +286,11 @@ def main() -> None:
         )
         raw["feature_ctrl"] = {
             "enable_early_recv": args.enable_early_recv,
-            "enable_scramble": args.enable_scramble,
+            "scramble": {
+                "enable": args.enable_scramble,
+                "device_id": args.scramble_device_id,
+                "custom_factor": args.scramble_custom_factor,
+            },
         }
         _validate(raw)
     except ValueError as exc:

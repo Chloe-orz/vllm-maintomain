@@ -41,7 +41,10 @@ def _payload(
             "edges_num": len(edges),
             "clouds_num": len(clouds),
         },
-        "feature_ctrl": {"enable_early_recv": False, "enable_scramble": False},
+        "feature_ctrl": {
+            "enable_early_recv": False,
+            "scramble": {"enable": False, "device_id": None, "custom_factor": None},
+        },
         "edges": edges,
         "clouds": clouds,
         "instance_links": [{"edge": edge, "cloud": cloud} for edge, cloud in links],

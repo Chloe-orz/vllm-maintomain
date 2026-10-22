@@ -17,7 +17,14 @@ def test_log_contains_complete_selected_config_without_reading_key_contents(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, role: str, identity: int
 ) -> None:
     raw = topology_payload("s3_cloud_share_1dp.yaml")
-    raw["feature_ctrl"] = {"enable_early_recv": True, "enable_scramble": True}
+    raw["feature_ctrl"] = {
+        "enable_early_recv": True,
+        "scramble": {
+            "enable": True,
+            "device_id": "ECPAIR-SN-8A3F91",
+            "custom_factor": "biz-2024-q3",
+        },
+    }
     path = tmp_path / "topology.yaml"
     path.write_text(yaml.safe_dump(raw))
     key = tmp_path / "tenant.key"
