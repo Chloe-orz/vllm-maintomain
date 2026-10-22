@@ -394,8 +394,9 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 # 排空时再读(立刻读 = 永远读不到,闸门摘除停摆;真机实录)。
                 if future is not None:
                     batch = getattr(payload, "lwd_batch", None)
+                    meta = getattr(batch, "batch_meta", None)
                     self._lwd_embed_futures_inflight.append(
-                        (future, int(getattr(batch, "engine_index", 0) or 0))
+                        (future, int(getattr(meta, "engine_index", 0) or 0))
                     )
                 prefill_work = True
                 h_emb += 1
