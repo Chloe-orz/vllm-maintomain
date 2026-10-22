@@ -12,6 +12,9 @@ recv hint);调度器每步对"已收未算完"的请求直接开窗:
     waiting 循环算 `num_new_tokens` 时对它取 min(总预算
     `max_num_scheduled_tokens = decode_exact + Σ该值` 压缩保留为总量
     上界);chunk 化从此只是边侧的流量整形;
+  - **攒满批**:数据未收完且窗口不足满窗(数据限速的残余窗)时不开
+    窗,攒到与下一块合并 —— 消除"碎窗独占一步"的固定开销尾巴;
+    末段(已收 == prompt 全长)不受此限,保证请求必然算完;
   - **下发前 W2 核验**:逐请求 `start + got ≤ recv_rows` 且 `got ≤ 窗口`
     (有 cap 在恒真,纯看门狗);KV/预算截断导致的**少排**是合法行为,
     只告警不核验,下一步按原生水位重算;
@@ -275,6 +278,15 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 n = min(arrived, room)
                 if n < 1:
                     break  # 预算尽
+                # 攒满批:数据未收完且不够一个满窗(数据限速的残余窗)
+                # 时本步不开窗,攒到与下一块合并成大窗 —— 消除"碎窗独占
+                # 一步"的固定开销尾巴(一块被预算截断、下一块还在线上时,
+                # 残余几行会被 async 调度单独排成一个 batch)。到达限速下
+                # 这并不损失吞吐(闲置是数据依赖的必然),延迟上限为一个
+                # chunk 到达间隔。末段(已收 == prompt 全长)不受此限,
+                # 保证请求必然算完;抢占重算后 recv_rows 满值,天然不命中。
+                if n < room and computed + arrived < request.num_prompt_tokens:
+                    continue
                 # start 必须此刻捕获:原生 schedule() 会经
                 # ``_update_after_schedule`` **乐观推进** num_computed,
                 # 下发后再读就是窗口末尾而不是起点。
