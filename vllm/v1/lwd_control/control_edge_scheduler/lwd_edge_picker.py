@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """边侧 prefill 组批纯函数:续传优先 + FCFS 前缀 + 末位截断(PD_mix
 唯一形态;PD 分离的单请求逃生通道已随相位机删除)。
 
@@ -56,9 +59,7 @@ def lwd_pick_prefill_batch(
     return picked, expected
 
 
-def _is_single_prefill(
-    single_prefill_min_tokens: int, num_prompt_tokens: int
-) -> bool:
+def _is_single_prefill(single_prefill_min_tokens: int, num_prompt_tokens: int) -> bool:
     """该请求是否触发独占规则(总 prompt 长度达标)。"""
     return (
         single_prefill_min_tokens > 0
@@ -140,8 +141,7 @@ def _pick_new_requests(
     """开新循环:waiting 序取 FCFS 前缀,c = min(prompt, C),新增数
     ≤ free_seq;不跳过队首(保 FCFS 与 seqno 链次序)。single_prefill
     由续传循环传入(True 即本批已收口)。返回 used。"""
-    new_count = 0
-    for cand in waiting:
+    for new_count, cand in enumerate(waiting):
         if single_prefill and picked:
             break
         single_prefill = _is_single_prefill(
@@ -157,5 +157,4 @@ def _pick_new_requests(
         )
         if batch_closed:
             break
-        new_count += 1
     return used

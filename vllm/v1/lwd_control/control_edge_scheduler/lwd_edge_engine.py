@@ -113,6 +113,11 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self._lwd_cloud_params_received.set()
             return True
         if isinstance(msg, LwdC2eNotify):
+            lwd_logger.info(
+                "[edge] c2e received reqs=%d hidden_numel=%d",
+                len(msg.req_ids),
+                msg.hidden_num_elements,
+            )
             self.scheduler.unembed_notify_queue.append(msg)
             self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
             return True
@@ -189,6 +194,11 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     def add_request(self, request: Request, _request_wave: int = 0) -> None:
         """边准入(校验+mrope,调度器本地账) -> 云请求预告(通信归引擎)
         -> 原生引擎入口(原生校验 + 入队 + abort_immediately 原生处理)。"""
+        lwd_logger.info(
+            "[edge] request received req=%s tokens=%d (admit + announce)",
+            request.request_id,
+            request.num_prompt_tokens,
+        )
         self.scheduler.lwd_admit_request(request)
         self._lwd_notify_request(request)
         super().add_request(request)

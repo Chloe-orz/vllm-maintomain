@@ -120,11 +120,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             < 1
         ):
             raise RuntimeError(
-                f"[LWD] 死锁配置: max_num_batched_tokens("
+                f"[LWD] deadlock config: max_num_batched_tokens("
                 f"{self.max_num_scheduled_tokens}) - max_num_seqs("
                 f"{self.max_num_running_reqs}) * spec_factor("
-                f"{self._lwd_spec_factor}) < 1, 续传 chunk 永无可调度预算; "
-                "请增大 max_num_batched_tokens 或减小 max_num_seqs"
+                f"{self._lwd_spec_factor}) < 1, resume chunks would never "
+                "have a schedulable budget; please increase "
+                "max_num_batched_tokens or decrease max_num_seqs"
             )
 
     def has_requests(self) -> bool:
@@ -134,9 +135,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         (原生批队列契约,空批会以 None 结果炸收割路径)。"""
         return bool(self.unembed_notify_queue) or self._lwd_embed_dispatchable()
 
-    def schedule(self) -> SchedulerOutput:
-        """EMBED 优先出批,否则消费 c2e 出 UNEMBED 批(先收尾再开新,
-        防 EMBED 被 decode 回程挤出深度配额)。"""
+    def _lwd_schedule_step(self) -> SchedulerOutput:
+        """Dispatch an EMBED batch first; otherwise consume c2e to produce an
+        UNEMBED batch (finish in-flight work before admitting new work, to
+        keep EMBED from being squeezed out of the depth quota by the decode
+        return trip)."""
         LwdControlDiag.edge_step_activity(
             len(self.running),
             sum(1 for _ in self._lwd_reqs_in_phase(LwdReqPhase.DECODE, self.running)),
@@ -232,6 +235,31 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
         }
 
+    @staticmethod
+    def _lwd_row_disposition(accepted: int, has_tokens: bool, finished: bool) -> str:
+        """Per-row delivery disposition (pad-and-skip, ported from the mm
+        branch 7ff2ddc3e):
+
+        - "skip": zero-accepted live row (accepted=0 and not finished) -- in
+          a mixed step, prefill requests occupy only reserved slots in the
+          sampling layout (Ascend MTP sampling only fills rows the draft
+          participated in), so the collector computes accepted=0 via
+          (sampled != -1).sum(). Such rows are protocol artifacts of the
+          mixed step; they are kept in the notify only for DOWN tensor
+          alignment: no delivery, no ERROR, no first-token marking (before
+          the fix this form used to kill requests as ERROR);
+        - "error": declares accepted>0 yet has no token = a real unembed
+          failure; ERROR takes precedence over the cloud finish code
+          (original semantics preserved);
+        - "deliver": everything else (including zero-accepted closing rows
+          that carry a finish code -- the termination signal must be passed
+          through; swallowing it would lose the completion)."""
+        if accepted == 0 and not finished:
+            return "skip"
+        if not has_tokens and not finished:
+            return "error"
+        return "deliver"
+
     def _lwd_deliver_unembed(
         self, notify: LwdC2eNotify, sampled_token_map: dict[str, list[int]]
     ) -> tuple[list[EngineCoreOutput], set[str]]:
@@ -239,27 +267,36 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         于云侧完成码;不在 awaiting 的迟到结果幂等丢弃。"""
         outputs: list[EngineCoreOutput] = []
         finished: set[str] = set()
+        # accepted is position-aligned with rows (same contract as
+        # lwd_build_unembed_batch); the DISABLE_DOWN bypass carries no
+        # accepted, so token presence/absence is used instead
+        accepts = notify.num_accepted_tokens
         for index, request_id in enumerate(notify.req_ids):
             finish_reason = self._lwd_finish_code(notify, index)
             finished_now = finish_reason is not None
             sampled_token_ids = list(sampled_token_map.get(request_id, []))
+            accepted = accepts[index] if accepts else (1 if sampled_token_ids else 0)
+            disposition = self._lwd_row_disposition(
+                accepted, bool(sampled_token_ids), finished_now
+            )
+            if disposition == "skip":
+                # Zero-accepted live row: no delivery, no empty output, and
+                # no needless debug-tax logging
+                continue
             LwdControlDiag.edge_tokens_delivered(
                 request_id,
                 sampled_token_ids,
                 finish_reason,
                 self.vllm_config,
             )
-            if not sampled_token_ids and not finished_now:
-                # [Lwd][eos-trace] B 点:kill 行留痕,按 down_seqno 与
-                # A(云零接受行)/C(worker 缺行)配对定案根因
+            if disposition == "error":
+                # [Lwd][eos-trace] point B: leave a trace for kill rows;
+                # pair by down_seqno with A (cloud zero-accepted row) / C
+                # (worker missing row) to settle the root cause
                 LwdControlDiag.trace_edge_kill_row(
                     seqno=notify.down_seqno,
                     rid=request_id,
-                    accepted=(
-                        notify.num_accepted_tokens[index]
-                        if index < len(notify.num_accepted_tokens)
-                        else -1
-                    ),
+                    accepted=accepted,
                     finish_code=(
                         notify.finish_reasons[index] if notify.finish_reasons else -1
                     ),
@@ -276,8 +313,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     request_id,
                 )
                 continue
-            if not sampled_token_ids and not finished_now:
-                continue  # 无内容且未完结:不出空输出
             if finished_now:
                 # 云端判停的地面真相落地:原生 finish 清账(KV/缓存释放
                 # 与 finished_req_ids 交接全走原生)
@@ -432,6 +467,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         items, req_ids, token_slices, prompt_offsets, has_mrope = built
         seqno = self._lwd_seqno
         assert self.lwd_send_to_cloud is not None, "cloud not connected"
+        lwd_logger.info(
+            "[edge] range announced seqno=%d reqs=%d tokens=%d",
+            seqno,
+            len(items),
+            sum(i.num_tokens for i in items),
+        )
         self.lwd_send_to_cloud(LwdRangeNotify(seqno=seqno, items=items))
         self._lwd_seqno = seqno + 1
         self._lwd_pending_batches[seqno] = set(req_ids)
