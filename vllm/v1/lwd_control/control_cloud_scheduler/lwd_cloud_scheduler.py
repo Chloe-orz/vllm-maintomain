@@ -13,6 +13,10 @@ decode-only,预告留队首重试;放行步 offset 对账 + 双钳制复现 +
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+import torch
+
 from vllm.lwd_logger import lwd_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import (
@@ -37,16 +41,45 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 
+LwdDownCarrier = tuple[torch.Tensor, list[str], int, int]
+"""``ModelRunnerOutput.lwd_down_carrier`` attached by the cloud worker:
+(pinned packed meta, req_ids, hidden numel, DOWN seqno)."""
+
+
+@dataclass
+class LwdC2eMeta:
+    """Step metadata unpacked from the cloud worker's DOWN carrier; the
+    scheduler forwards it to the edge ahead of the DOWN hidden tensor
+    (the data plane carries only the tensor itself)."""
+
+    # Total element count of the DOWN hidden tensor for this step.
+    hidden_num_elements: int
+    # Per-request sampled-token rank within the step's logits ("top-id-th"),
+    # one row per request in hidden row order.
+    top_id_ths: list[list[int]]
+    # Per-request draft accept counts (0 for non-spec steps).
+    num_accepted_tokens: list[int]
+    # Request ids in hidden row order.
+    req_ids: list[str]
+    # DOWN channel seqno of this step's packet; the edge posts its matching
+    # irecv with this exact value for pairing on the tag-less HCCL wire.
+    down_seqno: int
+
 
 class LwdCloudScheduler(LwdBaseScheduler):
     """notify 门控的 prefill/decode 混排调度器(PD_mix,云侧唯一形态)。"""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # prefill 通知队列:引擎 ingest 线程投递边侧批量 RangeNotify,本线程每步
-        # 至多消费队首一条;预告自带 seqno 即本批 UP 链配对号。引擎侧经
-        # self.scheduler.prefill_notify_queue 借引用投递/清扫(线程纪律
-        # 归通知队列)
+        # seqno ledger for one-shot gate logs: recorded once on the first HOLD
+        # check, cleared and recorded again on OPEN
+        self._lwd_gate_logged: set[int] = set()
+        # Prefill notify queue: the engine ingest thread posts edge-side
+        # batched RangeNotify here; this thread consumes at most one head item
+        # per step. The notify carries its own seqno, which is the UP-chain
+        # pairing number of this batch. The engine side posts/sweeps via
+        # self.scheduler.prefill_notify_queue by reference (thread discipline
+        # belongs to the notify queue)
         self.prefill_notify_queue = LwdPrefillNotifyQueue()
         # MTP 预算系数:decode 每请求每步消耗 1+k 个 token(草稿 token
         # 占预算与 KV);公式唯一住处 lwd_base_scheduler.lwd_spec_factor
@@ -76,6 +109,19 @@ class LwdCloudScheduler(LwdBaseScheduler):
         carrier = getattr(model_runner_output, "lwd_down_carrier", None)
         if carrier is not None:
             meta = self._lwd_carrier_to_meta(carrier)
+            # Deliver committed counts (same source as the finish
+            # decision): collector counts are device-side derivatives
+            # without check_stop truncation (stop/EOS/max_tokens), and
+            # the edge delivery path performs no local stop check — the
+            # delivered count must be same-source with the finish
+            # decision. Requests absent from the outputs get 0 (the
+            # edge's pad-and-skip disposition handles them).
+            committed = {
+                out.request_id: len(out.new_token_ids)
+                for outputs in engine_core_outputs.values()
+                for out in outputs.outputs
+            }
+            meta.num_accepted_tokens = [committed.get(rid, 0) for rid in meta.req_ids]
             LwdControlDiag.cloud_step(self, meta, engine_core_outputs)
             finish_reasons = self._lwd_c2e_finish_reasons(
                 meta.req_ids, engine_core_outputs
@@ -133,7 +179,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         )
 
     @staticmethod
-    def _lwd_carrier_to_meta(carrier):
+    def _lwd_carrier_to_meta(carrier: LwdDownCarrier) -> LwdC2eMeta:
         """pinned 载荷解包为步元数据。
 
         载荷 = 云侧收集后 pinned 的扁平 int 张量,按"变长段在前、定长
@@ -151,11 +197,9 @@ class LwdCloudScheduler(LwdBaseScheduler):
         再按 seg_lens 把 ranks 切回逐请求的 top_id_ths 行
         (本例 [[r0,r1,r2],[r0]])。-2*n_req/-n_req 两个魔数即
         "counts 段 + seg_lens 段"两条定长尾巴的宽度。"""
-        from vllm.v1.outputs import LwdC2eMeta
-
-        pinned, req_ids, hidden_numel, seqno = carrier
+        packed, req_ids, hidden_numel, seqno = carrier
         n_req = len(req_ids)
-        vals = pinned.tolist()
+        vals = packed.tolist()
         counts = vals[-2 * n_req : -n_req]
         seg_lens = vals[-n_req:]
         ranks_flat = vals[: -2 * n_req]
@@ -243,14 +287,36 @@ class LwdCloudScheduler(LwdBaseScheduler):
 
     def _lwd_up_recv_complete(self, notify: LwdRangeNotify) -> bool:
         """提前收闸门:该 seqno 的 UP 数据收完才放行;判据 = 通道水位(FIFO 完成序)。"""
+        from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
             is_irecv_complete,
+            watermark,
         )
-        from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 
         ready = is_irecv_complete(LwdChannelType.UP, notify.seqno)
-        # [Lwd][pre-recv] 闸门读数:与 HINT/SUBMIT/DONE/REPORT/POST 用同一单调钟,
-        # 可把"预告到达->worker挂recv->worker收完上报->引擎放行"四段直接相减。
+        # [Lwd][pre-recv] Gate readings: use the same monotonic clock as
+        # HINT/SUBMIT/DONE/REPORT/POST, so the four segments "notify arrival
+        # -> worker posts recv -> worker reports completion -> engine
+        # releases" can be subtracted directly. Logged once per seqno (first
+        # HOLD check and OPEN) to avoid flooding on every idle step.
+        seen = self._lwd_gate_logged
+        if ready:
+            if notify.seqno in seen:
+                return True
+            seen.discard(notify.seqno)
+            lwd_logger.info(
+                "[cloud-sched] notify seqno=%d gate OPEN watermark=%d",
+                notify.seqno,
+                watermark(LwdChannelType.UP),
+            )
+        elif notify.seqno not in seen:
+            seen.add(notify.seqno)
+            lwd_logger.info(
+                "[cloud-sched] notify seqno=%d gate HOLD watermark=%d "
+                "(UP not fully received; silent retry afterwards)",
+                notify.seqno,
+                watermark(LwdChannelType.UP),
+            )
         return ready
 
     def _lwd_preflight_ok(self, items: list[LwdRangeItem], num_decode: int) -> bool:
@@ -291,10 +357,12 @@ class LwdCloudScheduler(LwdBaseScheduler):
             return False
         return True
 
-    def schedule(self) -> SchedulerOutput:
-        """混排调度:每步四道门决策——条目对账(all-or-nothing)→ 提前收
-        水位 → preflight 三检 → 混排步;任一门不过即本步 decode-only,
-        预告留队首下步重试。"""
+    def _lwd_schedule_step(self) -> SchedulerOutput:
+        """Mixed scheduling: four gates decide each step -- item
+        reconciliation (all-or-nothing) -> early-receive watermark ->
+        preflight triple check -> mixed step; if any gate fails, this step
+        is decode-only and the notify stays at the queue head for retry
+        next step."""
         decode_ids = self._lwd_collect_decode_requests()
         notify = self.prefill_notify_queue.peek()
         if notify is not None:
