@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """LWD 控制面诊断中枢:开关现读、spec 接受率观测、诊断旁路的判定与
 载荷提取、debug 打点转发。
 
@@ -30,9 +33,35 @@ _SPEC_LOG_INTERVAL_S = 10.0
 def _lwd_debug_mods():
     """lwd_debug 惰性进口:本模块顶层保持零重依赖(纯逻辑可测),
     lwd_control 内对 lwd_debug 的 import 仍唯一收口在这里。"""
-    from vllm.v1.lwd_debug import LwdControlLog, LwdDebug, LwdLogBase
-
+    try:
+        from vllm.v1.lwd_debug import LwdControlLog, LwdDebug, LwdLogBase
+    except ImportError:
+        return _LwdDebugNoOp, _LwdDebugNoOp, _LwdDebugNoOp
     return LwdControlLog, LwdDebug, LwdLogBase
+
+
+class _LwdDebugNoOp:
+    """No-op stand-in for the not-yet-migrated vllm.v1.lwd_debug classes."""
+
+    @staticmethod
+    def set_debug(enabled: bool) -> None:
+        pass
+
+    @staticmethod
+    def flight(running: int, awaiting: int) -> None:
+        pass
+
+    @staticmethod
+    def edge_tokens_delivered(*args: object, **kwargs: object) -> None:
+        pass
+
+    @staticmethod
+    def cloud_step(*args: object, **kwargs: object) -> None:
+        pass
+
+    @staticmethod
+    def cloud_request_admitted(*args: object, **kwargs: object) -> None:
+        pass
 
 
 class LwdControlDiag:
@@ -135,9 +164,10 @@ class LwdControlDiag:
 
         rate = self._spec_accepted / self._spec_draft_tokens * 100
         lwd_logger.info(
-            "[spec] cumulative: rate=%.1f%% accepted=%d "
-            "draft_tokens=%d",
-            rate, self._spec_accepted, self._spec_draft_tokens,
+            "[spec] cumulative: rate=%.1f%% accepted=%d draft_tokens=%d",
+            rate,
+            self._spec_accepted,
+            self._spec_draft_tokens,
         )
 
     # ------------------------------------------------------------------ #
@@ -173,7 +203,7 @@ class LwdControlDiag:
         return ids_by_req
 
     @staticmethod
-    def bypass_unembed_rows(batch) -> "tuple[list[str], list[list[int]]] | None":
+    def bypass_unembed_rows(batch) -> tuple[list[str], list[list[int]]] | None:
         """DISABLE_DOWN 直通判定与行集:UNEMBED 批且通告携带旁路
         token(hidden=0)时返回 (req_ids, 旁路 token 行),否则 None。
         只出数据不出执行适配器——直通 future/伪输出由边引擎包装。"""
@@ -219,16 +249,14 @@ class LwdControlDiag:
     ) -> None:
         """[Lwd][eos-trace] A 点·云侧组 c2e 时:存在零接受行才留痕
         (MTP 正常步每行至少接受根 token,零接受≈0,日志量可控)。"""
-        rows = LwdControlDiag.zero_accept_rows(
-            req_ids, accepted, finish_reasons
-        )
+        rows = LwdControlDiag.zero_accept_rows(req_ids, accepted, finish_reasons)
         if rows:
             from vllm.lwd_logger import lwd_logger
 
             lwd_logger.info(
-                "[eos-trace] cloud seqno=%s zero-accept rows "
-                "(rid,acc,fin)=%s",
-                seqno, rows,
+                "[eos-trace] cloud seqno=%s zero-accept rows (rid,acc,fin)=%s",
+                seqno,
+                rows,
             )
 
     @staticmethod
@@ -262,10 +290,7 @@ class LwdControlDiag:
         """worker 回填缺行判定:声明 accepted>0 的行却无 token 输出
         (不在回填行集或 token 列表为空)——C 点数据。accepted=0 的行
         worker 不产出属合法,不计缺。"""
-        filled = {
-            rid: toks
-            for rid, toks in zip(result_req_ids, sampled_token_ids)
-        }
+        filled = {rid: toks for rid, toks in zip(result_req_ids, sampled_token_ids)}
         return [
             rid
             for rid, acc in zip(req_ids, accepts)
@@ -292,4 +317,3 @@ class LwdControlDiag:
                 "[eos-trace] worker seqno=%s missing rows=%s",
                 seqno, missing,
             )
-
