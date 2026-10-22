@@ -11,6 +11,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from typing import Any
 
 import torch
 
@@ -54,6 +55,40 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
 
     lwd_scheduler_cls = LwdCloudScheduler
     scheduler: LwdCloudScheduler
+
+    def __init__(self, *args: Any, lwd_dp_size: int, **kwargs: Any) -> None:
+        # Pre-recv hint MQ must exist before super().__init__ spawns the
+        # executor workers (same process): create_hint_mq() publishes the
+        # handle through the environment, and only processes spawned after
+        # that see it. The sideband MQ exists because rpc_broadcast_mq is
+        # drained by the worker's single-threaded busy loop, which sits
+        # inside a several-hundred-ms prefill forward - hints queued behind
+        # it would lose the whole point of pre-posting the receive.
+        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import create_hint_mq
+
+        self._lwd_hint_mq = create_hint_mq()
+        super().__init__(*args, lwd_dp_size=lwd_dp_size, **kwargs)
+        # The cloud endpoint worker created its done-report MQ during
+        # init_device; now that the executor is up, fetch its handle over
+        # the executor's collective RPC (the executor itself stays free of
+        # LWD plumbing). Exactly one worker - the endpoint rank - must
+        # report a handle; anything else is a wiring error.
+        from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
+
+        handles = [
+            handle
+            for handle in self.model_executor.collective_rpc(
+                "lwd_early_recv_done_handle"
+            )
+            if handle is not None
+        ]
+        if len(handles) != 1:
+            raise RuntimeError(
+                "[LWD] early receive expects one endpoint worker reporting "
+                f"completions, got {len(handles)}"
+            )
+        self._lwd_done_mq = MessageQueue.create_from_handle(handles[0], 0)
+        lwd_logger.info("[pre-recv] hint MQ created, done MQ attached via RPC")
 
     def _lwd_assemble(self) -> None:
         self._lwd_ingest_thread: threading.Thread | None = None
@@ -117,7 +152,7 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         busy_loop 单线程消费,会被几百毫秒的 prefill 前向堵住,提示就
         "早"不起来了)。引擎在 super().__init__ 里就把 executor 建好了,
         故此处直接取。"""
-        hint_mq = getattr(self.model_executor, "lwd_recv_hint_mq", None)
+        hint_mq = self._lwd_hint_mq
         if hint_mq is not None:
             from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
                 register_hint_sender,
@@ -158,6 +193,11 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
     ) -> None:
         """Ingest thread: range notify -> notify queue + pre-recv hint;
         request notify -> native ADD."""
+        lwd_logger.info(
+            "[cloud] ingest msg=%s seqno=%s",
+            type(msg).__name__,
+            getattr(msg, "seqno", "-"),
+        )
         # TODO(lwd): several edges per cloud DP rank need requests tracked by
         # the peer that owns them, issue #8.
         if isinstance(msg, LwdRangeNotify):
@@ -179,12 +219,25 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
 
             num_tokens = sum(item.num_tokens for item in items)
             aux_rows = 0
-            # 先打点再入队:worker 通信线程 0.5ms 就能取走,若打点在入队之后,
-            # 跨进程写日志的次序会让 hint2sub 出现负值,看着像时序错乱。
+            # Log before enqueueing: the worker comm thread can pick
+            # the hint up within 0.5 ms; if the log came after the
+            # enqueue, cross-process log write ordering would make
+            # hint2sub go negative, which looks like a timing anomaly.
+            lwd_logger.info(
+                "[Lwd][pre-recv] HINT seqno=%d num_tokens=%d ts=%.3f",
+                msg.seqno,
+                num_tokens,
+                time.monotonic(),
+            )
             post_irecv_hint(make_recv_hint(msg.seqno, num_tokens, aux_rows))
         elif isinstance(msg, LwdRequestNotify):
             request = self._lwd_build_request(msg)
             self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
+            lwd_logger.info(
+                "[cloud] request added req=%s tokens=%d",
+                msg.request_id,
+                msg.num_prompt_tokens,
+            )
 
     def shutdown(self) -> None:
         # Before the executor goes: a pre-recv hint blocks on its queue.
@@ -245,7 +298,7 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
 
     def _lwd_drain_irecv_completions(self) -> None:
         """每步排空 done MQ,把 worker 收完的 UP recv 并进提前收水位(闸门就绪判据)。"""
-        done_mq = getattr(self.model_executor, "lwd_irecv_done_mq", None)
+        done_mq = getattr(self, "_lwd_done_mq", None)
         if done_mq is None:
             return
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
@@ -264,7 +317,14 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
                 break
         if not items:
             return
-        record_irecv_completions(items)
+        advanced = record_irecv_completions(items)
+        lwd_logger.info(
+            "[Lwd][pre-recv] DRAIN n=%d seqnos=%s advanced=%s ts=%.3f",
+            len(items),
+            sorted({s for _ch, s in items}),
+            sorted({s for _ch, s in advanced}) if advanced else "[]",
+            time.monotonic(),
+        )
 
     def post_step(self, model_executed: bool) -> None:
         """Flush pending c2e to the edge at the end of the step (the
