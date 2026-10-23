@@ -405,6 +405,13 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            # LWD per-request window cap: set by LwdCloudMixedScheduler on
+            # prefill requests whose embeddings are only partially staged,
+            # so the pooled token budget cannot over-schedule a request
+            # beyond its window. None for all other requests.
+            lwd_window_cap = getattr(request, "lwd_window_cap", None)
+            if lwd_window_cap is not None:
+                num_new_tokens = min(num_new_tokens, lwd_window_cap)
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
@@ -682,6 +689,12 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    # LWD per-request window cap (see the RUNNING-loop twin
+                    # above): bounds this request to the rows whose embeddings
+                    # have actually been staged for the current window.
+                    lwd_window_cap = getattr(request, "lwd_window_cap", None)
+                    if lwd_window_cap is not None:
+                        num_new_tokens = min(num_new_tokens, lwd_window_cap)
                     logger.info(
                         "sched dbg: num_new=%s computed=%s num_tokens=%s prompt=%s status=%s",
                         num_new_tokens, num_computed_tokens, request.num_tokens,

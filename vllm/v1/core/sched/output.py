@@ -35,7 +35,16 @@ class LwdBatchType(enum.Enum):
 
 @dataclass
 class LwdEmbedBatch:
-    """LWD prefill_only mode edge execute batch"""
+    """LWD prefill_only mode edge execute batch.
+
+    云侧不再"整批一次算完":调度器按**每个请求已收到多少行**与实时 KV 预算
+    取小来决定本步算多少(design v7 §5.3),逐请求的下发量由原生
+    ``num_scheduled_tokens`` 表达 —— 所以这里**不再需要** ``windows`` /
+    ``chunk_offsets``:那份拷贝会与原生水位分歧,而分歧的表现是静默切错窗口。
+
+    注意 ``token_ids`` 的长度仍是**边侧整批发送的逐请求行数**(HCCL P2P 要求
+    两端 numel 严格相等),它是"这一批有多少行"的事实,不是"本步算多少"。
+    """
 
     req_ids: list[str] = field(default_factory=list)
     token_ids: list[list[int]] = field(default_factory=list)
@@ -57,6 +66,21 @@ class LwdEmbedBatch:
     # 目标云 engine(= dp_rank):多 DP 下数据面按它选 UP 通道;
     # 单云恒 0。
     engine_index: int = 0
+
+    # 逐请求的 prompt 总行数(消费点补挂 recv 时,暂存池按它把 per-request
+    # host buffer 一次分够全长 —— 提示(hint)路径丢失时的权威兜底)。
+    prompt_lens: list[int] = field(default_factory=list)
+
+    # ------------------------------------------------------------------ #
+    # 已 abort 的请求(跨进程捎带,design v7 §6.4)                        #
+    # ------------------------------------------------------------------ #
+    # 它们的剩余行**永远不会**被算完,但载荷已经暂存在 host 上。调度器的
+    # 摘除台账只活在调度器进程里,worker 的暂存池看不到 —— 必须随批捎带过去,
+    # worker 才能冻结这些请求的剩余行(释放仍然等请求结束,§6.1)。
+    # v7 注:逐请求下发量改由原生 ``num_scheduled_tokens`` 表达,
+    # 所以这里不再有 ``windows`` / ``chunk_offsets`` 那份拷贝 —— 它与原生
+    # 水位是同一件事的两份账,分歧时表现为静默切错窗口。
+    aborted_req_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -100,6 +124,11 @@ class NewRequestData:
     prompt_embeds_shape: tuple[int, ...] | None = None
     prompt_embeds_dtype: "torch.dtype | None" = None
     prompt_is_token_ids: list[bool] | None = None
+    # LWD 全量 mrope positions([3, prompt_len] int64 字节):由
+    # RequestNotify 透传进 Request,调度器在 new_reqs 里随 SO 带给
+    # runner,准入时一次性写入 req_state(替代按 chunk 切窗携带)。
+    # 纯文本/非 LWD 恒为空字节。
+    lwd_mrope_positions: bytes = b""
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None

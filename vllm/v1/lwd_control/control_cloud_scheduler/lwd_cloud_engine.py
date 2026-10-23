@@ -93,7 +93,72 @@ class LwdCloudEngineCoreMixin:
             "[Lwd][pre-recv] armed=%s scheduler=%s",
             self._lwd_early_recv, scheduler_name,
         )
+        self._lwd_check_host_stage_switch()
         super().__init__(*args, **kwargs)
+        # [Lwd][perf] 段计时:把每步引擎侧时间拆成 drain/sched/submit/
+        # sampleq/update 五段(其余 = 队列等待)。实例属性覆写包装,
+        # 不动原生 core.py;基线与 offload 分支都打,才能对表。
+        self._lwd_segs: dict[str, float] = {}
+        self._lwd_install_step_probes()
+
+    def _lwd_install_step_probes(self) -> None:
+        """实例级包装三个逐步调用点,时长计入 ``_lwd_segs``(毫秒)。"""
+        segs = self._lwd_segs
+
+        def _wrap(obj, attr, key):
+            orig = getattr(obj, attr, None)
+            if orig is None:
+                return
+
+            def _timed(*a, **kw):
+                t = time.monotonic()
+                try:
+                    return orig(*a, **kw)
+                finally:
+                    segs[key] = (time.monotonic() - t) * 1000
+
+            setattr(obj, attr, _timed)
+
+        _wrap(self.scheduler, "schedule", "sched")
+        _wrap(self.scheduler, "update_from_output", "update")
+        _wrap(self.model_executor, "execute_model", "submit")
+        _wrap(self.model_executor, "sample_tokens", "sampleq")
+
+    def _lwd_check_host_stage_switch(self) -> None:
+        """Fail fast when the cloud would deadlock on a missing switch.
+
+        PD_mix 的调度依赖"每个请求已收到多少行"(`recv_rows`)来决定下发多少,
+        而这个上报只由云 worker 的 host 暂存路径产生
+        (`VLLM_ASCEND_LWD_HOST_STAGE=1`)。开关关着时:
+
+            stager is None -> 不上报行数 -> recv_rows 恒 0
+            -> 可见集谓词永远挡掉该请求 -> 云侧空转,边侧等云端响应而挂住
+
+        这是一个**静默死锁**:两边都不报错,只是整个系统停住。所以这里在启动
+        阶段就把它点出来 —— 跨进程读不到 worker 的环境变量,读的是引擎自己
+        的环境(同一套启动脚本导出,足以判断配错)。
+
+        注意:这不是"开关关闭时的合法降级"。本方案的调度与上报是同一件事的
+        两半,必须同时在场。
+        """
+        if not self._lwd_early_recv:
+            return
+        try:
+            from vllm_ascend import envs
+        except ImportError:
+            logger.warning(
+                "[Lwd][host-stage] 无法导入 vllm_ascend.envs,跳过开关自检"
+            )
+            return
+        if envs.VLLM_ASCEND_LWD_HOST_STAGE:
+            return
+        raise RuntimeError(
+            "[Lwd][host-stage] VLLM_ASCEND_LWD_HOST_STAGE 未开启,但云端点"
+            "调度器需要它上报\"每个请求已收多少行\"。继续运行会静默死锁:"
+            "云侧 recv_rows 恒为 0 -> 可见集谓词挡掉所有 prefill -> 云侧空转、"
+            "边侧等不到云端响应。请在**云侧**启动脚本里 export "
+            "VLLM_ASCEND_LWD_HOST_STAGE=1 后重启。"
+        )
 
     def _lwd_setup_zmq(self) -> None:
         """介入 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载首拍
@@ -117,7 +182,8 @@ class LwdCloudEngineCoreMixin:
         self._lwd_hello = LwdHelloNotify(
             pre_out_host=config.pre_out_host,
             pre_out_port=pre_out_port,
-            # 调度三元组供边侧互校(cap/preflight 公式的同源输入)
+            # 调度配置供边侧互校(批上限/名额的同源输入);
+            # num_speculative_tokens 仅为 wire 兼容保留,边侧不再使用
             max_num_batched_tokens=sched_config.max_num_batched_tokens,
             max_num_seqs=sched_config.max_num_seqs,
             num_speculative_tokens=(
@@ -136,6 +202,17 @@ class LwdCloudEngineCoreMixin:
         self._lwd_announce()
         # 门池:元数据查重与暂存,到达即构建放行;仅本 IO 线程独占
         self._lwd_gate_pending: dict[str, LwdRequestNotify] = {}
+        # 逐请求 prompt 全长(IO 线程本地台账,供 recv hint 的 prompt_lens)。
+        # **绝不**在 IO 线程上读 scheduler.requests:ADD 经 input_queue 异步
+        # 落地,RangeNotify 先于 ADD 是常态(并发下 input_queue 积压),
+        # 直读会 KeyError 打死本线程、控制面停摆(真机实录:并发卡死)。
+        self._lwd_prompt_lens: dict[str, int] = {}
+        # [host 暂存 / design v7 §5.2] 逐请求"已收行数"台账:worker 在 D2H
+        # 完成时随水位上报捎带过来,调度器按它决定下一步能给这个请求下发多少
+        # 行(§5.3 的 min(已收−已算, 预算))。引用交付调度器(IO 线程写 /
+        # 主循环读,dict 赋值原子)。
+        self._lwd_recv_rows: dict[str, int] = {}
+        self.scheduler.lwd_recv_rows = self._lwd_recv_rows
         # UP 链 seqno 登记(边→云→云 worker 的最后一跳,§9.12 接缝):
         # rid -> [chunk 序 seqno 列表],RangeNotify 到达即登记;调度器
         # 出 prefill 批时取快照挂 SO.lwd_up_seqnos 随批下发云 worker
@@ -260,18 +337,16 @@ class LwdCloudEngineCoreMixin:
                 len(items), sum(item.num_tokens for item in items),
                 msg.seqno,
             )
-            # 每条预告都整条入队(重复预告即重复点名,剔除-调度-拼回幂等,
-            # 无副作用;PRE_OUT 只 append,调度主线程单独 popleft,deque
-            # 单操作原子;预告自带 seqno,出批时作 UP 链配对号)
-            self.scheduler.prefill_notify_queue.append(msg)
+            # wire_version 3 起调度改为 arrival 驱动:预告**不再入调度
+            # 队列**,只驱动数据面提前收(下面的 hint)。调度器按
+            # ``recv_rows > num_computed`` 自行决定给谁下发多少行。
             # [Lwd][pre-recv] 提前收①:预告到达即给云 worker 下发提示(seqno +
             # flat token 数),worker 的通信线程收到就挂精确尺寸的
             # UP irecv(主帧 hash 载荷) —— 不再等这个批的
             # SchedulerOutput 下发。num_tokens 取 items 逐条目之和
-            # (mixed 恒填 items;顶层字段只描述首条目)。mrope positions
-            # 已随 RangeNotify 走控制面(wire_version>=2),UP 数据面只有
+            # (mixed 恒填 items;顶层字段只描述首条目)。UP 数据面只有
             # 主帧,aux_rows 恒 0——若残留非零,worker 会预挂一条永远收
-            # 不到数据的 aux irecv,水位停摆、闸门后的批永不下发。
+            # 不到数据的 aux irecv,水位停摆。
             if self._lwd_early_recv:
                 from vllm_ascend.distributed.lwd_comm.pre_recv import (
                     make_recv_hint,
@@ -280,21 +355,60 @@ class LwdCloudEngineCoreMixin:
 
                 num_tokens = sum(item.num_tokens for item in items)
                 aux_rows = 0
+                # host 暂存(design v7 §4.3)要在"挂 recv"的时刻就知道逐请求
+                # 行表:暂存池按它把整块接收载荷拆到各请求自己的 buffer。
+                #
+                # ★ 两套坐标都要给,别合成一个:
+                #   * ``offsets``        = 该请求这段行在**本批载荷内**的起点;
+                #   * ``prompt_offsets`` = 它在**自己 prompt 内**的起点。
+                # 这里 ``LwdRangeItem.offset`` 是 **prompt 坐标**(调度器就是拿
+                # 它与 ``request.num_computed_tokens`` 对账的),所以它属于后者。
+                # 批内布局由 worker/stager 按行数自行累加得出 —— 曾经把 prompt
+                # 坐标当批内布局传给 stager,后果是"批里第二个请求"的写入偏移
+                # 算成 0,数据写到自己 buffer 之外。
+                req_ids = [item.request_id for item in items]
+                rows = [item.num_tokens for item in items]
+                prompt_offsets = [item.offset for item in items]
+                # 逐请求 prompt 全长:暂存池按它在首个 chunk 就把
+                # per-request host buffer 一次分够(消灭扩容及其与在飞
+                # D2H 的竞态)。取自 IO 线程本地台账(元数据先于预告到达,
+                # 协议保证);缺失是协议错误,跳过本条提示 —— 消费点会以
+                # SO meta 兜底补挂,提前收只是少赚一拍,不致命。
+                prompt_lens = [
+                    self._lwd_prompt_lens.get(rid, 0) for rid in req_ids
+                ]
+                if any(n <= 0 for n in prompt_lens):
+                    logger.error(
+                        "[Lwd][pre-recv] HINT seqno=%d skipped: missing "
+                        "prompt_lens for %s (RangeNotify before metadata — "
+                        "protocol violation)",
+                        msg.seqno,
+                        [r for r in req_ids
+                         if self._lwd_prompt_lens.get(r, 0) <= 0],
+                    )
+                    return
                 # 先打点再入队:worker 通信线程 0.5ms 就能取走,若打点在入队之后,
                 # 跨进程写日志的次序会让 hint2sub 出现负值,看着像时序错乱。
                 logger.info(
                     "[Lwd][pre-recv] HINT seqno=%d num_tokens=%d aux_rows=%d "
-                    "ts=%.3f",
-                    msg.seqno, num_tokens, aux_rows, time.monotonic(),
+                    "prompt_offsets=%s ts=%.3f",
+                    msg.seqno, num_tokens, aux_rows, prompt_offsets,
+                    time.monotonic(),
                 )
                 post_irecv_hint(
-                    make_recv_hint(msg.seqno, num_tokens, aux_rows)
+                    make_recv_hint(
+                        msg.seqno, num_tokens, aux_rows,
+                        req_ids=req_ids, rows=rows,
+                        prompt_offsets=prompt_offsets,
+                        prompt_lens=prompt_lens,
+                    )
                 )
             return
         if isinstance(msg, LwdAbortNotify):
             logger.info("[Lwd][cloud-ctrl] AbortNotify req=%s", msg.request_id)
             self._lwd_gate_pending.pop(msg.request_id, None)
             self._lwd_seqno_registry.pop(msg.request_id, None)
+            self._lwd_prompt_lens.pop(msg.request_id, None)
             # 预告队列**不改**:该请求已预告的 chunk 数据已在线上,必须由
             # 调度器先算完再终结(见 LwdBaseScheduler.finish_requests);
             # "请求已不存在"时的条目清理也在那里做。
@@ -308,6 +422,9 @@ class LwdCloudEngineCoreMixin:
             return
         logger.info("[Lwd][cloud-ctrl] RequestNotify req=%s", rid)
         self._lwd_gate_pending[rid] = msg
+        # prompt 全长入本地台账:recv hint 的 prompt_lens 从这里取(IO 线程
+        # 读 scheduler.requests 会踩 ADD 未落地的坑,见 __init__ 注释)。
+        self._lwd_prompt_lens[rid] = msg.num_prompt_tokens
         self._lwd_promote(rid)
 
     def _lwd_promote(self, request_id: str) -> None:
@@ -370,6 +487,7 @@ class LwdCloudEngineCoreMixin:
             # worker 本地分配):35MB 零 buffer 走 MQ overflow 通道实测
             # 单程 240ms+,是 prefill SO 开工延迟的主因。
             request.lwd_embeds_placeholder = True
+            request.lwd_mrope_positions = wire.mrope_positions
             return request
         hash_block_size = resolve_kv_cache_block_sizes(
             self.scheduler.kv_cache_config, self.vllm_config
@@ -392,37 +510,54 @@ class LwdCloudEngineCoreMixin:
             block_hasher=block_hasher,
         )
         request.lwd_embeds_placeholder = True  # 同上:占位 embeds 不上 MQ
+        request.lwd_mrope_positions = wire.mrope_positions
         return request
     
     def step_with_batch_queue(self):
-        """步骤执行时长打点(开始执行→执行结束;不含引擎空等)。"""
+        """步骤执行时长打点(开始执行→执行结束;不含引擎空等)。
+
+        分段:drain=到达排水;sched=调度;submit=execute_model 下发;
+        sampleq=sample_tokens 下发;update=update_from_output;其余
+        (队列等待等)= exec − 各段之和。"""
+        segs = self._lwd_segs
+        segs.clear()
         _t0 = time.monotonic()
         self._lwd_drain_irecv_completions()
+        _t1 = time.monotonic()
         out = super().step_with_batch_queue()
         logger.info(
-            "[Lwd][perf] cloud-step exec=%.2fms",
-            (time.monotonic() - _t0) * 1000,
+            "[Lwd][perf] cloud-step exec=%.2f drain=%.2f sched=%.2f "
+            "submit=%.2f sampleq=%.2f update=%.2fms",
+            (time.monotonic() - _t0) * 1000, (_t1 - _t0) * 1000,
+            segs.get("sched", 0.0), segs.get("submit", 0.0),
+            segs.get("sampleq", 0.0), segs.get("update", 0.0),
         )
         return out
 
     def step(self):
-        """同步步路径同款打点。"""
+        """同步步路径同款打点(分段见 step_with_batch_queue)。"""
+        segs = self._lwd_segs
+        segs.clear()
         _t0 = time.monotonic()
         self._lwd_drain_irecv_completions()
+        _t1 = time.monotonic()
         out = super().step()
         logger.info(
-            "[Lwd][perf] cloud-step exec=%.2fms",
-            (time.monotonic() - _t0) * 1000,
+            "[Lwd][perf] cloud-step exec=%.2f drain=%.2f sched=%.2f "
+            "submit=%.2f sampleq=%.2f update=%.2fms",
+            (time.monotonic() - _t0) * 1000, (_t1 - _t0) * 1000,
+            segs.get("sched", 0.0), segs.get("submit", 0.0),
+            segs.get("sampleq", 0.0), segs.get("update", 0.0),
         )
         return out
 
     def _lwd_drain_irecv_completions(self) -> None:
         """[Lwd][pre-recv] 提前收③:把 worker 上报的收完项并进水位(每步一次)。
 
-        云 worker 的通信线程每收完一条 UP recv 就上报 (channel, seqno);本处
-        在每步开头排空 done MQ,水位随即成为 PD_mix 闸门
-        (``_lwd_pre_recv_ready``) 的就绪判据 —— 收完的批本步就能下发,
-        没收完的本步只跑 decode。
+        云 worker 的通信线程每收完一条 UP recv 就上报 (channel, seqno +
+        逐请求已收行数);本处在每步开头排空 done MQ,把行数并进
+        ``_lwd_recv_rows`` 台账 —— arrival 驱动的调度器按它决定下一步
+        能给每个请求下发多少行。
         """
         done_mq = getattr(self.model_executor, "lwd_irecv_done_mq", None)
         if done_mq is None:
@@ -443,12 +578,59 @@ class LwdCloudEngineCoreMixin:
                 break
         if not items:
             return
-        for channel, seqno in record_irecv_completions(items):
+        # 上报载荷两种形态:
+        #   * (channel, seqno)             —— 老形态(host 暂存关着)
+        #   * ((channel, seqno), arrived)  —— 捎带本批逐请求已收行数
+        #     arrived = [(req_id, rows_delta), ...](design v7 §5.2)
+        watermark_items = []
+        for item in items:
+            if (
+                isinstance(item, tuple)
+                and len(item) == 2
+                and isinstance(item[0], tuple)
+            ):
+                key, arrived = item
+                watermark_items.append(key)
+                self._lwd_note_arrived(arrived)
+            else:
+                watermark_items.append(item)
+        for channel, seqno in record_irecv_completions(watermark_items):
             # 引擎侧收到上报的落点(与 worker 的 REPORT 行对减 = 上报过 MQ +
             # 等到本步排空的延迟)
             logger.info(
                 "[Lwd][pre-recv] watermark advanced channel=%s seqno=%d ts=%.3f",
                 channel.value, seqno, time.monotonic(),
+            )
+
+    def _lwd_note_arrived(self, arrived) -> None:
+        """把 worker 上报的逐请求已收行数并进台账(design v7 §5.2)。
+
+        ``recv_rows[req]`` 用 **max() 累加**而不是 `+=`:边侧队满重试会产生
+        重复预告,worker 侧虽然只报增量,但跨进程传输本身也可能重放同一批;
+        max() 让整条链天然幂等,且不会把行数推过 prompt 长度。
+
+        这是调度器决定"这一步能给这个请求下发多少行"的**唯一**依据(§5.3)。
+        """
+        if not arrived:
+            return
+        ledger = self._lwd_recv_rows
+        touched = []
+        for req_id, rows in arrived:
+            try:
+                rid, n = str(req_id), int(rows)
+            except (TypeError, ValueError):
+                continue
+            if n <= 0:
+                continue
+            before = ledger.get(rid, 0)
+            if n > before:
+                # max(),不是 += :重放/重复上报都不会把行数推过真实已收量
+                ledger[rid] = n
+                touched.append((rid, before, n))
+        if touched:
+            logger.info(
+                "[Lwd][host-stage] ARRIVED ledger update %s (tracked=%d)",
+                touched, len(ledger),
             )
 
     def lwd_handle_model_output(
@@ -465,6 +647,13 @@ class LwdCloudEngineCoreMixin:
         边侧按 num_accepted 取有效前缀。"""
         # [Lwd][perf] cloud-step dt 已由 exec 时长替代(见 step_with_batch_queue
         # 覆写):开始执行→执行结束,不含无请求的空等。
+        # prompt_lens 台账随请求完结清账(防长跑泄漏;abort 路径另有一处)。
+        for outputs in engine_core_outputs.values():
+            for rid in outputs.finished_requests or ():
+                self._lwd_prompt_lens.pop(rid, None)
+            for out in outputs.outputs:
+                if out.finish_reason is not None:
+                    self._lwd_prompt_lens.pop(out.request_id, None)
         carrier = getattr(model_output, "lwd_down_carrier", None)
         if carrier is not None:
             packed, req_ids, hidden_numel, seqno = carrier

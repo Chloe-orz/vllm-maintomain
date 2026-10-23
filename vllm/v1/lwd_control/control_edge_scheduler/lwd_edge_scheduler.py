@@ -17,15 +17,16 @@ decode 分支不可达。
 
 chunk 组批约束(lwd_chunked_prefill_design.md):prompt 按
 c = min(剩余, chunk 单元 C) 切块,批 = 续传 chunk 优先 + waiting FCFS
-前缀,Σc ≤ cap(云侧预算 − 在途数 × spec 系数,边云同值前提下读本地
-配置);续传队首装不下时的 cap 截断块独占一批(云侧按批内最大条目
-复现 chunk 边界,设计 §2.4)。一个批 = 一条批量 RangeNotify = 一个
-seqno = 一次 UP send,数据面 chunk 流按批连续,跨请求交错/重组复杂度
-仍为零。
+前缀,Σc ≤ cap(= 整步预算 max_num_batched_tokens,边云同值前提下读
+本地配置;host 暂存后云侧按当步余量开窗消费,边侧不再为云 decode
+预留预算,cap 只是批尺寸的绝对上限)。一个批 = 一条批量 RangeNotify =
+一个 seqno = 一次 UP send,数据面 chunk 流按批连续,跨请求交错/重组
+复杂度仍为零。
 """
 
 from __future__ import annotations
 
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -65,14 +66,19 @@ logger = init_logger(__name__)
 _LWD_ADD_RETRY_STEPS = 5
 _LWD_ADD_RETRY_INTERVAL_S = 0.2
 
-# 云侧 pending 上限,按未消费 chunk 计:一条 (engine, seqno) = 一个云步
-# 消费单位(seqno 流 per-engine,单靠 seqno 会跨 engine 撞号)。边侧记录
-# (engine, seqno) -> 批内请求列表,批内全部请求收到首 token 即该 chunk
-# 已消费;计数**每个 engine 各持一份**,某 engine 未消费数达到上限只停
-# 它对这一 engine 新开 prefill(其他 engine 不受影响)——请求在边侧
-# waiting 攒批(picker FCFS 前缀天然组多请求批),该 engine pending 排空
-# 后闸门自开。
-_LWD_MAX_PENDING_CHUNKS = 2
+# 边侧发送队列深度安全网(per-engine):按"已发送但云侧未收讫"的批数计
+# (摘除由 UP send 完成水位驱动,见 lwd_edge_note_send_watermark)。正常
+# 时 pending ≈ 线路深度(≤ 云侧在飞 recv 上限),闸门不介入;它只在云侧
+# 接收停摆时兜底,防边侧通道上的快照克隆堆爆 NPU。阈值须 ≥ 云侧在飞
+# recv 上限(VLLM_ASCEND_LWD_MAX_INFLIGHT_RECV,默认 8)+ 余量,否则闸门
+# 会抢在线路流控之前误介入。
+# 每个 engine 各持一份(批与 seqno 都按 engine 独立):某 engine 未收讫
+# 数达到上限只停它对这一 engine 新开 prefill(其他 engine 不受影响)——
+# 请求在边侧 waiting 攒批(picker FCFS 前缀天然组多请求批),该 engine
+# pending 排空后闸门自开。
+_LWD_MAX_PENDING_CHUNKS = int(
+    os.environ.get("VLLM_ASCEND_LWD_MAX_PENDING_CHUNKS", "10")
+)
 
 
 class LwdEdgeScheduler(LwdBaseScheduler):
@@ -128,30 +134,20 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # awaiting:嵌入完待云结果的 request_id -> 登记时刻(单调钟)。
         # 请求本体已清出调度器,此表是结果路径的唯一生命周期台账。
         self._lwd_awaiting: dict[str, float] = {}
-        # 已收到首个 token 的请求集合:awaiting 中不在此集合的请求 =
-        # 云侧尚未消费到其 prefill(pending_notify 的边侧本地估计,
-        # 免新增协议字段);首个 c2e 到达即标记,完结/abort 时清除。
-        self._lwd_first_token_seen: set[str] = set()
-        # seqno -> 批内 request_id 列表(chunk 粒度 pending 跟踪):
-        # 批内全部请求收到首 token 即整条移除;abort/finish 时按请求摘除,
-        # 摘空即移除(finish 摘除是死锁修复:_lwd_first_token_seen 完结即
-        # 移出,不摘除会让"短请求先完结"的批条目永不清除,pending 攒满
-        # 上限即永卡闸门)。云侧 pending_notify 的边侧本地镜像,免协议改动。
+        # seqno -> 批内 request_id 列表(chunk 粒度 pending 跟踪):摘除由
+        # UP send 完成水位驱动(lwd_edge_note_send_watermark,语义 = 云侧
+        # 已收讫),与首 token 交付解耦 —— 边侧放行节奏不再挂在云侧计算
+        # 完成上。abort/finish 时按请求摘除,摘空即移除。
         # 多云 DP:键为 (engine_index, seqno)——seqno 流 per-engine,
         # 单靠 seqno 会跨 engine 撞号。
         self._lwd_batch_requests: dict[tuple[int, int], list[str]] = {}
         # pending 闸门状态(per-engine,仅作开/关转换日志用)
         self._lwd_gate_held: dict[int, bool] = {}
-        # MTP 预算系数:decode 每请求每步消耗 1+k 个 token(草稿 token
-        # 同样占预算与 KV);k = num_speculative_tokens(配置解析期已
-        # 求值,缺省 None 按 0),无 spec 配置即 1。
         # 边云 max_num_batched_tokens/max_num_seqs 部署对齐(同值),故
-        # cap 直接读本地配置(设计 §2.3,配置对齐为部署约束)
-        spec_config = getattr(self.vllm_config, "speculative_config", None)
-        num_spec = (
-            getattr(spec_config, "num_speculative_tokens", None) or 0
-        )
-        self._lwd_spec_factor: int = 1 + num_spec
+        # cap 直接读本地配置(设计 §2.3,配置对齐为部署约束)。
+        # 注:不再有 decode 预算预留(spec_factor)——host 暂存后云侧按
+        # 当步精确余量开窗消费,一条 notify 可跨多步,边侧无需替云侧
+        # 预留 decode 预算。
         # mixed 开关:与云侧调度器选择同源(scheduler_name,部署双侧同值)。
         # 非 mixed(prefill_first/decode_first 逃生通道)= 旧单请求组批语义:
         # 只取队首、允许原生截断成 chunk、不做整 prompt 核验
@@ -173,28 +169,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # chunk 单元 C:prompt 按 min(剩余, C) 切块下发
         # (lwd_chunked_prefill_design.md)。C 取本地
         # long_prefill_token_threshold(原生调度本就按它截断 prompt 排程,
-        # scheduler.py:408/690,双侧天然复现同一边界);未配置(≤0,默认)
-        # 时退化为 max_num_scheduled_tokens(= 边云对齐预算,整 prompt 不
-        # 超预算不切块,与整体组批形态连续过渡)。云侧不读本值,按每条
-        # RangeNotify 的 max(items) 临时覆写阈值复现(设计 §2.3)。
+        # scheduler.py:408/690);未配置(≤0,默认)时退化为
+        # max_num_scheduled_tokens(= 边云对齐预算,整 prompt 不超预算不
+        # 切块,与整体组批形态连续过渡)。云侧不读本值,按已收行数开窗。
         threshold = self.scheduler_config.long_prefill_token_threshold
         self._lwd_chunk_unit: int = (
             threshold if threshold > 0 else self.max_num_scheduled_tokens
         )
-        # 活性 fail-fast:最坏在途(满员)下 cap 恒 < 1 即死锁配置
-        # (设计 §2.6),拉起时直接拒绝
-        if self._lwd_mixed and (
-            self.max_num_scheduled_tokens
-            - self.max_num_running_reqs * self._lwd_spec_factor
-            < 1
-        ):
-            raise RuntimeError(
-                f"[LWD] 死锁配置: max_num_batched_tokens("
-                f"{self.max_num_scheduled_tokens}) - max_num_seqs("
-                f"{self.max_num_running_reqs}) * spec_factor("
-                f"{self._lwd_spec_factor}) < 1, 续传 chunk 永无可调度预算; "
-                "请增大 max_num_batched_tokens 或减小 max_num_seqs"
-            )
 
     def schedule(self) -> SchedulerOutput:
         """chunk 化 prefill 组批 + 原生准入。
@@ -233,12 +214,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
         返回 (req_ids, expected, cap):expected 为逐请求的本步应排 token
         数(步后 chunk 核验用,不等即配置发散 fail-fast);cap 为本步
-        token 预算上界(云侧预算 − 在途数 × spec 系数,边云同值前提下
-        本地配置即云侧预算),供 _lwd_schedule_batch 做预算钳制。
+        token 预算上界(= 整步预算 max_num_scheduled_tokens,边云同值
+        前提下本地配置即云侧预算),供 _lwd_schedule_batch 做预算钳制。
 
         chunk 语义(lwd_chunked_prefill_design.md §3.1):
-        - 每个 chunk 自限:c = min(剩余 prompt, chunk 单元 C),云侧原生
-          调度在阈值复现(T=批内最大)下逐请求推出同一边界;
+        - 每个 chunk 自限:c = min(剩余 prompt, chunk 单元 C);
         - 续传(先收尾再开新):running 中未发完的 prefill 按 FCFS 序取
           c = min(剩余, C),Σ ≤ cap;
         - 开新:waiting(skipped 优先,原生准入失败回插者)按 FCFS
@@ -248,10 +228,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
           (含续传);短请求允许合批,不限制云侧 decode 混排;
         - 末位截断(续传/新开共用):批内最后一个条目允许被剩余额度
           截尾成 cap−used,与集中式 chunked prefill 的"预算耗尽截断"
-          逐语义对齐——截断块恒为末位,边侧(§2.5)与云侧(§2.3)的
-          预算钳制都靠预算耗尽精确复现它,非末位块由 R/C/T 定界与
-          截断块尺寸无关。无此逃生,在途 decode 把 cap 压到 C 以下时
-          大 prompt 永不可开新,流水线全程串行;
+          逐语义对齐——截断块恒为末位,云侧按已收行数开窗消费,
+          截断块的剩余行随下一条 notify 续传;
         priority 调度策略下 waiting 迭代序非弹出序,本前缀语义未适配
         (LWD 部署恒 FCFS,设计 M-10)。"""
         # 逃生通道(旧相位语义):单请求、不 cap、允许原生截断成 chunk、
@@ -265,14 +243,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             ]
             picked = [candidates[0].request_id] if candidates else []
             return picked, {}, self.max_num_scheduled_tokens
-        # cap 语义(per-engine):批 Σchunk ≤ 预算 − 本 engine 在途数 ×
-        # spec 系数(云混排步里 decode 每请求占 1+k token,MTP 下
-        # k = num_spec_tokens;在途数是该 engine decode 人口的恒成立
-        # 上界,设计 §2.2/§5.3)。边云预算部署对齐,本地
-        # max_num_scheduled_tokens 即云侧单 engine 预算
+        # cap 语义(per-engine):批 Σchunk ≤ 整步预算。host 暂存后云侧按
+        # 当步精确余量(预算 − decode_exact、KV 行数)开窗消费,一条
+        # notify 可跨多步,边侧不再为云 decode 预留预算;此处只保留绝对
+        # 上限(云 staging 几何 max_numel 与 recv 槽显存都按批尺寸定界)。
+        # 边云预算部署对齐,本地 max_num_scheduled_tokens 即云侧单
+        # engine 预算;inflight 仍按该 engine 统计(名额 free_seq 与原生
+        # 准入同源,只数路由到它的 running + awaiting)。
         prefill_cnt, decode_cnt = self._lwd_engine_load(engine)
         inflight = prefill_cnt + decode_cnt
-        cap = self.max_num_scheduled_tokens - inflight * self._lwd_spec_factor
+        cap = self.max_num_scheduled_tokens
         free_seq = self.max_num_running_reqs - inflight
         picked: list[str] = []
         expected: dict[str, int] = {}
@@ -320,9 +300,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             expected[request.request_id] = chunk
             used += chunk
         # 2) 开新:FCFS 前缀,自限 chunk;装不下时同上末位截断。
-        # 无截断逃生时,任一在途请求(含 decode 中的 awaiting)把 cap
-        # 压到 C 以下会让大 prompt 永不可开新、流水线全程串行(真机
-        # 已现:decode 阶段云侧只剩 1-2 个请求在跑)
         new_count = 0
         candidates = [
             c
@@ -364,12 +341,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
         选择规则见 _lwd_pick_prefill_batch;队列剔除/隔离/拼回复用基类
         _lwd_schedule_for_visible_reqs(waiting/skipped 来源走原生准入
-        窗口,running 来源走续跑)。
-
-        预算钳制(设计 §2.5):可见集调用期间把 max_num_scheduled_tokens
-        临时压到 cap(原生 token 预算即读该字段,
-        scheduler.py:360),原生 budget/threshold 双重截断逐请求复现
-        picker 的 chunk 划分。语义注记:与旧手写容器交换不同,本步被
+        窗口,running 来源走续跑)。cap 恒等于整步预算,不再需要临时
+        压缩(预留已删);chunk 划分由 picker 自限(threshold 配置时另有
+        原生阈值截断兜底)。语义注记:与旧手写容器交换不同,本步被
         抢占的请求回 waiting 尾部、被跳过的回 skipped 队首,均取基类
         统一语义,不再做队首回插。
 
@@ -382,15 +356,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 "[Lwd][edge-sched] pick batch reqs=%s tokens=%d cap=%d",
                 req_ids, sum(expected.values()), cap,
             )
-        if req_ids and cap < self.max_num_scheduled_tokens:
-            saved_budget = self.max_num_scheduled_tokens
-            self.max_num_scheduled_tokens = cap
-            try:
-                out = self._lwd_schedule_for_visible_reqs(req_ids)
-            finally:
-                self.max_num_scheduled_tokens = saved_budget
-        else:
-            out = self._lwd_schedule_for_visible_reqs(req_ids)
+        out = self._lwd_schedule_for_visible_reqs(req_ids)
         # chunk 核验:picker 的 chunk 划分必须被原生调度逐请求复现
         # (不等即 cap/threshold 失守或原生行为发散;云侧注入窗口
         # 看门狗也会把它变成 RuntimeError——这里先炸,错在边侧调度,
@@ -544,8 +510,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if not self.lwd_edge_max_num_seqs_check(engine):
             return True
         if self._lwd_mixed:
-            # 云侧 pending 闸门:该 engine 已发未消费的 chunk 数达上限即
-            # 停止对它新开 prefill(请求在边 waiting 攒批,云侧排空自开)
+            # 云侧 pending 闸门:该 engine 已发未收讫的批数达上限即
+            # 停止对它新开 prefill(请求在边 waiting 攒批,水位推进自开)
             pending = sum(
                 1 for (e, _) in self._lwd_batch_requests if e == engine
             )
@@ -692,28 +658,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 continue
             # _update_after_schedule 已乐观推进 num_computed,起点需回退本步量
             offset = request.num_computed_tokens - num_tokens
-            # 多模态:准入时预算了整 prompt positions 的请求,各 chunk
-            # 恒携带 mrope(key 在即恒真);[3,N] 切本 chunk 列并序列化
-            # 为原始字节随 item 走控制面(wire_version>=2,数据面 aux
-            # 帧已退役)
-            positions = self._lwd_mrope_positions_dict.get(request_id)
-            req_has_mrope = positions is not None
-            mrope_bytes = b""
-            if req_has_mrope:
-                assert positions is not None
-                mrope_bytes = (
-                    positions[:, offset : offset + num_tokens]
-                    .contiguous()
-                    .numpy()
-                    .tobytes()
-                )
+            # mrope positions 自 wire_version 3 起随 LwdRequestNotify 全量
+            # 一次下发,不再按 chunk 切列携带(云侧调度已改为 arrival 驱动,
+            # 无 chunk 概念);has_mrope 标记保留(诊断/日志用),字节留空。
+            req_has_mrope = request_id in self._lwd_mrope_positions_dict
             items.append(
                 LwdRangeItem(
                     request_id=request_id,
                     offset=offset,
                     num_tokens=num_tokens,
                     has_mrope=req_has_mrope,
-                    mrope_positions=mrope_bytes,
+                    mrope_positions=b"",
                 )
             )
             req_ids.append(request_id)
@@ -802,6 +757,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # HELLO 未收齐的构造窗口(legacy 单云路径同款静默)
             return
         sp = sampling_params
+        # 全量 mrope positions(wire_version 3):准入时已按全 prompt 算好,
+        # 随元数据一次下发;云侧调度改为 arrival 驱动后不再按 chunk 携带。
+        mrope_bytes = b""
+        positions = self._lwd_mrope_positions_dict.get(request_id)
+        if positions is not None:
+            mrope_bytes = positions.numpy().tobytes()
         message = LwdRequestNotify(
             request_id=request_id,
             num_prompt_tokens=num_prompt_tokens,
@@ -809,6 +770,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 sp.max_tokens if sp is not None and sp.max_tokens is not None else 16
             ),
             block_hashes=block_hashes if block_hashes is not None else [],
+            mrope_positions=mrope_bytes,
             temperature=sp.temperature if sp is not None else 1.0,
             top_p=sp.top_p if sp is not None else 1.0,
             top_k=sp.top_k if sp is not None else 0,
@@ -847,16 +809,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         finish_requests 触不到它,须在此显式摘除,防迟到云结果被误认领。"""
         for request_id in request_ids:
             self._lwd_awaiting.pop(request_id, None)
-            self._lwd_first_token_seen.discard(request_id)
             self._lwd_mrope_positions_dict.pop(request_id, None)
             engine = self._lwd_route.pop(request_id, None)
-            seen = self._lwd_first_token_seen
             for key, rids in list(self._lwd_batch_requests.items()):
-                rids = [rid for rid in rids if rid != request_id]
-                if not rids or all(rid in seen for rid in rids):
-                    del self._lwd_batch_requests[key]
+                remaining = [rid for rid in rids if rid != request_id]
+                if remaining:
+                    self._lwd_batch_requests[key] = remaining
                 else:
-                    self._lwd_batch_requests[key] = rids
+                    del self._lwd_batch_requests[key]
             if engine is None:
                 continue
             publisher = self.lwd_edge_publishers.get(engine)
@@ -871,6 +831,23 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     "[Lwd][edge-notify] AbortNotify req=%s engine=%d",
                     request_id, engine,
                 )
+
+    def lwd_edge_note_send_watermark(self, engine: int, watermark: int) -> None:
+        """UP send 完成水位(边 worker 随批结果捎回):该 engine 上 seqno ≤
+        水位的批云侧已收讫,从 pending 闸门台账摘除。
+
+        HCCL P2P 的 isend 完成 = 数据已落云侧已挂好的 recv buffer,与云侧
+        是否算完无关 —— 摘除语义从"云侧算完"(首 token)改为"云侧收下",
+        边侧放行节奏与云侧计算完成解耦。水位是**通道级**的(seqno 流
+        per-engine),必须带 engine 限定,否则会把别的 engine 尚在途中的
+        批误摘,闸门对该 engine 失效。"""
+        cleared = [
+            key
+            for key in self._lwd_batch_requests
+            if key[0] == engine and key[1] <= watermark
+        ]
+        for key in cleared:
+            del self._lwd_batch_requests[key]
 
     def lwd_edge_update_progress(self, executed: dict[str, int]) -> None:
         """步末登记执行量;嵌入完结即转入 awaiting。
@@ -923,32 +900,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 request_id,
             )
             return False
-        self._lwd_first_token_seen.add(request_id)
-        seen = self._lwd_first_token_seen
-        for key, rids in list(self._lwd_batch_requests.items()):
-            if all(rid in seen for rid in rids):
-                del self._lwd_batch_requests[key]
         if finished:
             del self._lwd_awaiting[request_id]
-            self._lwd_first_token_seen.discard(request_id)
             self._lwd_route.pop(request_id, None)
-            # 死锁根因修复:完结请求必须像 abort 一样从批台账摘除。批清除
-            # 判据 all(rid in seen) 要求 seen 只增不减,而上一行的 discard
-            # 让完结请求永久缺席——同批"短请求先完结、长请求首 token 后到"
-            # 时该批条目永不清除;泄漏条目攒到 _LWD_MAX_PENDING_CHUNKS
-            # 个,prefill gate 永卡 HOLD,边侧停发新 chunk、云侧 mid-prefill
-            # 空转刷 c2e_meta=None(真机实录:bench 泄漏 8 条后全局死锁,
-            # 单请求/无 MTP 时序不踩中故难复现)。
-            for key, rids in list(self._lwd_batch_requests.items()):
-                if request_id not in rids:
-                    continue
-                remaining = [rid for rid in rids if rid != request_id]
-                if remaining and not all(
-                    rid in self._lwd_first_token_seen for rid in remaining
-                ):
-                    self._lwd_batch_requests[key] = remaining
-                else:
-                    del self._lwd_batch_requests[key]
+            # pending 闸门台账的摘除已改由 UP send 完成水位驱动
+            # (lwd_edge_note_send_watermark),与首 token 交付解耦。
         logger.info(
             "[Lwd][edge-deliver] req=%s tokens=%d finished=%s",
             request_id, len(token_ids), finished,

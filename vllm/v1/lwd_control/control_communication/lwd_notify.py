@@ -15,9 +15,10 @@ if TYPE_CHECKING:
 # 控制面协议版本:1 = mrope positions 经数据面 UP aux 帧([n,3] int64
 # 第二 P2P 载荷);2 = mrope positions 经控制面 LwdRangeItem.mrope_
 # positions 原始字节直传(数据面 aux 帧自 mrope 退役;aux 机制本身
-# 保留,供 deepstack 等大数据量载荷扩展);3 = 云侧多 DP:HELLO 携带
-# engine_index/coord_stats_addr,C2eNotify 携带 engine_index。
-# 两侧必须同版本部署:
+# 保留,供 deepstack 等大数据量载荷扩展);3 = 云侧多 DP + 按请求 arrival
+# 驱动:HELLO 携带 engine_index/coord_stats_addr,C2eNotify 携带
+# engine_index;RangeNotify 不再驱动调度(只驱动数据面提前收),mrope
+# positions 随 LwdRequestNotify 全量一次下发。两侧必须同版本部署:
 # msgspec 容忍未知字段,版本错配时旧端不会报错,只会 mrope 静默缺失。
 LWD_WIRE_VERSION = 3
 
@@ -88,6 +89,12 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):
     得知,必须随预告透传;缺省 None = 云侧 EOS 判定落空,仅
     max_tokens 兜底(旧版边侧,additive 兼容)。"""
 
+    mrope_positions: bytes = b""
+    """全量 mrope positions(wire_version 3 起):[3, num_prompt_tokens]
+    int64 CPU 张量的连续字节流,边侧准入时一次算好、随请求预告一次
+    下发 —— 云侧调度按 arrival 驱动后不再按 chunk 携带。空 = 纯文本
+    请求(零路径变化)。"""
+
 
 class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):
     """边->云 abort 预告(PRE_OUT);云侧清理请求登记。"""
@@ -99,11 +106,11 @@ class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
     """云->边发现通告(POST_OUT,首拍一次);pre_out_* 是边侧连接云端点的
     唯一事实源,pre_out_host 须为边可路由真实 IP(0.0.0.0 不可作通告值)。
 
-    调度三元组(max_num_batched_tokens/max_num_seqs/num_speculative_
-    tokens)供边侧互校:三者是 cap/preflight 公式两侧的同源输入,
-    不一致不会让链路报错,只会让 preflight 恒 hold、prefill 被 decode
-    静默串行(真机实录:边 factor=1 云 factor=4 时 chunk 8191 +
-    decode 4 > 预算 8192)。0 = 旧版未携带,边侧仅告警不拦截。"""
+    调度配置(max_num_batched_tokens/max_num_seqs)供边侧互校:两者是
+    边侧批上限与云侧调度的同源输入,不一致不会让链路报错,只会让批
+    尺寸越过云侧 staging 几何上限或名额失配。num_speculative_tokens
+    仅为 wire 兼容保留,边侧不再使用(host 暂存后边侧不再为云 decode
+    预留预算)。0 = 旧版未携带,边侧仅告警不拦截。"""
 
     pre_out_host: str
     pre_out_port: int

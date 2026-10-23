@@ -1,46 +1,50 @@
-"""云侧混合调度器:prefill/decode 同批下发(设计:lwd_mixed_batch_design.md
-+ lwd_chunked_prefill_design.md)。
+"""云侧混合调度器:prefill/decode 同批下发,**arrival 驱动**(design v8)。
 
-chunk 混排语义:边侧按 c = min(剩余 prompt, chunk 单元) 切块组批
-(续传优先 + FCFS 前缀),云侧每步至多消费 prefill_notify_queue 队首
-一条批量 RangeNotify,与全部 decode 态请求混排一个批下发:
+边侧按 c = min(剩余 prompt, chunk 单元) 切块组批发 RangeNotify,但
+云侧调度**不再消费预告队列** —— 预告只驱动数据面提前收(引擎下发
+recv hint);调度器每步对"已收未算完"的请求直接开窗:
 
-  - preflight 三检(预算/名额/KV 保守预估)任一不过 -> 本步 decode-only,
-    预告留队首原位,decode 泄压后下步重试;
-  - 放行先做 offset 对账(item.offset == 云侧 num_computed,chunk
-    断流/重复/乱序即 fail-fast),再按 T = max(items) 临时覆写
-    long_prefill_token_threshold——原生调度的 threshold 截断逐请求
-    复现边侧 chunk 边界(自限 chunk,设计 §2.3 证明与处理顺序无关);
-  - 步后核验批内每请求 num_scheduled == 预告量(chunk 精确准入),
-    不等即 fail-fast(一次 UP recv 对应整批张量,错排会留残余行错配)。
+  - **可见集谓词**:`recv_rows − num_computed <= 0` 的请求本步不进 batch
+    (数据面没到就算 = 读零占位、静默错算);recv_rows 是 worker 在分段
+    D2H 完成后随水位捎带上报的逐请求累计高水位;
+  - **按请求下发**:每请求本步行数 = `min(已收 − 已算, 剩余预算)`,通过
+    挂在请求对象上的 `lwd_window_cap` 属性交给原生 —— 原生 running/
+    waiting 循环算 `num_new_tokens` 时对它取 min(总预算
+    `max_num_scheduled_tokens = decode_exact + Σ该值` 压缩保留为总量
+    上界);chunk 化从此只是边侧的流量整形;
+  - **攒满批**:数据未收完且窗口不足满窗(数据限速的残余窗)时不开
+    窗,攒到与下一块合并 —— 消除"碎窗独占一步"的固定开销尾巴;
+    末段(已收 == prompt 全长)不受此限,保证请求必然算完;
+  - **下发前 W2 核验**:逐请求 `start + got ≤ recv_rows` 且 `got ≤ 窗口`
+    (有 cap 在恒真,纯看门狗);KV/预算截断导致的**少排**是合法行为,
+    只告警不核验,下一步按原生水位重算;
+  - KV/并发名额/块对齐全部交还原生。
 
-前置约束:spec decode(MTP)预算已按 1+k 系数对齐(边 cap 与本类
-preflight),但端到端未经真机验证(eagle 纯度判据失真风险,台账
-P3-3/设计 M-8);
-不兼容云侧抢占重算(占位 embeds 无法本地重 prefill)与 prefix caching
-(命中使 num_computed 起点 >0,触发 offset 对账 fail-fast;且被命中
-chunk 的 UP send 无人消费 = 通道打洞,chunk 化后硬前提,设计 §8-C3)
-——部署须保证 KV 充足并关闭缓存,本类的核验只负责把违背变成当场
-报错而非静默错算。
+前置约束:spec decode(MTP)的 decode 预算按 decode_exact 逐请求精确
+记账(草稿 token 同样占预算),但端到端未经真机验证(eagle 纯度
+判据失真风险,台账 P3-3/设计 M-8);
+云侧抢占重算:已支持本地重 prefill —— pinned host 载荷活到请求结束
+(design v7 §6.1),抢占把 num_computed 归零后 recv_rows 台账不动,
+可见集谓词自然对该请求重开整条 prompt 的窗口,runner 在 harvest 前
+把 stager 读指针回退到调度水位(``_lwd_rewind_staged_reads``),注入
+几何与首算逐字相同;被抢请求拼回 waiting 队首(原生语义)。调度侧
+每步多付的只是一次 re-prefill 的预算。仍须关闭 prefix caching(零
+占位 token ids 的块哈希跨请求同值,命中即静默错算),本类的核验
+只负责把违背变成当场报错而非静默错算。
 """
 
 from __future__ import annotations
 
+import itertools
 import time
 from collections import deque
 
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import (
     LwdBatch,
     LwdBatchType,
     LwdEmbedBatch,
     SchedulerOutput,
-)
-from vllm.v1.lwd_control.control_communication.lwd_notify import (
-    LWD_WIRE_VERSION,
-    LwdRangeItem,
-    LwdRangeNotify,
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
@@ -50,29 +54,19 @@ logger = init_logger(__name__)
 
 
 class LwdCloudMixedScheduler(LwdBaseScheduler):
-    """notify 门控的 prefill/decode 混排调度器(相位机的继任者)。"""
+    """arrival 驱动的 prefill/decode 混排调度器(相位机的继任者)。"""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # prefill 通知队列:边侧批量范围预告(RangeNotify)逐条入队,每步
-        # 至多消费队首一条;预告自带 seqno 即本批 UP 链配对号
-        self.prefill_notify_queue: deque[LwdRangeNotify] = deque()
-        # [Lwd][sched] 调度批日志步计数(饿死分析:RangeNotify 到达 ->
-        # 混排步消费的间隔与中间插入的 decode-only 步数)
+        # 保留一个恒空的预告队列占位:基类的 abort 延迟终结机制会读它
+        # (恒空 ⇒ abort 立即终结);引擎自 wire_version 3 起不再入队
+        # (调度按 arrival 驱动,RangeNotify 只驱动数据面提前收)。
+        self.prefill_notify_queue: deque = deque()
+        # [Lwd][sched] 调度批日志步计数
         self._lwd_sched_step = 0
-        # MTP 预算系数:decode 每请求每步消耗 1+k 个 token(草稿 token
-        # 占预算与 KV);k = num_speculative_tokens(配置解析期已求值,
-        # 缺省 None 按 0),无 spec 配置即 1
-        spec_config = getattr(self.vllm_config, "speculative_config", None)
-        num_spec = (
-            getattr(spec_config, "num_speculative_tokens", None) or 0
-        )
-        self._lwd_spec_factor: int = 1 + num_spec
         logger.info(
-            "[Lwd] cloud mixed scheduler: chunked-prefill batches mixed "
-            "with decode (one notify consumed per step at most, "
-            "spec_factor=%d)",
-            self._lwd_spec_factor,
+            "[Lwd] cloud mixed scheduler: arrival-driven prefill mixed "
+            "with decode (no notify queue)"
         )
         # spec 接受率累计器(引擎进程内直出):LWD 云前端没有注册请求,
         # 前端 stats 链(output_processor 丢弃未知请求输出 + lifespan
@@ -83,6 +77,99 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         self._lwd_spec_draft_tokens = 0
         self._lwd_spec_accepted = 0
         self._lwd_spec_last_log = time.monotonic()
+
+        # ------------------------------------------------------------------ #
+        # host 暂存调度(design v7 §5)                                        #
+        # ------------------------------------------------------------------ #
+        # 注:**不再有"已消费行数"台账**。v4 那本账与原生 num_computed_tokens
+        # 是同一件事的第二份拷贝,两份就可能分歧,而分歧的表现是静默切错窗口。
+        # v7 的权威只有一个:原生水位。已收行数则在引擎侧(lwd_recv_rows),
+        # 由 worker 捎带上报。
+        # 已 abort、但剩余行永远不会被算完的请求(从"活跃"里摘掉)。
+        self._lwd_dropped: set[str] = set()
+        # 本步待通知 worker 的 abort 名单(§6.4)。
+        # 摘除台账只活在调度器进程里,worker 的暂存池看不到,所以必须随批
+        # 捎带过去;每步排空(通知是幂等的,重复送达只会重复一个 no-op)。
+        self._lwd_abort_pending: list[str] = []
+        logger.info(
+            "[Lwd][host-stage] windowed consume armed: base=%d",
+            self.max_num_scheduled_tokens,
+        )
+
+    def _lwd_verify_w2(
+        self, out, notify, windowed, windows, decode_exact,
+        eff_starts=None,
+    ) -> None:
+        """下发前核验:**排程量不得超过已到达量**(design v7 §7 的 W2)。
+
+        这是本方案唯一"静默错算"型风险的兜底。``num_scheduled_tokens``
+        超出已到达量时不会报错,只会让 runner 从 host 上读一段**还没被写入**
+        的零值区,算出一批零 embedding —— 表现是"输出莫名其妙"而不是崩溃,
+        极难定位。所以这里逐请求核验并把差异报全:
+
+        1. 该请求是否**根本没到数据却被排**(``recv_rows == 0``)—— 那说明
+           可见集谓词(§5.3.1b)失效,这是最严重的一档;
+        2. 本步排程量是否落在**已到达**的行数之内;
+        3. 本步排程量是否越过**窗口**(``got > w``)—— 即 ``lwd_window_cap``
+           钩子失守。越过窗口 = 越过本 chunk 边界,runner 的注入几何
+           (mrope 按 chunk_rows 切窗)会静默错乱,而逐请求"已到达"核验
+           不一定拦得住(后续 chunk 可能已随累计水位到达,真机实录
+           seqno=101)。窗口判据在 cap 机制正常时恒真,是纯看门狗。
+
+        **判据里绝不能再出现"已消费行数"**(真机踩过):
+        ``consumed`` 是 **worker 侧的存储读指针**,由 ``_lwd_stage_requests_to_device``
+        在同一步的 harvest 阶段推进,而 harvest 跑在 ``_prepare_inputs`` 内、
+        **早于**本核验。拿它做减法,调度器看到的必然是"已经搬完了"的
+        值 ⇒ ``avail == 0`` ⇒ 第一批就被误判成越界(真机实录:
+        ``recv_rows=15 consumed=15`` 却报 "only 0 have arrived")。
+
+        "取数区间必须落在已写入范围内"是**另一件事**,由 worker 的 stager
+        几何校验负责(``LwdReqEmbed.read_range``,见
+        ``_pre_recv_host_stage_check.py`` §5)。两处判据分开,各自看自己
+        能权威看到的量 —— 这也是 §7 表格里的分工。
+        """
+        ledger = getattr(self, "lwd_recv_rows", None) or {}
+        for k, (item, w) in enumerate(zip(windowed, windows)):
+            rid = item.request_id
+            got = int(out.num_scheduled_tokens.get(rid, 0))
+            if got == 0:
+                continue
+            if got > w:
+                raise RuntimeError(
+                    f"[Lwd][cloud-sched] W2 VIOLATION req={rid} seqno="
+                    f"{notify.seqno}: native scheduled {got} rows beyond "
+                    f"the window w={w} (lwd_window_cap 钩子失守 —— 越过本 "
+                    f"chunk 边界会破坏 runner 的注入几何,宁可当场炸)"
+                )
+            recv_rows = int(ledger.get(rid, 0))
+            if recv_rows <= 0:
+                raise RuntimeError(
+                    f"[Lwd][cloud-sched] W2 VIOLATION req={rid} seqno="
+                    f"{notify.seqno}: scheduled {got} tokens but the data "
+                    f"plane reported recv_rows=0 (该请求不该进 batch —— 可见集"
+                    f"谓词 `recv_rows > 0` 失效)"
+                )
+            # 该请求已累计收到的最高行号(recv_rows 按 prompt 起点计数,
+            # 不是相对本 chunk)。本步要算到 ``start + got``,不能越过它。
+            # ``start`` 取**本步生效起点**(部分消费时比 item.offset 大),
+            # 它由调用方通过 eff_starts 平行传入 —— **不能**回写 item.offset
+            # 来达到同样效果:那个字段是载荷尺寸协议(见 _schedule_mixed)。
+            #
+            # **别写成 ``start + got > recv_rows`` 的等价变形去减 offset**:
+            # 续传 chunk 的 offset > 0,而它前面的行早已计入 recv_rows,减掉
+            # offset 就会把"前面已经收到的部分"漏算 —— 真机实录:一个
+            # offset=1164/已收 2346 的续传请求被误判成越界
+            # ("only 2346 have arrived" 而它算的区间 [1164, 3510) 其实合法)。
+            start = int(eff_starts[k]) if eff_starts else item.offset
+            if start + got > recv_rows:
+                raise RuntimeError(
+                    f"[Lwd][cloud-sched] W2 VIOLATION req={rid} seqno="
+                    f"{notify.seqno}: native scheduled rows "
+                    f"[{start}, {start + got}) but only "
+                    f"{recv_rows} have arrived in total "
+                    f"(window={w} chunk_rows={item.num_tokens} "
+                    f"chunk_offset={item.offset} decode_exact={decode_exact})"
+                )
 
     def update_from_output(self, scheduler_output, model_runner_output):
         """先累计 spec 接受率(镜像原生 update_from_output 的统计分支),
@@ -157,240 +244,78 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         ]
 
     # ------------------------------------------------------------------ #
-    # notify 条目分类与 preflight                                          #
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _lwd_notify_items(notify: LwdRangeNotify) -> list[LwdRangeItem]:
-        """取批条目:优先 items(mixed 组批);空则回退旧版单请求语义。"""
-        if notify.items:
-            return list(notify.items)
-        return [
-            LwdRangeItem(
-                request_id=notify.request_id,
-                offset=notify.offset,
-                num_tokens=notify.num_tokens,
-            )
-        ]
-
-    def _lwd_classify_items(
-        self, items: list[LwdRangeItem]
-    ) -> tuple[list[LwdRangeItem], bool]:
-        """条目三分:ready(待 prefill)/ stale(已完结或重复预告,剔除)
-        / unknown(ADD 尚未落地)。返回 (ready, 是否有 unknown)。
-
-        unknown 存在即整批 defer(all-or-nothing:一次 UP recv 对应整批
-        张量,不能只放行子集);abort 清扫(引擎侧)负责把永不落地的
-        条目摘除,队首不会被永久堵住。"""
-        ready: list[LwdRangeItem] = []
-        unknown = False
-        for item in items:
-            request = self.requests.get(item.request_id)
-            if request is None:
-                unknown = True
-                continue
-            if self._lwd_is_decode(request):
-                logger.warning(
-                    "[Lwd][cloud-sched] drop stale notify item req=%s "
-                    "num=%d (already prefilled; duplicate notify?)",
-                    item.request_id, item.num_tokens,
-                )
-                continue
-            ready.append(item)
-        return ready, unknown
-
-    def _lwd_pre_recv_ready(self, notify: LwdRangeNotify) -> bool:
-        """提前收闸门:该批(本 chunk 批)的 UP 数据收完了没。
-
-        收完才允许下发这个 prefill 批 —— 此时 embeds(主帧)与 mrope(aux 帧)
-        都已在云 worker 的接收 buffer 里,注入侧 future.wait() 立刻返回;没收完
-        就本步只下 decode(notify 留队首,下步再判),不把等待塞进 worker 前向。
-
-        判据是引擎维护的每通道水位(worker 通信线程上报收完的 seqno):完成序
-        = seqno 序(通道 FIFO),所以 seqno <= 水位 即精确判据。一条 seqno 覆盖
-        主帧 + aux 帧(``LwdCommRequest`` 的 aux 约定),故水位天然覆盖两帧。
-        """
-        from vllm_ascend.distributed.lwd_comm.pre_recv import (
-            is_irecv_complete,
-            watermark,
-        )
-        from vllm_ascend.distributed.lwd_comm.types import LwdChannelType
-
-        ready = is_irecv_complete(LwdChannelType.UP, notify.seqno)
-        # [Lwd][pre-recv] 闸门读数:与 HINT/SUBMIT/DONE/REPORT/POST 用同一单调钟,
-        # 可把"预告到达->worker挂recv->worker收完上报->引擎放行"四段直接相减。
-        logger.info(
-            "[Lwd][pre-recv] gate seqno=%d watermark=%d ready=%s ts=%.3f",
-            notify.seqno,
-            watermark(LwdChannelType.UP),
-            ready,
-            time.monotonic(),
-        )
-        return ready
-
-    def _lwd_preflight_ok(
-        self, items: list[LwdRangeItem], num_decode: int
-    ) -> bool:
-        """放行三检:token 预算 / 并发名额 / KV 保守预估。
-
-        预算与名额本由边侧 cap 保证(设计 §2),此处是双保险;KV 预估
-        忽略前缀缓存命中(命中只降占用,高估是安全方向)。decode 占用
-        按 1+k 计(MTP 草稿 token 同样吃预算;KV 块预留同系数上取整)。"""
-        need_tokens = (
-            sum(item.num_tokens for item in items)
-            + num_decode * self._lwd_spec_factor
-        )
-        if need_tokens > self.max_num_scheduled_tokens:
-            logger.info(
-                "[Lwd][cloud-sched] preflight hold: tokens %d > budget %d",
-                need_tokens, self.max_num_scheduled_tokens,
-            )
-            return False
-        # 名额只数新增准入:续传 chunk 的请求已在 running,再按条目数
-        # 计会双重占用名额造成假性 hold(chunk 化前批内恒为新增,
-        # len(items) 与新增数相等)
-        running_ids = {req.request_id for req in self.running}
-        new_items = sum(
-            1 for item in items if item.request_id not in running_ids
-        )
-        if len(self.running) + new_items > self.max_num_running_reqs:
-            logger.info(
-                "[Lwd][cloud-sched] preflight hold: seqs %d+%d > max %d",
-                len(self.running), new_items, self.max_num_running_reqs,
-            )
-            return False
-        need_blocks = (
-            sum(cdiv(item.num_tokens, self.block_size) for item in items)
-            + num_decode * cdiv(self._lwd_spec_factor, self.block_size)
-        )
-        free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
-        if need_blocks > free_blocks:
-            logger.info(
-                "[Lwd][cloud-sched] preflight hold: kv blocks %d > free %d",
-                need_blocks, free_blocks,
-            )
-            return False
-        return True
-
-    @staticmethod
-    def _lwd_verify_full_admission(
-        out: SchedulerOutput, notify: LwdRangeNotify, items: list[LwdRangeItem]
-    ) -> None:
-        """步后核验:批内每请求排程量 == 预告量(chunk 精确准入)。
-        不等即配置发散/KV 失守(错排会让整批 UP 张量留残余行),
-        fail-fast 不当场炸就会静默错算。"""
-        for item in items:
-            scheduled = out.num_scheduled_tokens.get(item.request_id, 0)
-            if scheduled != item.num_tokens:
-                raise RuntimeError(
-                    f"[Lwd][cloud-sched] batch admission mismatch "
-                    f"req={item.request_id} seqno={notify.seqno}: "
-                    f"scheduled={scheduled} != notify={item.num_tokens} "
-                    f"(mixed mode forbids partial admission)"
-                )
-
-    # ------------------------------------------------------------------ #
-    # 调度主体                                                            #
+    # 调度主体(arrival 驱动,design v8)                                    #
     # ------------------------------------------------------------------ #
     def _schedule_impl(self) -> SchedulerOutput:
+        # (2) 收集 decode 集(判据:prompt 已算完 = 可采样)。
         decode_ids = self._lwd_collect_decode_requests()
-        notify = (
-            self.prefill_notify_queue[0] if self.prefill_notify_queue else None
-        )
-        if notify is not None:
-            items, unknown = self._lwd_classify_items(
-                self._lwd_notify_items(notify)
-            )
-            if not items and not unknown:
-                # 全部条目失效(完结/重复):弹队,本步纯 decode。
-                # 按对象身份弹(abort 清扫可能整体替换过 deque,见
-                # _schedule_mixed 同款处理)
-                queue = self.prefill_notify_queue
-                if queue and queue[0] is notify:
-                    queue.popleft()
-                notify = None
-            elif unknown:
-                # 请求 ADD 未落地(input_queue 次序滞后):预告留队首,
-                # 本步先 decode;abort 清扫兜底防永久堵队首
-                logger.info(
-                    "[Lwd][cloud-sched] notify seqno=%d deferred: "
-                    "request(s) not added yet",
-                    notify.seqno,
-                )
-                notify = None
-            elif not self._lwd_pre_recv_ready(notify):
-                # 提前收闸门:UP 张量还没收完 -> 本步不下发这个 prefill 批
-                # (notify 留队首,下步再判),本步只下 decode。收完的批优先,
-                # 没收完的批一直让 decode 自转,不把等待塞进 worker 前向。
-                notify = None
-            elif not self._lwd_preflight_ok(items, len(decode_ids)):
-                # 预算/名额/KV 不足:预告留队首,decode 泄压后重试。
-                # 这条必须打日志:它是"数据都收完了、闸门也放行了,prefill 却
-                # 一直不下发"的唯一静默出口(现场排查尾部停摆时,先看这条)。
-                logger.info(
-                    "[Lwd][cloud-sched] notify seqno=%d deferred: preflight "
-                    "rejected (reqs=%d tokens=%d decode=%d pending_notify=%d)",
-                    notify.seqno, len(items),
-                    sum(item.num_tokens for item in items), len(decode_ids),
-                    len(self.prefill_notify_queue),
-                )
-                notify = None
-            else:
-                return self._schedule_mixed(notify, items, decode_ids)
-        return self._lwd_schedule_for_visible_reqs(decode_ids)
+        # decode 的 token 账一次算清(decode 优先);KV 完全交给原生
+        # (waiting 分配失败即 break,天然 defer)。
+        decode_exact, _ = self._lwd_decode_tokens(decode_ids)
+        room = self.max_num_scheduled_tokens - decode_exact
+        # ---- arrival 驱动(design v8)----
+        # 不再有 notify 队列/chunk 边界:任何"已收未算完"的 prefill 请求
+        # 本步都可下发,窗口 = min(已收 − 已算, room)。已收行数
+        # ``recv_rows`` 由 worker 在分段 D2H 完成后随水位捎带上报(prompt
+        # 坐标累计高水位);已算行数取原生水位 num_computed_tokens。
+        # 可见集谓词(recv_rows > computed)同时是安全闸:零值占位绝不进
+        # batch(读了不报错,静默错算)。chunk 化从此只是边侧的流量整形。
+        ledger = getattr(self, "lwd_recv_rows", None) or {}
+        windowed: list[tuple] = []  # (request, n_rows)
+        if room > 0:
+            for request in itertools.chain(
+                self.running, self.waiting, self.skipped_waiting
+            ):
+                rid = request.request_id
+                if rid in self._lwd_dropped:
+                    continue  # abort 冻结:剩余行永不下发
+                computed = request.num_computed_tokens
+                if computed >= request.num_prompt_tokens:
+                    continue  # decode 态:由 decode_ids 覆盖
+                arrived = int(ledger.get(rid, 0)) - computed
+                if arrived <= 0:
+                    continue  # 数据还没到
+                n = min(arrived, room)
+                if n < 1:
+                    break  # 预算尽
+                # 攒满批:数据未收完且不够一个满窗(数据限速的残余窗)
+                # 时本步不开窗,攒到与下一块合并成大窗 —— 消除"碎窗独占
+                # 一步"的固定开销尾巴(一块被预算截断、下一块还在线上时,
+                # 残余几行会被 async 调度单独排成一个 batch)。到达限速下
+                # 这并不损失吞吐(闲置是数据依赖的必然),延迟上限为一个
+                # chunk 到达间隔。末段(已收 == prompt 全长)不受此限,
+                # 保证请求必然算完;抢占重算后 recv_rows 满值,天然不命中。
+                if n < room and computed + arrived < request.num_prompt_tokens:
+                    continue
+                # start 必须此刻捕获:原生 schedule() 会经
+                # ``_update_after_schedule`` **乐观推进** num_computed,
+                # 下发后再读就是窗口末尾而不是起点。
+                windowed.append((request, n, computed))
+                room -= n
+        if windowed:
+            out = self._lwd_dispatch_windows(windowed, decode_ids,
+                                             decode_exact)
+        else:
+            out = self._lwd_schedule_for_visible_reqs(decode_ids)
+        self._lwd_last_windowed = len(windowed)
+        self._lwd_attach_abort_notice(out, self._lwd_take_abort_pending())
+        return out
 
-    def _schedule_mixed(
-        self,
-        notify: LwdRangeNotify,
-        items: list[LwdRangeItem],
-        decode_ids: list[str],
-    ) -> SchedulerOutput:
-        """混排步:decode 集 + 批内 chunk 同批下发。
+    def _lwd_decode_tokens(self, decode_ids: list[str]) -> tuple[int, dict]:
+        """本步 decode 逐请求的 token 消耗(原推导逐字保留,只改成"留账")。
 
-        offset 对账:item.offset 必须 == 云侧当前 num_computed(async
-        关闭前提下调度时刻即真实水位)——不等即 chunk 断流(>)/
-        重复(<)/乱序,协议级事故 fail-fast,不当场炸就会把
-        embeddings 注入错位窗口静默错算。
-        双钳制复现(设计 §2.3/§2.4 修订):① 阈值复现——临时覆写
-        long_prefill_token_threshold = max(items.num_tokens),非末位
-        自限块由 R/C/T 定界逐请求复现;② 预算钳制——临时把
-        max_num_scheduled_tokens 压到 decode 精确消耗 + Σ chunk,
-        末位 cap 截断块由"预算耗尽"复现(与集中式 chunked prefill
-        的截断语义逐字对齐)。两个 finally 均恢复。
-        注意 decode 请求 num_new = 1+k 远小于正常量级的 T,不受覆写
-        影响(病态小 chunk 配置见设计 §8-C9)。"""
-        logger.info(
-            "[Lwd][cloud-sched] mixed notify seqno=%d reqs=%s tokens=%d",
-            notify.seqno, [item.request_id for item in items],
-            sum(item.num_tokens for item in items),
-        )
-        for item in items:
-            if item.has_mrope and not item.mrope_positions:
-                raise RuntimeError(
-                    f"[Lwd][cloud-sched] mrope payload missing "
-                    f"req={item.request_id} seqno={notify.seqno}: "
-                    f"has_mrope=True 但控制面未携带 positions 字节——边侧"
-                    f"仍按数据面 aux 帧协议运行(wire_version<"
-                    f"{LWD_WIRE_VERSION}),两侧必须同版本部署"
-                )
-            request = self.requests[item.request_id]
-            if request.num_computed_tokens != item.offset:
-                raise RuntimeError(
-                    f"[Lwd][cloud-sched] chunk offset mismatch "
-                    f"req={item.request_id} seqno={notify.seqno}: "
-                    f"notify offset={item.offset} != cloud computed="
-                    f"{request.num_computed_tokens} "
-                    f"(chunk 断流/重复/乱序)"
-                )
-        req_ids = decode_ids + [item.request_id for item in items]
-        # decode 精确消耗:预算钳制的精确性依赖逐字复刻原生 running 段
-        # (scheduler.py:381-416)的 num_new 推导——1+len(spec) 不是准确式:
-        # ① placeholder(spec 拒绝遗留的非零值)计入排程窗口;
-        # ② max_tokens 守卫(占位>0 且距 max_tokens 不足 2)与
-        #   next_decode_eligible_step 会让请求整步跳过、消耗 0。
-        # 不逐字复刻就会留下余量,使末位截断块被超排(真机实录:
-        # decode 请求被守卫跳过消耗 0,末位块 604 被排成 608)。
-        # threshold 不约束 decode(正常量级 T ≫ num_new,病态小 chunk
-        # 配置见设计 §8-C9);预算由构造保证充足,不影响本推导。
+        预算钳制的精确性依赖逐字复刻原生 running 段(scheduler.py:381-416)
+        的 num_new 推导——1+len(spec) 不是准确式:
+        ① placeholder(spec 拒绝遗留的非零值)计入排程窗口;
+        ② max_tokens 守卫(占位>0 且距 max_tokens 不足 2)与
+          next_decode_eligible_step 会让请求整步跳过、消耗 0。
+        不逐字复刻就会留下余量,使末位截断块被超排(真机实录:
+        decode 请求被守卫跳过消耗 0,末位块 604 被排成 608)。
+
+        返回 ``(decode_exact, {req_id: d_i})``。d_i 现在只喂 token 账
+        (KV 块账已交还原生);per_req 保留给调用方做诊断。
+        """
+        per_req: dict[str, int] = {}
         decode_exact = 0
         for rid in decode_ids:
             req = self.requests[rid]
@@ -403,7 +328,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 continue  # 原生 max_tokens 守卫:本步跳过,消耗 0
             if self.current_step < req.next_decode_eligible_step:
                 continue  # V2+PP 节拍守卫:本步跳过,消耗 0
-            decode_exact += max(
+            d_i = max(
                 0,
                 min(
                     req.num_tokens_with_spec
@@ -412,47 +337,175 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                     self.max_model_len - 1 - req.num_computed_tokens,
                 ),
             )
-        saved_threshold = self.scheduler_config.long_prefill_token_threshold
+            if d_i <= 0:
+                continue
+            per_req[rid] = d_i
+            decode_exact += d_i
+        return decode_exact, per_req
+
+    def _lwd_dispatch_windows(
+        self,
+        windowed: list[tuple],
+        decode_ids: list[str],
+        decode_exact: int,
+    ) -> SchedulerOutput:
+        """混排步:decode 集 + 所有"已收未算完"请求的窗口同批下发。
+
+        arrival 驱动(design v8):窗口 = min(已收 − 已算, room),无 notify
+        队列、无 chunk 边界、无 seqno 对账 —— 注入落点恒为
+        ``num_computed_tokens``,runner 按请求从自己的 host buffer 顺序
+        取数。
+
+        **按请求下发**:窗口经 ``lwd_window_cap`` 逐请求挂给原生(唯一
+        上界),预算压成 ``decode_exact + Σ窗口`` 作总量上界;步后逐请求
+        W2 核验(``start + got ≤ recv_rows`` 且 ``got ≤ 窗口``,恒真,纯
+        看门狗);原生少排(块对齐截尾/KV 分配失败)合法,下一步按
+        num_computed 重算。
+        """
+        logger.info(
+            "[Lwd][cloud-sched] mixed step reqs=%s windows=%s",
+            [r.request_id for r, _n, _s in windowed],
+            [n for _r, n, _s in windowed],
+        )
+        total_windows = sum(n for _r, n, _s in windowed)
+        req_ids = decode_ids + [r.request_id for r, _n, _s in windowed]
         saved_budget = self.max_num_scheduled_tokens
-        self.scheduler_config.long_prefill_token_threshold = max(
-            item.num_tokens for item in items
-        )
-        self.max_num_scheduled_tokens = decode_exact + sum(
-            item.num_tokens for item in items
-        )
+        # 逐请求上界:把每个 windowed 请求本步可排的行数挂到请求对象上,
+        # 原生 running/waiting 循环算 num_new_tokens 时对它有 min —— 不能
+        # 只靠"压缩总预算 + FIFO 前缀序":那个组合不等于逐请求取小,池化
+        # 预算会被排在前面的请求超领(真机实录 seqno=101:窗口 8 行,原生
+        # 按整条 prompt 剩余排了 138 行,把 decode_exact 的份额吃掉)。
+        # 预算压缩保留为总量上界,双保险。
+        for request, n, _s in windowed:
+            request.lwd_window_cap = n
+        self.max_num_scheduled_tokens = decode_exact + total_windows
         try:
             out = self._lwd_schedule_for_visible_reqs(req_ids)
         finally:
-            self.scheduler_config.long_prefill_token_threshold = (
-                saved_threshold
-            )
             self.max_num_scheduled_tokens = saved_budget
-        self._lwd_verify_full_admission(out, notify, items)
-        # 消费队首:abort 清扫(IO 线程)可能整体替换过 deque,按对象
-        # 身份弹队首,避免错弹替换后的新队首
-        queue = self.prefill_notify_queue
-        if queue and queue[0] is notify:
-            queue.popleft()
-        # UP 链 seqno 随批下发云 worker:批配对号直接取预告自带 seqno(与
-        # 边侧 EMBED 批派发号同源同值)。batch_meta 承载 worker 的 recv
-        # 尺寸与注入切行信息:req_ids 取批内逐请求,token_ids 为占位
-        # 列表——长度必须等于边侧实际发送的逐请求 token 数,recv numel
-        # 才能与边侧 isend 严格相等(HCCL P2P 要求两端 numel 匹配)。
-        # prompt_offsets/has_mrope/mrope_positions 逐 item 透传:runner
-        # 对 MM 请求把 positions 字节 frombuffer 直写 req_state(文本
-        # 请求空 bytes、零路径变化);数据面 aux 帧已退役。
-        out.lwd_batch = LwdBatch(
-            batch_type=LwdBatchType.LWD_EMBED,
-            seqno=notify.seqno,
-            batch_meta=LwdEmbedBatch(
-                req_ids=[item.request_id for item in items],
-                token_ids=[[0] * item.num_tokens for item in items],
-                prompt_offsets=[item.offset for item in items],
-                has_mrope=[item.has_mrope for item in items],
-                mrope_positions=[item.mrope_positions for item in items],
-            ),
+            for request, _n, _s in windowed:
+                request.lwd_window_cap = None
+        # ---- W2(design v7 §7):本方案唯一"静默错算"型风险的兜底 ----
+        # num_computed 在此刻仍是步初值(update_from_output 未跑)。
+        ledger = getattr(self, "lwd_recv_rows", None) or {}
+        for request, w, start in windowed:
+            rid = request.request_id
+            got = int(out.num_scheduled_tokens.get(rid, 0))
+            if got == 0:
+                continue
+            recv_rows = int(ledger.get(rid, 0))
+            if recv_rows <= 0:
+                raise RuntimeError(
+                    f"[Lwd][cloud-sched] W2 VIOLATION req={rid}: scheduled "
+                    f"{got} tokens but the data plane reported recv_rows=0 "
+                    f"(该请求不该进 batch —— 可见集谓词失效)"
+                )
+            # start 是准入时(原生乐观推进**之前**)捕获的窗口起点。
+            if got > w or start + got > recv_rows:
+                raise RuntimeError(
+                    f"[Lwd][cloud-sched] W2 VIOLATION req={rid}: native "
+                    f"scheduled rows [{start}, {start + got}) — window={w}, "
+                    f"recv_rows={recv_rows} (lwd_window_cap 失守)"
+                )
+        native_prefill = sum(
+            int(out.num_scheduled_tokens.get(r.request_id, 0))
+            for r, _n, _s in windowed
         )
+        if native_prefill < total_windows:
+            # 合法但值得观测:几乎只在原生 KV 分配失败时出现 —— 这正是
+            # "KV 开始不够"的信号,比盯着 free 块数可靠。
+            logger.warning(
+                "[Lwd][cloud-sched] native under-scheduled: "
+                "native prefill=%d < Σwindows=%d (native-side truncation, "
+                "typically KV pressure; the remainder is retried next step)",
+                native_prefill, total_windows,
+            )
+        # 新准入请求的全量 mrope positions 随 SO 带给 runner(RequestNotify
+        # → Request 透传而来;纯文本为空字节)。
+        for d in out.scheduled_new_reqs:
+            req = self.requests.get(d.req_id)
+            if req is not None:
+                d.lwd_mrope_positions = (
+                    getattr(req, "lwd_mrope_positions", b"") or b""
+                )
         return out
+
+    def _lwd_drop_request_from_chunks(self, request_id: str) -> int:
+        """把一个被 abort 的请求从逐请求台账里摘成"永不消费"。
+
+        返回它被丢弃的剩余行数。已算完的行是历史事实(KV 已算、embeddings
+        已注入),不回滚;只把剩余行冻结。arrival 驱动后不再有预告队列,
+        剩余行直接按"prompt 剩余"记账。
+
+        同时把它排进"待通知 worker"名单:worker 的暂存池是按请求管存储的,
+        这些剩余行在 host 上还占着 pinned,必须让 worker 也冻结 —— abort 时
+        worker 只冻结,真正的释放在请求结束那条路上做(design v7 §6.1/§6.3)。
+        """
+        already = request_id in self._lwd_dropped
+        self._lwd_dropped.add(request_id)
+        remaining = 0
+        request = self.requests.get(request_id)
+        if request is not None:
+            remaining = max(
+                request.num_prompt_tokens - request.num_computed_tokens, 0
+            )
+        if remaining:
+            logger.info(
+                "[Lwd][host-stage] ABORT-PARTIAL req=%s dropped_rows=%d",
+                request_id, remaining,
+            )
+        if not already:
+            # 只在首次摘除时排队通知(重复送达也只是幂等 no-op,但名单里
+            # 每步只该出现新摘除的请求)
+            self._lwd_abort_pending.append(request_id)
+        return remaining
+
+    def _lwd_take_abort_pending(self) -> list[str]:
+        """取出本步要通知 worker 的 abort 名单(取走即清,幂等靠 worker 侧)。"""
+        pending = self._lwd_abort_pending
+        if not pending:
+            return []
+        self._lwd_abort_pending = []
+        return pending
+
+    def _lwd_attach_abort_notice(self, out: SchedulerOutput, aborted: list[str]) -> None:
+        """把 abort 名单挂到本步输出上(§3.6.1)。
+
+        挂在哪取决于本步有没有 EMBED 批:
+          * 有批 -> 挂在该批的 ``batch_meta.aborted_req_ids``(搭已有通道,
+            不新增协议);
+          * 没批(纯 decode / 空步)-> 退化挂一个**只带 abort 名单**的
+            EMBED 批:``req_ids`` 为空,所以 worker 的 recv 路径与 runner 的
+            注入路径都不会碰它(两边都以 ``req_ids`` 为空即返回),
+            只有 abort 处理会读它。**这一步是必需的** —— 否则"请求被 abort
+            且当时没有批要下发"时,pinned 就没人回收了。
+
+        **名单绝不丢弃**:挂不上(已有非 EMBED 批)时放回待发队列,下一步再送
+        —— pinned 回收是滞后容忍的,漏送则不是。
+        """
+        if not aborted:
+            return
+        batch = getattr(out, "lwd_batch", None)
+        if batch is None:
+            out.lwd_batch = LwdBatch(
+                batch_type=LwdBatchType.LWD_EMBED,
+                seqno=-1,
+                batch_meta=LwdEmbedBatch(aborted_req_ids=list(aborted)),
+            )
+            return
+        if (
+            batch.batch_type is LwdBatchType.LWD_EMBED
+            and getattr(batch, "batch_meta", None) is not None
+        ):
+            # 与已有名单合并(同一步可能既有新摘除又有积压)
+            existing = list(batch.batch_meta.aborted_req_ids or ())
+            batch.batch_meta.aborted_req_ids = existing + [
+                r for r in aborted if r not in existing
+            ]
+            return
+        # 已有非 EMBED 批:不动它,名单放回队列等下一步
+        # (取走时已清空,这里补回;顺序无所谓,通知是幂等的)
+        self._lwd_abort_pending = list(aborted) + self._lwd_abort_pending
 
     def schedule(self) -> SchedulerOutput:
         # [Lwd][perf] 云侧每步 LWD 税分段之一:调度(容器交换)时长
@@ -460,37 +513,33 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         self._lwd_settle_deferred_aborts()
         out = self._schedule_impl()
         self._lwd_sched_step += 1
-        self._lwd_log_sched_batch(out)
+        self._lwd_log_sched_batch(out, getattr(self, "_lwd_last_windowed", 0))
         logger.info(
             "[Lwd][perf] cloud-sched dur=%.2fms", (time.monotonic() - _t) * 1000
         )
         return out
 
-    def _lwd_log_sched_batch(self, out: SchedulerOutput) -> None:
+    def _lwd_log_sched_batch(self, out: SchedulerOutput,
+                             n_prefill: int = 0) -> None:
         """[Lwd][sched] 每步调度批结构化日志(lwd_backlog_probe ⑤ 段锚点)。
 
-        phase 判定:lwd_batch=EMBED 且批内还有 decode 请求即 MIXED;EMBED
-        独占为 PREFILL;有排程 token 为 DECODE;否则 EMPTY。pending_notify
-        给出待吃量——EMPTY/DECODE 连跑且 pending_notify>0 = 通知已到但
-        preflight 不过或 ADD 未落地。reqs 超 12 个截断,防大 decode 批
-        刷屏。"""
-        batch = getattr(out, "lwd_batch", None)
-        if batch is not None and batch.batch_type == LwdBatchType.LWD_EMBED:
-            n_prefill = len(batch.batch_meta.req_ids)
+        phase 判定:本步有 prefill 窗口(n_prefill>0,由 _schedule_impl
+        传入)且批内还有 decode 请求即 MIXED;prefill 独占为 PREFILL;
+        有排程 token 为 DECODE;否则 EMPTY。reqs 超 12 个截断,防大
+        decode 批刷屏。"""
+        if n_prefill:
             n_reqs = len(out.num_scheduled_tokens)
             phase = "MIXED" if n_reqs > n_prefill else "PREFILL"
-            seqno: object = batch.seqno
         else:
             phase = "DECODE" if out.total_num_scheduled_tokens else "EMPTY"
-            seqno = ""
         reqs = list(out.num_scheduled_tokens)
         reqs_str = ",".join(reqs[:12]) + (
             f",+{len(reqs) - 12}more" if len(reqs) > 12 else ""
         )
         logger.info(
-            "[Lwd][sched] cloud step=%d phase=%s seqno=%s reqs=[%s] tokens=%d "
-            "pending_notify=%d decode_ready=%d",
-            self._lwd_sched_step, phase, seqno, reqs_str,
-            out.total_num_scheduled_tokens, len(self.prefill_notify_queue),
+            "[Lwd][sched] cloud step=%d phase=%s reqs=[%s] tokens=%d "
+            "decode_ready=%d",
+            self._lwd_sched_step, phase, reqs_str,
+            out.total_num_scheduled_tokens,
             len(self._lwd_collect_decode_requests()),
         )
