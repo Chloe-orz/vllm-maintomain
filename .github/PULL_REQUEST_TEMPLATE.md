@@ -1,33 +1,44 @@
 <!-- markdownlint-disable -->
+# 方案 (复杂的需要方案架构图, 不复杂的不需要)
 
-## Overview
+# 评审截图 (涉及外部的需要评审, 不涉及的不需要)
 
-<!-- Summarize the change in 1-2 lines. Link relevant issues and PRs. -->
+# 修改影响 (类似代码注释的功能, 建议补充, 方便回忆意图)
 
-## Claims
+# 测试结果
 
-<!-- State the accomplishments in a few concrete bullets: speedups, feature support, bug fixes, etc. -->
+## 命令
+<!-- 运行命令 -->
 
-## Validation
+## 修改前
+<!-- 截图 -->
 
-<!-- Show evidence that the claims are met by this change, and steps to reproduce validations. -->
+## 修改后
+<!-- 截图 -->
 
-## Details
+# Checklist
+- [ ] 实现全面, 功能完备 -- 需要人看!
+- [ ] 避免 if-else 堆叠: 公共流程抽象为基类, 差异流程用子类继承承载 -- 需要人看!
+- [ ] 模块间隔离: 模块间依赖要少, 要高内聚, 避免改动一个模块影响无关模块 -- 需要人看!
+- [ ] 性能敏感路径要评估性能影响 -- 需要人看!
+- [ ] 命名要清晰 -- 需要人看!
 
-<!-- Explain motivation, design decisions, root cause, tradeoffs, and limitations concisely. Link or collapse lengthy supporting material. -->
+- [ ] PR描述说明要清晰, 完备
+- [ ] PR要有自验证报告, 和测试截图
+- [ ] vllm 和 vllm-ascend 的 PR 描述中要互相贴关联链接
 
----
+- [ ] bugfix需要补充回归测试
+- [ ] CI 已通过, 否则打`no-test`标签
 
-<details>
-<summary> Pull Request Checklist </summary>
+- [ ] 避免侵入式修改, 不要使用patch
+- [ ] fail-fast, 避免往下传递异常情况
+- [ ] 类型标注要全面
+- [ ] 函数职责要单一
+- [ ] 注释不要冗余
+- [ ] 公共函数要提取
+- [ ] 检查魔法数字
+- [ ] 没做完的地方是否有TODO注释
+- [ ] 使用英文, 不要使用中文
+- [ ] 测试是否覆盖失败分支
+- [ ] 逻辑性比较强的有业务逻辑需要ut. 初始化等代码不需要测试.
 
-- [ ] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).
-- [ ] AI assistance was used during the creation of this PR.
-
-- [ ] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.
-- [ ] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.
-- [ ] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.
-- [ ] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.
-</details>
-
-**BEFORE SUBMITTING, PLEASE READ <https://docs.vllm.ai/en/latest/contributing>** (anything written below this line will be removed by GitHub Actions)

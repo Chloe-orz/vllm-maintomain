@@ -42,6 +42,11 @@ from .kv_transfer import KVTransferConfig
 from .load import LoadConfig
 from .logging import LoggingConfig
 from .lora import LoRAConfig
+from .lwd import (
+    LwdConfig,
+    log_lwd_config,
+    resolve_lwd_config,
+)
 from .mamba import MambaBackendEnum, MambaConfig
 from .model import ModelConfig
 from .observability import ObservabilityConfig
@@ -423,6 +428,8 @@ class VllmConfig:
     """Additional config for specified platform. Different platforms may
     support different configs. Make sure the configs are valid for the platform
     you are using. Contents must be hashable."""
+    lwd_config: LwdConfig | None = None
+    """Parsed LWD topology, coordination and API metadata; does not enable execution."""
     instance_id: str = ""
     """The ID of the vLLM instance."""
     optimization_level: OptimizationLevel = OptimizationLevel.O2
@@ -1467,6 +1474,16 @@ class VllmConfig:
             # below unsafe (e.g. use_mla resolves the architecture registry).
             return
 
+        # EngineArgs supplies a complete snapshot; direct callers can use raw input.
+        if (
+            isinstance(self.additional_config, dict)
+            and "lwd_config" in self.additional_config
+            and self.lwd_config is None
+        ):
+            self.lwd_config = resolve_lwd_config(self.additional_config)
+        if self.lwd_config is not None:
+            log_lwd_config(logger, self.lwd_config)
+
         self._resolve_mm_encoder_only()
 
         if self.is_mm_encoder_only and self.cache_config.enable_prefix_caching:
@@ -1493,6 +1510,10 @@ class VllmConfig:
         # Models may have supplied their own DCP defaults above; anything still
         # unset falls back to the stock ones.
         self.parallel_config.set_dcp_defaults()
+        if self.lwd_config is not None:
+            from vllm.distributed.lwd import lwd_check_parallel_config
+
+            lwd_check_parallel_config(self)
 
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)

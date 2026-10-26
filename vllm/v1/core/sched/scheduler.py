@@ -27,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
+from vllm.lwd_logger import lwd_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
@@ -1207,6 +1208,18 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens = padded_num_tokens
                             pad_spec_decode = True
 
+                    # [Lwd] prefill token accounting debug log: routed via
+                    # lwd_logger (VLLM_LWD_LOG_LEVEL, default silent) so it
+                    # never pollutes the native scheduler log at INFO.
+                    lwd_logger.info(
+                        "sched dbg: num_new=%s computed=%s num_tokens=%s "
+                        "prompt=%s status=%s",
+                        num_new_tokens,
+                        num_computed_tokens,
+                        request.num_tokens,
+                        request.num_prompt_tokens,
+                        request.status,
+                    )
                     if 0 < long_prefill_token_threshold < num_new_tokens:
                         num_new_tokens = long_prefill_token_threshold
 
