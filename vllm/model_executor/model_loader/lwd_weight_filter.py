@@ -15,8 +15,10 @@ Matching is component-wise rather than prefix-based on purpose:
 
 * the checkpoint name and the vLLM module name do not always agree on their
   leading components -- a multimodal checkpoint stores the tower as
-  ``model.visual.*`` while the vLLM module is ``visual`` -- so a prefix test
-  would silently miss them;
+  ``model.visual.*`` while the vLLM module is ``visual``, and DeepSeek's native
+  checkpoints drop the ``model.`` prefix entirely (``layers.3.mlp`` for the
+  module ``model.layers.3``) -- so a prefix test would silently miss them;
+  a leading ``model`` component is therefore ignored on both sides;
 * component matching keeps ``layers.3`` from matching ``layers.30``.
 
 Checkpoint layout note: :meth:`DefaultModelLoader._prepare_weights` enumerates
@@ -35,6 +37,11 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 
+def _strip_model_prefix(parts: list[str]) -> list[str]:
+    """Drop a leading ``model`` component (present in HF, absent in native)."""
+    return parts[1:] if len(parts) > 1 and parts[0] == "model" else parts
+
+
 def parse_skip_keys(placeholder_names: Iterable[str]) -> list[list[str]]:
     """Convert dotted placeholder module names into component keys.
 
@@ -46,14 +53,19 @@ def parse_skip_keys(placeholder_names: Iterable[str]) -> list[list[str]]:
     Returns:
         One list of path components per name; empty names are dropped.
     """
-    return [name.rstrip(".").split(".") for name in placeholder_names if name]
+    return [
+        _strip_model_prefix(name.rstrip(".").split("."))
+        for name in placeholder_names
+        if name
+    ]
 
 
 def name_is_skipped(weight_name: str, skip_keys: list[list[str]]) -> bool:
     """Return whether *weight_name* lives inside one of the skipped modules.
 
     Args:
-        weight_name: Checkpoint tensor name, e.g. ``model.layers.3.mlp.w1``.
+        weight_name: Checkpoint tensor name, e.g. ``model.layers.3.mlp.w1`` or
+            ``layers.3.mlp.w1`` (native checkpoint layout).
         skip_keys: Component keys produced by :func:`parse_skip_keys`.
 
     Returns:
@@ -62,7 +74,7 @@ def name_is_skipped(weight_name: str, skip_keys: list[list[str]]) -> bool:
     """
     if not skip_keys:
         return False
-    parts = weight_name.split(".")
+    parts = _strip_model_prefix(weight_name.split("."))
     num_parts = len(parts)
     for key in skip_keys:
         key_len = len(key)
