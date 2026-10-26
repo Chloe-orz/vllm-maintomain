@@ -82,6 +82,10 @@ class LwdEmbedBatch:
     # 水位是同一件事的两份账,分歧时表现为静默切错窗口。
     aborted_req_ids: list[str] = field(default_factory=list)
 
+    # refill 补发批标记:True = 抢占重算的带外补发;边 worker 执行后
+    # 立即摘除本批重登记的 MM 特征,正常批仍随请求生命周期管理。
+    is_refill: bool = False
+
 
 @dataclass
 class LwdUnembedBatch:

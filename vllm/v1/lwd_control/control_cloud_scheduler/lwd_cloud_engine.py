@@ -27,10 +27,15 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdAbortNotify,
     LwdC2eNotify,
     LwdHelloNotify,
+    LwdPrefixReadyNotify,
     LwdRangeItem,
     LwdRangeNotify,
+    LwdRefillNotify,
     LwdRequestNotify,
     lwd_encode_cloud_notify,
+)
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
+    init_lwd_prefix_cache,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import LwdConfig
 from vllm.v1.lwd_debug import LwdDebug
@@ -94,12 +99,37 @@ class LwdCloudEngineCoreMixin:
             self._lwd_early_recv, scheduler_name,
         )
         self._lwd_check_host_stage_switch()
+        # PRE_OUT 线程可能在主线程完成 PC 初始化前构建 HELLO;
+        # 先给默认值,HELLO 构建前等待 init_done。
+        self._lwd_prefix_enabled = False
+        self._lwd_prefix_state = None
+        self._lwd_hash_block_size = 0
+        self._lwd_prefix_init_done = threading.Event()
         super().__init__(*args, **kwargs)
+        self._lwd_init_prefix_cache()
         # [Lwd][perf] 段计时:把每步引擎侧时间拆成 drain/sched/submit/
         # sampleq/update 五段(其余 = 队列等待)。实例属性覆写包装,
         # 不动原生 core.py;基线与 offload 分支都打,才能对表。
         self._lwd_segs: dict[str, float] = {}
         self._lwd_install_step_probes()
+
+    def _lwd_init_prefix_cache(self) -> None:
+        """初始化本 engine 独立的前缀预留表和 refill 下行通道。"""
+        try:
+            state = init_lwd_prefix_cache(
+                self.vllm_config,
+                self.scheduler.kv_cache_config,
+                self.scheduler.kv_cache_manager,
+                use_eagle=bool(getattr(self.scheduler, "use_eagle", False)),
+            )
+            self._lwd_prefix_state = state
+            self._lwd_prefix_enabled = state.enabled
+            self._lwd_hash_block_size = state.hash_block_size
+            if state.enabled:
+                self.scheduler.lwd_prefix_reservations = state.reservations
+                self.scheduler.lwd_refill_sender = self._lwd_send_refill
+        finally:
+            self._lwd_prefix_init_done.set()
 
     def _lwd_install_step_probes(self) -> None:
         """实例级包装三个逐步调用点,时长计入 ``_lwd_segs``(毫秒)。"""
@@ -179,6 +209,8 @@ class LwdCloudEngineCoreMixin:
         )
         sched_config = self.vllm_config.scheduler_config
         spec_config = getattr(self.vllm_config, "speculative_config", None)
+        self._lwd_prefix_init_done.wait()
+        prefix_state = self._lwd_prefix_state
         self._lwd_hello = LwdHelloNotify(
             pre_out_host=config.pre_out_host,
             pre_out_port=pre_out_port,
@@ -197,6 +229,15 @@ class LwdCloudEngineCoreMixin:
             coord_stats_addr=self._lwd_coord_stats_addr(
                 config, self.frontend_stats_publish_address
             ),
+            prefix_caching=self._lwd_prefix_enabled,
+            hash_block_size=self._lwd_hash_block_size,
+            prefix_alignment_tokens=(
+                prefix_state.alignment_tokens if prefix_state else 0
+            ),
+            prefix_alignment_required=(
+                prefix_state.alignment_required if prefix_state else False
+            ),
+            prefix_use_eagle=prefix_state.use_eagle if prefix_state else False,
         )
         # 首拍即通告(边侧可能已 bind 等待)
         self._lwd_announce()
@@ -401,6 +442,7 @@ class LwdCloudEngineCoreMixin:
                         req_ids=req_ids, rows=rows,
                         prompt_offsets=prompt_offsets,
                         prompt_lens=prompt_lens,
+                        refills=[item.is_refill for item in items],
                     )
                 )
             return
@@ -442,6 +484,7 @@ class LwdCloudEngineCoreMixin:
         min_tokens),云侧按客户端真实参数采样,不再落默认值。"""
         sampling_params = SamplingParams(
             max_tokens=wire.max_tokens,
+            skip_reading_prefix_cache=wire.skip_reading_prefix_cache,
             temperature=wire.temperature,
             top_p=wire.top_p,
             top_k=wire.top_k,
@@ -459,12 +502,9 @@ class LwdCloudEngineCoreMixin:
         # 供 min_tokens 判定;云侧无客户端 generation_config,传空。
         sampling_params.update_from_generation_config({}, wire.eos_token_id)
         LwdDebug.cloud_request_admitted(wire, sampling_params)  # [lwd-debug]
-        # 不传真实 ids 也不造占位:按原生 prompt-embeds 语义挂零缓冲,
-        # 行数即 prompt 长度(UP 注入直接写该缓冲的对应窗口);
-        # ids=None 时 input_batch 自动把 prompt 段 is_token_ids 置 False,
-        # M-RoPE 走纯文本直通构造(与扫描结果逐值一致)。
+        # 占位内容从不被读取,empty 避免长 prompt 在 READY 关键路径 memset。
         prompt_ids: list[int] | None = None
-        prompt_embeds = torch.zeros(
+        prompt_embeds = torch.empty(
             wire.num_prompt_tokens,
             self.vllm_config.model_config.get_hidden_size(),
             dtype=self.vllm_config.model_config.dtype,
@@ -475,7 +515,6 @@ class LwdCloudEngineCoreMixin:
         )
         local_hasher = self.request_block_hasher
         if local_hasher is None:
-            # prefix caching 未启用:请求不挂 hasher,整链机制不激活
             request = Request(
                 request_id=wire.request_id,
                 prompt_token_ids=prompt_ids,
@@ -483,18 +522,15 @@ class LwdCloudEngineCoreMixin:
                 sampling_params=sampling_params,
                 pooling_params=None,
             )
-            # 占位 embeds 不随 SO 上传运输层(NewRequestData 只带形状,
-            # worker 本地分配):35MB 零 buffer 走 MQ overflow 通道实测
-            # 单程 240ms+,是 prefill SO 开工延迟的主因。
             request.lwd_embeds_placeholder = True
             request.lwd_mrope_positions = wire.mrope_positions
+            request.lwd_prefix_nonce = wire.prefix_nonce
             return request
         hash_block_size = resolve_kv_cache_block_sizes(
             self.scheduler.kv_cache_config, self.vllm_config
         )[1]
 
         def block_hasher(request: Request) -> list[bytes]:
-            # prompt 首建用边侧预告链,续算/缺链/长度不符回退本地(fail-open)
             if len(request.block_hashes) == 0 and request.num_output_tokens == 0:
                 expected = request.num_prompt_tokens // hash_block_size
                 if len(wire.block_hashes) == expected:
@@ -509,10 +545,84 @@ class LwdCloudEngineCoreMixin:
             pooling_params=None,
             block_hasher=block_hasher,
         )
-        request.lwd_embeds_placeholder = True  # 同上:占位 embeds 不上 MQ
+        request.lwd_embeds_placeholder = True
         request.lwd_mrope_positions = wire.mrope_positions
+        request.lwd_prefix_nonce = wire.prefix_nonce
+        expected = wire.num_prompt_tokens // hash_block_size
+        request.lwd_wire_hashes_adopted = len(wire.block_hashes) == expected
         return request
-    
+
+    def add_request(self, request: Request, request_wave: int = 0) -> None:
+        """在本 engine 预留前缀并回 READY,再进入原生/DP 准入。"""
+        nonce = getattr(request, "lwd_prefix_nonce", 0)
+        if not nonce:
+            if self._lwd_prefix_enabled:
+                logger.error(
+                    "[Lwd][prefix] reject req=%s: prefix_nonce=0 while "
+                    "cloud prefix caching is enabled",
+                    request.request_id,
+                )
+                return
+            return super().add_request(request, request_wave)
+        rid = request.request_id
+        reservations = getattr(self.scheduler, "lwd_prefix_reservations", None)
+        if reservations is None:
+            self._lwd_send_prefix_ready(
+                rid, 0, nonce, error="cloud prefix caching is disabled"
+            )
+            return
+        if not getattr(request, "lwd_wire_hashes_adopted", False):
+            self._lwd_send_prefix_ready(
+                rid, 0, nonce,
+                error="prefix hash chain does not match cloud hash block size",
+            )
+            return
+        try:
+            hit = reservations.reserve(request)
+        except Exception as exc:
+            logger.exception("[Lwd][prefix] reserve failed req=%s", rid)
+            self._lwd_send_prefix_ready(rid, 0, nonce, error=str(exc))
+            return
+        logger.info(
+            "[Lwd][prefix] reserved req=%s hit_tokens=%d prompt_tokens=%d",
+            rid, hit, request.num_prompt_tokens,
+        )
+        try:
+            super().add_request(request, request_wave)
+        except Exception:
+            reservations.release(rid)
+            self._lwd_send_prefix_ready(
+                rid, 0, nonce, error="cloud admission failed"
+            )
+            raise
+        self._lwd_send_prefix_ready(rid, hit, nonce)
+
+    def _lwd_publish_reliable(self, notify) -> None:
+        while not self._lwd_post_out.closed:
+            if self._lwd_post_out.publish(notify):
+                return
+            time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)
+
+    def _lwd_send_prefix_ready(
+        self, request_id: str, hit_tokens: int, nonce: int, error: str = ""
+    ) -> None:
+        self._lwd_publish_reliable(
+            LwdPrefixReadyNotify(request_id, hit_tokens, nonce, error)
+        )
+        logger.info(
+            "[Lwd][prefix] READY sent req=%s hit=%d nonce=%d error=%r",
+            request_id, hit_tokens, nonce, error,
+        )
+
+    def _lwd_send_refill(self, request_id: str, start_row: int, end_row: int) -> None:
+        self._lwd_publish_reliable(
+            LwdRefillNotify(request_id, start_row, end_row)
+        )
+        logger.info(
+            "[Lwd][prefix] REFILL sent req=%s rows=[%d, %d)",
+            request_id, start_row, end_row,
+        )
+
     def step_with_batch_queue(self):
         """步骤执行时长打点(开始执行→执行结束;不含引擎空等)。
 
@@ -578,12 +688,20 @@ class LwdCloudEngineCoreMixin:
                 break
         if not items:
             return
-        # 上报载荷两种形态:
-        #   * (channel, seqno)             —— 老形态(host 暂存关着)
-        #   * ((channel, seqno), arrived)  —— 捎带本批逐请求已收行数
-        #     arrived = [(req_id, rows_delta), ...](design v7 §5.2)
+        # 上报载荷:(channel, seqno)、((channel, seqno), arrived) 或
+        # ("refill_done", request_id)。refill_done 只摘调度闸门,
+        # 不推进普通 UP watermark。
         watermark_items = []
         for item in items:
+            if (
+                isinstance(item, tuple)
+                and len(item) == 2
+                and item[0] == "refill_done"
+            ):
+                gate_hook = getattr(self.scheduler, "lwd_refill_done", None)
+                if gate_hook is not None:
+                    gate_hook(str(item[1]))
+                continue
             if (
                 isinstance(item, tuple)
                 and len(item) == 2

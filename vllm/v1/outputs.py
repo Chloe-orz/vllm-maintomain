@@ -282,6 +282,10 @@ class ModelRunnerOutput:
     # 摘除 pending 闸门条目(语义 = 云侧已收讫)。非 LWD 恒为 -1。
     lwd_up_send_watermark: int = -1
 
+    # UNEMBED 捎带全部 engine 的 UP 水位;EMBED/单 DP 仍使用上面的
+    # 单数字段,多 DP 由边引擎逐 engine 清理 pending。
+    lwd_up_send_watermarks: dict[int, int] = field(default_factory=dict)
+
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs]

@@ -28,10 +28,19 @@ recv hint);调度器每步对"已收未算完"的请求直接开窗:
 可见集谓词自然对该请求重开整条 prompt 的窗口,runner 在 harvest 前
 把 stager 读指针回退到调度水位(``_lwd_rewind_staged_reads``),注入
 几何与首算逐字相同;被抢请求拼回 waiting 队首(原生语义)。调度侧
-每步多付的只是一次 re-prefill 的预算。仍须关闭 prefix caching(零
-占位 token ids 的块哈希跨请求同值,命中即静默错算),本类的核验
-只负责把违背变成当场报错而非静默错算。
-"""
+每步多付的只是一次 re-prefill 的预算。
+prefix caching(wire v4 起支持):命中边界经协商定死——边侧预告真实
+内容的块哈希链,云侧建请求时 reserve(钉住命中块 + fail-closed 快照)
+并回 READY,边侧自 num_computed=hit 起发送剩余段;原生 allocate_slots
+经 kv_cache_manager 的 LWD 钩子把命中块挂进请求 KV 链,可见性谓词中
+被命中的 [0, H) 零值行因 num_computed 起点 = H 而永不进窗。"零占位
+token ids 哈希跨请求同值"的风险由两点消除:hasher 优先采用 wire 预告
+链(云引擎),链长不符的协商请求当场回 error 拒绝准入。
+抢占重准入(prefix caching 开启时)走统一路径(设计 §5.3):可见集
+组装前对被抢占请求只读重查 H',H'≥暂存地板 S 直接按快照续算
+(H'>S 为 self-hit),H'<S 发 LwdRefillNotify 由边侧补发缺失行并挂
+refill 闸门(``_lwd_refill_gate``,可见性谓词前短路),补发完成
+(``lwd_refill_done``)后摘闸准入。"""
 
 from __future__ import annotations
 
@@ -45,6 +54,9 @@ from vllm.v1.core.sched.output import (
     LwdBatchType,
     LwdEmbedBatch,
     SchedulerOutput,
+)
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
+    prefix_start,
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
@@ -91,6 +103,16 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         # 摘除台账只活在调度器进程里,worker 的暂存池看不到,所以必须随批
         # 捎带过去;每步排空(通知是幂等的,重复送达只会重复一个 no-op)。
         self._lwd_abort_pending: list[str] = []
+        # 前缀协商(wire v4):开关读配置级,与 HELLO 通告同源;预留表由
+        # 引擎 init_lwd_prefix_cache 装配(scheduler.lwd_prefix_reservations)。
+        self._lwd_prefix_enabled = bool(
+            self.vllm_config.cache_config.enable_prefix_caching
+        )
+        # refill 闸门(设计 §5.3):抢占重准入重查 H' < 暂存地板 S 时挂起,
+        # 补发完成(lwd_refill_done)摘除;门内请求可见性谓词前短路(不开窗)。
+        self._lwd_refill_gate: set[str] = set()
+        # rid -> 钉住的重查命中 H'(refill 完成时把暂存地板推进到 H')
+        self._lwd_refill_pending: dict[str, int] = {}
         logger.info(
             "[Lwd][host-stage] windowed consume armed: base=%d",
             self.max_num_scheduled_tokens,
@@ -244,6 +266,110 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         ]
 
     # ------------------------------------------------------------------ #
+    # 前缀协商:抢占重准入统一路径(设计 §5.3)与 refill 闸门                #
+    # ------------------------------------------------------------------ #
+    def _lwd_prep_prefix_readmission(self, request) -> bool:
+        """被抢占请求的重准入预备:只读重查 H' -> 短钉残块 + 快照。
+
+        对所有被抢占请求生效(不止命中过的请求):H' > S 是 self-hit——
+        未命中过的请求被抢占后可命中自己此前算过且入缓存的块,抢占
+        重算直接变便宜(原生即有此性质,host 暂存全覆盖故零额外处理)。
+
+        命中上限 = num_prompt_tokens - 1(尾部至少保留 1 个 token 参与
+        计算;host 暂存只覆盖 prompt 段,命中不进 decode 区);另做到达
+        钳制 H''=min(H', recv_rows 下对齐调度块粒度)——H' 不得超过
+        本请求已收行数(stager ``consumed <= recv_rows`` 不变量),且
+        H'' 恒为各组块整数倍(与命中边界同源对齐)。
+
+        Returns:
+            True = H'' >= 暂存地板 S,快照就绪,本步可开窗;
+            False = H'' < S(命中块已被逐出),已发 LwdRefillNotify 并挂
+            refill 闸门,本步不可见,等补发完成(lwd_refill_done)摘闸。
+
+        Raises:
+            RuntimeError: refill 通道未装配(引擎未注入 lwd_refill_sender,
+                属接线错误,fail-fast)。
+        """
+        reservations = self.lwd_prefix_reservations
+        floor = getattr(request, "lwd_resume_cap_tokens", 0)
+        if request.skip_reading_prefix_cache:
+            groups, h_prime = (), 0
+        else:
+            groups, h_prime = (
+                self.kv_cache_manager.coordinator.find_longest_cache_hit(
+                    request.block_hashes,
+                    max_cache_hit_length=max(0, request.num_prompt_tokens - 1),
+                )
+            )
+        # 到达钳制:H' 可能越过本请求的已收高水位(共享前缀的其他请求
+        # 把缓存链补得比本请求已收到的行更长)。stager 不变量
+        # ``0 <= consumed <= recv_rows`` 要求准入边界不超过已收行数,
+        # 否则 runner 的读指针前跳会越过未写入行。向下对齐到**调度块
+        # 粒度**(scheduler_block_size = 各组块大小 LCM,与命中边界同源
+        # ——混合 KV 组下 hash 块是各组块大小的 GCD,钳到 hash 粒度会
+        # 破坏组块对齐,truncate_groups 的整除假设随之失效);H''=0
+        # 退化为无命中(截空不钉块,走原生全量重算暂存行)。只截钉块/
+        # 快照,不回写台账。
+        ledger = getattr(self, "lwd_recv_rows", None) or {}
+        recv_rows = int(ledger.get(request.request_id, 0))
+        align = self.kv_cache_manager.coordinator.scheduler_block_size
+        h_clamped = min(h_prime, recv_rows // align * align)
+        if h_clamped < h_prime:
+            logger.info(
+                "[Lwd][prefix] clamp readmission hit req=%s: H'=%d -> %d "
+                "(recv_rows=%d align=%d)",
+                request.request_id, h_prime, h_clamped,
+                recv_rows, align,
+            )
+            groups = reservations.truncate_groups(groups, h_clamped)
+            h_prime = h_clamped
+        # 钉住残块 + fail-closed 快照:防准入/refill 期间残块再被逐出
+        # (补发赶不上逐出的追赶抖动);预留短窗口,首次成功分配后释放
+        reservations.reserve_hit(request, groups, h_prime)
+        if h_prime >= floor:
+            return True
+        sender = getattr(self, "lwd_refill_sender", None)
+        if sender is None:
+            raise RuntimeError(
+                "[Lwd][prefix] refill channel not wired: "
+                "scheduler.lwd_refill_sender missing (engine init order?)"
+            )
+        self._lwd_refill_gate.add(request.request_id)
+        self._lwd_refill_pending[request.request_id] = h_prime
+        logger.info(
+            "[Lwd][prefix] refill required req=%s: H'=%d < floor S=%d, "
+            "requesting edge resend of [%d, %d)",
+            request.request_id, h_prime, floor, h_prime, floor,
+        )
+        sender(request.request_id, h_prime, floor)
+        return False
+
+    def lwd_refill_done(self, request_id: str) -> None:
+        """refill 补发完成(引擎 done MQ 驱动):摘闸门 + 推进暂存地板。
+
+        补发行填齐 [H', S) 后,stager 覆盖区间扩到 [H', prompt):暂存
+        地板推进到 H'(下一次抢占以新地板判补发);请求按钉住的 H'
+        快照恢复可见。幂等:迟到/重复上报(请求已终结、闸门已摘)
+        告警后忽略(§6 竞态:refill 在途 abort / 迟到 refill_done)。"""
+        h_prime = self._lwd_refill_pending.pop(request_id, None)
+        if h_prime is None:
+            logger.warning(
+                "[Lwd][prefix] stale refill_done req=%s (not gated), ignored",
+                request_id,
+            )
+            return
+        self._lwd_refill_gate.discard(request_id)
+        request = self.requests.get(request_id)
+        if request is None:
+            # 补发期间请求已终结:预留/闸门由 _free_request 兜底清理
+            return
+        request.lwd_resume_cap_tokens = h_prime
+        logger.info(
+            "[Lwd][prefix] refill done req=%s: gate lifted, floor -> %d",
+            request_id, h_prime,
+        )
+
+    # ------------------------------------------------------------------ #
     # 调度主体(arrival 驱动,design v8)                                    #
     # ------------------------------------------------------------------ #
     def _schedule_impl(self) -> SchedulerOutput:
@@ -261,6 +387,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         # 可见集谓词(recv_rows > computed)同时是安全闸:零值占位绝不进
         # batch(读了不报错,静默错算)。chunk 化从此只是边侧的流量整形。
         ledger = getattr(self, "lwd_recv_rows", None) or {}
+        reservations = getattr(self, "lwd_prefix_reservations", None)
         windowed: list[tuple] = []  # (request, n_rows)
         if room > 0:
             for request in itertools.chain(
@@ -272,7 +399,22 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 computed = request.num_computed_tokens
                 if computed >= request.num_prompt_tokens:
                     continue  # decode 态:由 decode_ids 覆盖
-                arrived = int(ledger.get(rid, 0)) - computed
+                start = computed
+                if self._lwd_prefix_enabled:
+                    if rid in self._lwd_refill_gate:
+                        continue  # refill 补发未到齐:洞未填齐整体不可见
+                    if computed == 0:
+                        if (
+                            request.num_preemptions > 0
+                            and reservations is not None
+                            and not reservations.has(rid)
+                            and not self._lwd_prep_prefix_readmission(request)
+                        ):
+                            continue  # H'<S:refill 在途,挂闸门等补发
+                        # 命中请求的起点是预留命中 H(被命中的 [0,H) 零值行
+                        # 永不进窗;recv_rows 亦自 H 起涨),不是裸水位 0
+                        start = prefix_start(request, reservations)
+                arrived = int(ledger.get(rid, 0)) - start
                 if arrived <= 0:
                     continue  # 数据还没到
                 n = min(arrived, room)
@@ -285,12 +427,14 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 # 这并不损失吞吐(闲置是数据依赖的必然),延迟上限为一个
                 # chunk 到达间隔。末段(已收 == prompt 全长)不受此限,
                 # 保证请求必然算完;抢占重算后 recv_rows 满值,天然不命中。
-                if n < room and computed + arrived < request.num_prompt_tokens:
+                # start + arrived == recv_rows(起点偏移恒等式),末段判据
+                # 对命中请求同样成立。
+                if n < room and start + arrived < request.num_prompt_tokens:
                     continue
                 # start 必须此刻捕获:原生 schedule() 会经
                 # ``_update_after_schedule`` **乐观推进** num_computed,
                 # 下发后再读就是窗口末尾而不是起点。
-                windowed.append((request, n, computed))
+                windowed.append((request, n, start))
                 room -= n
         if windowed:
             out = self._lwd_dispatch_windows(windowed, decode_ids,

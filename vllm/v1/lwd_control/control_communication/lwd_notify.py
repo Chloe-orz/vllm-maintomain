@@ -18,9 +18,11 @@ if TYPE_CHECKING:
 # 保留,供 deepstack 等大数据量载荷扩展);3 = 云侧多 DP + 按请求 arrival
 # 驱动:HELLO 携带 engine_index/coord_stats_addr,C2eNotify 携带
 # engine_index;RangeNotify 不再驱动调度(只驱动数据面提前收),mrope
-# positions 随 LwdRequestNotify 全量一次下发。两侧必须同版本部署:
-# msgspec 容忍未知字段,版本错配时旧端不会报错,只会 mrope 静默缺失。
-LWD_WIRE_VERSION = 3
+# positions 随 LwdRequestNotify 全量一次下发;4 = prefix caching 协商
+# (HELLO 前缀能力位 + RequestNotify.prefix_nonce + READY/Refill 下行 +
+# RangeItem.is_refill)。两侧必须同版本部署:msgspec 容忍未知字段,
+# 版本错配时旧端不会报错,只会 mrope/prefix 协商静默缺失。
+LWD_WIRE_VERSION = 4
 
 
 class LwdRangeItem(msgspec.Struct, gc=False):
@@ -44,6 +46,9 @@ class LwdRangeItem(msgspec.Struct, gc=False):
     后 tobytes)。CPU 产生、CPU 消费——云 runner frombuffer 成 [3,n]
     后零转置直写 req_state。空 = 无 mrope;has_mrope=True 而字节为空
     = 对端仍按 aux 帧协议运行(wire_version<2),云侧 fail-fast。"""
+    is_refill: bool = False
+    """补发标记(wire_version 4 起):True = 抢占重算的 refill 补发,
+    范围为 prompt 绝对坐标;带外优先发送、不过边侧 picker。"""
 
 
 class LwdRangeNotify(msgspec.Struct, gc=False, tag=True):
@@ -73,6 +78,11 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):
     num_prompt_tokens: int
     max_tokens: int = 16
     block_hashes: list[bytes] = []
+    prefix_nonce: int = 0
+    """前缀协商号:非 0 = 云侧预留命中块并回 READY 后,边侧才按
+    num_computed=hit_tokens 入队发送剩余段。"""
+    skip_reading_prefix_cache: bool = False
+    """透传 SamplingParams.skip_reading_prefix_cache。"""
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = 0
@@ -131,6 +141,30 @@ class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
     """云侧 DPCoordinator 的 front 发布地址(tcp://<云可路由IP>:port),
     边侧据此订阅 stats 对账并上行 FIRST_REQ 唤醒。空 = 无 coordinator
     (dp=1 单云),边侧不建唤醒通道。"""
+    prefix_caching: bool = False
+    """本 engine 的 prefix caching 开关,边侧逐 engine 严格互校。"""
+    hash_block_size: int = 0
+    """本 engine 的 KV 哈希块粒度;各 engine 必须一致。"""
+    prefix_alignment_tokens: int = 0
+    prefix_alignment_required: bool = False
+    prefix_use_eagle: bool = False
+
+
+class LwdPrefixReadyNotify(msgspec.Struct, gc=False, tag=True):
+    """云->边前缀协商回执;nonce 与 RequestNotify 对账。"""
+
+    request_id: str
+    hit_tokens: int
+    nonce: int
+    error: str = ""
+
+
+class LwdRefillNotify(msgspec.Struct, gc=False, tag=True):
+    """云->边 refill 补发请求,范围为 prompt 绝对坐标。"""
+
+    request_id: str
+    start_row: int
+    end_row: int
 
 
 # 完成码哨兵:finish_reasons 中的"本步未终结"值
@@ -168,7 +202,9 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
 LwdNotify = Union[LwdRangeNotify, LwdRequestNotify, LwdAbortNotify]  # noqa: UP007
 # 云->边方向(POST_OUT):HELLO 发现 + 步元数据(唯一载荷,兼结果回传
 # 驱动);重同步消息在此 union 上 additive 扩展
-LwdCloudNotify = Union[LwdHelloNotify, LwdC2eNotify]  # noqa: UP007
+LwdCloudNotify = Union[  # noqa: UP007
+    LwdHelloNotify, LwdC2eNotify, LwdPrefixReadyNotify, LwdRefillNotify
+]
 # 数据面批型定义归 vllm/v1/core/sched/output.py(LwdBatch/LwdBatchType/
 # LwdEmbedBatch/LwdUnembedBatch,f8182fd5 定稿),协议层不重复声明
 
