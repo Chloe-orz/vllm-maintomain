@@ -1136,9 +1136,20 @@ def launch_core_engines(
     )
 
     if run_coordinator:
+        # In an LWD cloud the front-end is the edge process on another
+        # host: pass this instance's cloud address so the coordinator's
+        # stats XPUB becomes a routable TCP endpoint the edge can connect
+        # to (see DPCoordinator.__init__).
+        lwd_cloud_addr = None
+        if (
+            vllm_config.lwd_config is not None
+            and vllm_config.lwd_config.role == "cloud"
+        ):
+            lwd_cloud_addr = vllm_config.lwd_config.instance.dp[0].addr
         coordinator = DPCoordinator(
             parallel_config,
             enable_wave_coordination=vllm_config.model_config.is_moe,
+            lwd_cloud_addr=lwd_cloud_addr,
         )
 
         addresses.coordinator_input, addresses.coordinator_output = (

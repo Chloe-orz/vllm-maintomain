@@ -1,10 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Cloud engine core: serves the edge of the same DP rank over the control
+"""Cloud engine cores: serve the edge of the same DP rank over the control
 plane. Edge messages are handled on an ingest thread (range notifies feed the
 scheduler and the pre-recv hint, request notifies become native ADDs); step
-metadata is flushed to the edge in post_step."""
+metadata is flushed to the edge in post_step.
+
+The LWD seams live in LwdCloudEngineCoreMixin and are orthogonal to the
+engine base: LwdCloudEngineCore (EngineCoreProc) serves one DP rank of a
+cloud instance and non-MoE multi-DP deployments; LwdCloudDPEngineCore
+(DPEngineCoreProc) serves MoE multi-DP deployments, inheriting the native
+DP semantics (wave state machine, dummy batches, START_DP_WAVE, stats
+publishing) unchanged.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +26,7 @@ import torch
 from vllm.lwd_logger import lwd_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequestType
-from vllm.v1.engine.core import EngineShutdownState
+from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc, EngineShutdownState
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,
 )
@@ -51,8 +59,8 @@ _LWD_INGEST_JOIN_TIMEOUT_S = 5.0
 _LwdIngestItem = tuple[LwdPeer, LwdEdgeToCloudMessage]
 
 
-class LwdCloudEngineCore(LwdBaseEngineCore):
-    """Cloud PO engine: control plane + ingest thread, the rest is native."""
+class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
+    """The LWD seams of a cloud engine, shared by both engine bases."""
 
     lwd_scheduler_cls = LwdCloudScheduler
     scheduler: LwdCloudScheduler
@@ -96,11 +104,14 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         self._lwd_edge: LwdPeer | None = None
         sched_config = self.vllm_config.scheduler_config
         # Scheduling limits the edge checks (same inputs of the cap/preflight
-        # formulas on both sides).
+        # formulas on both sides). The coordinator address lets the edge
+        # trigger the first DP wave; its published host may not be routable
+        # from the edge, so it is rewritten to this DP's topology address.
         self._lwd_cloud_params = LwdCloudParamsNotify(
             max_num_batched_tokens=sched_config.max_num_batched_tokens,
             max_num_seqs=sched_config.max_num_seqs,
             num_speculative_tokens=lwd_spec_factor(self.vllm_config) - 1,
+            dp_coordinator_addr=self._lwd_dp_coordinator_addr(),
         )
         self._lwd_register_recv_hint()
         # Edge messages are handled off the IO thread: building a request
@@ -115,6 +126,18 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         self._lwd_ingest_thread.start()
         plane = self._lwd_start_control_plane()
         lwd_logger.info("[cloud] engine assembled: control plane on %s", plane.endpoint)
+
+    def _lwd_dp_coordinator_addr(self) -> str:
+        """Routable coordinator stats endpoint, or empty without one."""
+        address = getattr(self, "frontend_stats_publish_address", None)
+        if not self.has_coordinator or not address:
+            return ""
+        if not str(address).startswith("tcp://"):
+            return ""
+        _, _, port = str(address).rpartition(":")
+        dp_rank = self.vllm_config.parallel_config.data_parallel_index
+        local = self.lwd_config.instance.dp[dp_rank]
+        return f"tcp://{local.addr}:{port}"
 
     def _lwd_decode(self, payload: bytes) -> LwdMessage:
         return lwd_decode_edge_to_cloud(payload)
@@ -252,6 +275,22 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
                 msg.request_id,
                 msg.num_prompt_tokens,
             )
+            # A paused wave must run the new request. Normally the edge's
+            # FIRST_REQ makes the coordinator broadcast START_DP_WAVE; this
+            # local wake-up is the fallback for a broken FIRST_REQ path
+            # (unroutable coordinator stats address): the request arriving
+            # here is itself the proof of work, exactly like a front-end
+            # ADD waking an idle engine (core.py add_request). Paused
+            # engines still drain their input queue, so the flag takes
+            # effect on the very next loop iteration; wave consistency is
+            # not harmed - the step-end all-reduce resynchronizes every
+            # engine, and a later START_DP_WAVE is idempotent on a running
+            # engine.
+            if not self.engines_running:
+                self.engines_running = True
+                lwd_logger.info(
+                    "[cloud] first request wakes a paused wave (local fallback)"
+                )
 
     def shutdown(self) -> None:
         # Before the executor goes: a pre-recv hint blocks on its queue.
@@ -363,3 +402,16 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
                 self._lwd_send_until_queued(self._lwd_edge, notify)
             self.scheduler.pending_c2e.clear()
         super().post_step(model_executed)
+
+
+class LwdCloudEngineCore(LwdCloudEngineCoreMixin, EngineCoreProc):
+    """Cloud PO engine of one DP rank (dp=1 and non-MoE multi-DP): the
+    engine processes of a multi-DP non-MoE cloud are independent, so the
+    native EngineCoreProc base is the whole story."""
+
+
+class LwdCloudDPEngineCore(LwdCloudEngineCoreMixin, DPEngineCoreProc):
+    """Cloud PO engine of a MoE multi-DP cloud: the native DP engine base
+    carries the wave state machine, dummy batches, START_DP_WAVE handling
+    and stats publishing, so the MoE engines stay in lockstep exactly as a
+    centralized DP deployment; the LWD seams come from the mixin."""
