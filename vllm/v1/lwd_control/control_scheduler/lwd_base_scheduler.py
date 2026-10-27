@@ -2,8 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Common base class for Lwd edge/cloud schedulers: phase predicates and
-the visible-set scheduling primitive (three-queue remove - schedule -
-reassemble).
+the visible-set scheduling primitive.
 
 Inherits AsyncScheduler; native scheduling behavior and isinstance checks
 stay unchanged.
@@ -96,11 +95,11 @@ class LwdBaseScheduler(AsyncScheduler):
         hidden, then reassembled into their original queues after the step
         (visible-set mechanism).
 
-        waiting/skipped sources go through native admission
+        Waiting and KV-holding sources go through native admission
         (allocate/state transition/accounting all intact), running sources
         go through resume. Reassembly: still-scheduled requests are
         appended after the hidden running, preempted ones go to the waiting
-        tail, skipped ones go to the skipped queue head.
+        tail, KV-holding ones go to the KV-holding queue head.
 
         token_budget_cap / chunk_threshold only tighten, never loosen, the
         native limits: the edge side passes a cap to reproduce the picker's
@@ -114,15 +113,21 @@ class LwdBaseScheduler(AsyncScheduler):
         picked = {self.requests[req_id] for req_id in req_ids}
         from_running = [req for req in self.running if req in picked]
         from_waiting = [req for req in self.waiting if req in picked]
-        from_skipped = [req for req in self.skipped_waiting if req in picked]
+        from_kv_holding = [req for req in self.kv_holding_waiting if req in picked]
+        from_deferred = self.deferred_waiting & picked
         self.running = [req for req in self.running if req not in picked]
         self.waiting.remove_requests(from_waiting)
-        self.skipped_waiting.remove_requests(from_skipped)
-        saved = (self.running, self.waiting, self.skipped_waiting)
+        self.kv_holding_waiting.remove_requests(from_kv_holding)
+        self.deferred_waiting.difference_update(picked)
+        saved = (self.running, self.waiting, self.kv_holding_waiting)
+        saved_deferred = self.deferred_waiting
         # Put the visible set in place and schedule it alone
         self.running = from_running
         self.waiting = self._lwd_new_queue(from_waiting)
-        self.skipped_waiting = self._lwd_new_queue(from_skipped)
+        self.kv_holding_waiting = self._lwd_new_queue(from_kv_holding)
+        # Deferred requests remain in one of the waiting queues; their markers
+        # must follow the visible set so native queue counts stay consistent.
+        self.deferred_waiting = from_deferred
         saved_cap = self.max_num_running_reqs
         self.max_num_running_reqs = max(0, saved_cap - len(saved[0]))
         saved_budget = self.max_num_scheduled_tokens
@@ -138,9 +143,13 @@ class LwdBaseScheduler(AsyncScheduler):
             self.max_num_running_reqs = saved_cap
             self.max_num_scheduled_tokens = saved_budget
             sched_cfg.long_prefill_token_threshold = saved_threshold
-            post = (self.running, self.waiting, self.skipped_waiting)
-            self.running, self.waiting, self.skipped_waiting = saved
+            post = (self.running, self.waiting, self.kv_holding_waiting)
+            post_deferred = self.deferred_waiting
+            self.running, self.waiting, self.kv_holding_waiting = saved
+            self.deferred_waiting = saved_deferred
             self.running += post[0]
-            self.waiting.extend(post[1])
-            self.skipped_waiting.prepend_requests(post[2])
+            for request in post[1]:
+                self.waiting.add_request(request)
+            self.kv_holding_waiting.prepend_requests(reversed(list(post[2])))
+            self.deferred_waiting.update(post_deferred)
         return out
