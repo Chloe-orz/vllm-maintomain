@@ -52,6 +52,9 @@ class LwdConfig:
     scheduler_name: str = "mixed"
     publish_queue_max: int = LWD_PUBLISH_QUEUE_MAX
     debug: bool = False
+    prefix_timeout_s: float = 60.0
+    """边侧等云侧前缀协商 READY 的预算(秒):超时按 error READY
+    取消请求,避免协议事故导致请求永久等待。"""
 
     def lwd_pre_out_endpoint(self) -> str:
         """PRE_OUT 端点:云侧 bind 地址,随 HELLO 通告给边。"""
@@ -83,7 +86,32 @@ class LwdConfig:
                 section.get("publish_queue_max", LWD_PUBLISH_QUEUE_MAX)
             ),
             debug=bool(section.get("debug", False)),
+            prefix_timeout_s=float(section.get("prefix_timeout_s", 60.0)),
         )
+        if config.prefix_timeout_s <= 0:
+            raise ValueError("LWD prefix_timeout_s must be positive")
+        if (
+            is_lwd_prefill_only(vllm_config)
+            and vllm_config.cache_config.enable_prefix_caching
+        ):
+            if config.scheduler_name != "mixed":
+                raise ValueError(
+                    "LWD prefix caching currently requires mixed scheduling"
+                )
+            spec = getattr(vllm_config, "speculative_config", None)
+            if spec is not None:
+                if spec.method != "mtp":
+                    raise ValueError(
+                        "LWD prefix caching supports only MTP speculation"
+                    )
+                if getattr(spec, "parallel_drafting", False):
+                    raise ValueError(
+                        "LWD prefix caching with MTP requires sequential drafting"
+                    )
+                if vllm_config.parallel_config.prefill_context_parallel_size > 1:
+                    raise ValueError(
+                        "LWD prefix caching with MTP does not support PCP"
+                    )
         return _lwd_apply_env_overrides(config)
 
 
@@ -130,6 +158,7 @@ def _lwd_apply_env_overrides(config: LwdConfig) -> LwdConfig:
         scheduler_name=config.scheduler_name,
         publish_queue_max=config.publish_queue_max,
         debug=config.debug or (debug is not None and debug.lower() == "1"),
+        prefix_timeout_s=config.prefix_timeout_s,
     )
 
 

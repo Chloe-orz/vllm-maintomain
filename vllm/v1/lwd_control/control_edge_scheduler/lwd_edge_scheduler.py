@@ -26,6 +26,7 @@ c = min(剩余, chunk 单元 C) 切块,批 = 续传 chunk 优先 + waiting FCFS
 
 from __future__ import annotations
 
+import copy
 import os
 import time
 from typing import TYPE_CHECKING
@@ -38,6 +39,7 @@ from vllm.v1.core.sched.output import (
     LwdBatchType,
     LwdEmbedBatch,
     LwdUnembedBatch,
+    NewRequestData,
     SchedulerOutput,
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
@@ -45,6 +47,7 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdC2eNotify,
     LwdRangeItem,
     LwdRangeNotify,
+    LwdRefillNotify,
     LwdRequestNotify,
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
@@ -54,6 +57,7 @@ from vllm.v1.lwd_debug import LwdControlLog
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.sampling_params import SamplingParams
     from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
         LwdControlPublisher,
@@ -81,6 +85,14 @@ _LWD_MAX_PENDING_CHUNKS = int(
 )
 
 
+def lwd_edge_scheduler_config(vllm_config: VllmConfig) -> VllmConfig:
+    """边调度器按 PC 关闭构造,原始引擎配置保留开关系数供协商。"""
+    scheduler_config = copy.copy(vllm_config)
+    scheduler_config.cache_config = copy.copy(vllm_config.cache_config)
+    scheduler_config.cache_config.enable_prefix_caching = False
+    return scheduler_config
+
+
 class LwdEdgeScheduler(LwdBaseScheduler):
     """纯 prefill 调度语义 + 控制面出口(notify/abort/seqno)。"""
 
@@ -91,6 +103,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         **kwargs,
     ) -> None:
         """publisher 由引擎在 HELLO 收齐后回填(per-engine 定向通道)。"""
+        orig_vllm_config = args[0] if args else kwargs["vllm_config"]
+        self._lwd_prefix_enabled = bool(
+            orig_vllm_config.cache_config.enable_prefix_caching
+        )
+        if args:
+            args = (lwd_edge_scheduler_config(args[0]), *args[1:])
+        else:
+            kwargs["vllm_config"] = lwd_edge_scheduler_config(
+                kwargs["vllm_config"]
+            )
         super().__init__(*args, **kwargs)
         # per-engine 定向发布面:{engine_index: publisher};空 = HELLO 未
         # 收齐(legacy 单云构造窗口),各发布点的空守卫维持原语义
@@ -134,6 +156,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # awaiting:嵌入完待云结果的 request_id -> 登记时刻(单调钟)。
         # 请求本体已清出调度器,此表是结果路径的唯一生命周期台账。
         self._lwd_awaiting: dict[str, float] = {}
+        self._lwd_prefix_pending: dict | None = None
+        self._lwd_prefix_hash_block_size = 0
+        # refill 需要重 embed 源;与 awaiting 同生命周期,容量由在途名额约束。
+        self._lwd_embed_sources: dict[str, tuple[list[int], list]] = {}
         # seqno -> 批内 request_id 列表(chunk 粒度 pending 跟踪):摘除由
         # UP send 完成水位驱动(lwd_edge_note_send_watermark,语义 = 云侧
         # 已收讫),与首 token 交付解耦 —— 边侧放行节奏不再挂在云侧计算
@@ -312,7 +338,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             single_prefill = is_deepseek_v4 and request.num_prompt_tokens >= 8000
             if single_prefill and picked:
                 break
-            chunk = min(request.num_prompt_tokens, unit)
+            remaining = (
+                request.num_prompt_tokens - request.num_computed_tokens
+            )
+            if remaining <= 0:
+                continue
+            chunk = min(remaining, unit)
             if new_count >= free_seq:
                 break
             if used + chunk > cap:
@@ -443,6 +474,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             eng = self._lwd_route.get(rid)
             if eng is not None:
                 decode[eng] += 1
+        for rid in self._lwd_prefix_pending or ():
+            eng = self._lwd_route.get(rid)
+            if eng is not None:
+                prefill[eng] += 1
         best, best_score = 0, None
         for k in range(M):
             eng = (self._lwd_last_engine + 1 + k) % M
@@ -494,6 +529,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             for req in self.running
             if self._lwd_route.get(req.request_id, 0) == engine
         )
+        prefill += sum(
+            1
+            for rid in self._lwd_prefix_pending or ()
+            if self._lwd_route.get(rid, 0) == engine
+        )
         decode = sum(
             1
             for rid in self._lwd_awaiting
@@ -537,12 +577,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_validate_request(request)
         self._lwd_compute_mrope_positions(request)
         engine = self._lwd_route_request(request.request_id)
+        nonce = getattr(request, "lwd_prefix_nonce", 0)
         self.lwd_edge_notify_request(
             request_id=request.request_id,
             num_prompt_tokens=len(request.prompt_token_ids),
             sampling_params=request.sampling_params,
             block_hashes=list(request.block_hashes),
             engine=engine,
+            prefix_nonce=nonce,
         )
         # wave 唤醒:每请求一条 FIRST_REQ(上行 coordinator,目标 engine
         # 已收到请求故被 exclude)。边台账对云侧收波有在途延迟窗,按
@@ -550,10 +592,33 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 幂等无害。单云(无 coordinator)钩子为 None,跳过。
         if self.lwd_first_req_hook is not None:
             self.lwd_first_req_hook(engine)
+        if nonce:
+            return
         super().add_request(request)
         if request.abort_immediately:
             self.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED)
             self.lwd_edge_abort([request.request_id])
+
+    def lwd_edge_prefix_ready(self, request: Request, hit_tokens: int) -> None:
+        """按协商命中边界进入原 engine 的本地等待队列。"""
+        hash_block_size = self._lwd_prefix_hash_block_size
+        if (
+            not 0 <= hit_tokens < request.num_prompt_tokens
+            or (hash_block_size > 0 and hit_tokens % hash_block_size != 0)
+        ):
+            logger.error(
+                "[Lwd][prefix] invalid READY hit req=%s hit=%d",
+                request.request_id, hit_tokens,
+            )
+            request.num_computed_tokens = 0
+            super().add_request(request)
+            self.finish_requests(
+                [request.request_id], RequestStatus.FINISHED_ABORTED
+            )
+            self.lwd_edge_abort([request.request_id])
+            return
+        request.num_computed_tokens = hit_tokens
+        super().add_request(request)
 
     @staticmethod
     def _lwd_request_has_mm(request: Request) -> bool:
@@ -723,6 +788,94 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
         return True
 
+    def lwd_edge_build_refill(
+        self, notify: LwdRefillNotify
+    ) -> SchedulerOutput | None:
+        """用保留源重 embed 缺失区间,并只发往请求原属 engine。"""
+        request_id = notify.request_id
+        source = self._lwd_embed_sources.get(request_id)
+        if source is None:
+            request = self.requests.get(request_id)
+            if request is not None and request.prompt_token_ids is not None:
+                source = (
+                    list(request.prompt_token_ids),
+                    list(request.mm_features),
+                )
+        if source is None:
+            logger.error("[Lwd][edge-refill] req=%s has no embed source", request_id)
+            return None
+        token_ids, mm_features = source
+        start, end = notify.start_row, notify.end_row
+        if not 0 <= start < end <= len(token_ids):
+            logger.error(
+                "[Lwd][edge-refill] req=%s invalid range [%d, %d)",
+                request_id, start, end,
+            )
+            return None
+        engine = self._lwd_route.get(
+            request_id, 0 if self._lwd_cloud_dp == 1 else None
+        )
+        publisher = (
+            self.lwd_edge_publishers.get(engine)
+            if engine is not None else None
+        )
+        if publisher is None:
+            logger.error(
+                "[Lwd][edge-refill] req=%s has no routed publisher", request_id
+            )
+            return None
+        seqno = self._lwd_seqno[engine]
+        item = LwdRangeItem(
+            request_id=request_id,
+            offset=start,
+            num_tokens=end - start,
+            is_refill=True,
+        )
+        if not publisher.publish(
+            LwdRangeNotify(
+                request_id=request_id,
+                offset=start,
+                num_tokens=end - start,
+                seqno=seqno,
+                items=[item],
+            )
+        ):
+            return None
+        self._lwd_seqno[engine] = seqno + 1
+        self._lwd_batch_requests[(engine, seqno)] = [request_id]
+        logger.info(
+            "[Lwd][edge-refill] req=%s engine=%d rows=[%d, %d) seqno=%d",
+            request_id, engine, start, end, seqno,
+        )
+        scheduler_output = SchedulerOutput.make_empty()
+        if mm_features:
+            scheduler_output.scheduled_new_reqs = [
+                NewRequestData(
+                    req_id=request_id,
+                    prompt_token_ids=None,
+                    mm_features=list(mm_features),
+                    sampling_params=None,
+                    pooling_params=None,
+                    block_ids=tuple(),
+                    num_computed_tokens=start,
+                    lora_request=None,
+                )
+            ]
+        scheduler_output.lwd_batch = LwdBatch(
+            batch_type=LwdBatchType.LWD_EMBED,
+            seqno=seqno,
+            batch_meta=LwdEmbedBatch(
+                req_ids=[request_id],
+                token_ids=[list(token_ids[start:end])],
+                prompt_offsets=[start],
+                has_mrope=[False],
+                prompt_lens=[len(token_ids)],
+                engine_index=engine,
+                is_refill=True,
+            ),
+        )
+        return scheduler_output
+
     def lwd_edge_notify_request(
         self,
         request_id: str,
@@ -730,6 +883,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         sampling_params: SamplingParams | None = None,
         block_hashes: list[bytes] | None = None,
         engine: int = 0,
+        prefix_nonce: int = 0,
     ) -> None:
         """发 LwdRequestNotify(请求元数据预告)到路由选定的 engine。
 
@@ -770,6 +924,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 sp.max_tokens if sp is not None and sp.max_tokens is not None else 16
             ),
             block_hashes=block_hashes if block_hashes is not None else [],
+            prefix_nonce=prefix_nonce,
+            skip_reading_prefix_cache=bool(
+                sp.skip_reading_prefix_cache if sp is not None else False
+            ),
             mrope_positions=mrope_bytes,
             temperature=sp.temperature if sp is not None else 1.0,
             top_p=sp.top_p if sp is not None else 1.0,
@@ -810,6 +968,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         for request_id in request_ids:
             self._lwd_awaiting.pop(request_id, None)
             self._lwd_mrope_positions_dict.pop(request_id, None)
+            self._lwd_embed_sources.pop(request_id, None)
             engine = self._lwd_route.pop(request_id, None)
             for key, rids in list(self._lwd_batch_requests.items()):
                 remaining = [rid for rid in rids if rid != request_id]
@@ -871,6 +1030,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if request.num_computed_tokens >= request.num_prompt_tokens:
                 finished_ids.append(request_id)
         if finished_ids:
+            if self._lwd_prefix_enabled:
+                for request_id in finished_ids:
+                    request = self.requests[request_id]
+                    self._lwd_embed_sources[request_id] = (
+                        list(request.prompt_token_ids or []),
+                        list(request.mm_features),
+                    )
             self.finish_requests(finished_ids, RequestStatus.FINISHED_STOPPED)
             now = time.monotonic()
             for request_id in finished_ids:
@@ -902,6 +1068,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return False
         if finished:
             del self._lwd_awaiting[request_id]
+            self._lwd_embed_sources.pop(request_id, None)
             self._lwd_route.pop(request_id, None)
             # pending 闸门台账的摘除已改由 UP send 完成水位驱动
             # (lwd_edge_note_send_watermark),与首 token 交付解耦。

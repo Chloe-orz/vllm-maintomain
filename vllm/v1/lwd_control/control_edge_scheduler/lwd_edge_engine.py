@@ -54,10 +54,15 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_WIRE_VERSION,
     LwdC2eNotify,
     LwdHelloNotify,
+    LwdPrefixReadyNotify,
+    LwdRefillNotify,
     lwd_decode_cloud_notify,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
     LwdConfig,
+)
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_prefix_control import (
+    LwdEdgePrefixControl,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
     LwdEdgeScheduler,
@@ -92,6 +97,14 @@ class LwdEdgeEngineCore(EngineCoreProc):
         super().__init__(*args, **kwargs)
         config = LwdConfig.from_env_and_config(vllm_config)
         self._lwd_config = config
+        self._lwd_prefix_enabled = bool(
+            vllm_config.cache_config.enable_prefix_caching
+        )
+        self._lwd_prefix_control = (
+            LwdEdgePrefixControl(self, config.prefix_timeout_s)
+            if self._lwd_prefix_enabled else None
+        )
+        self._lwd_pending_refills: deque = deque()
         # 层日志总开关:env 已开则不动,config 段开则补开(仅本进程)
         LwdLogBase.set_debug(config.debug)
         # 云 engine 数(= 云侧 data_parallel_size):边侧收齐 M 个 HELLO
@@ -138,8 +151,14 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 f"master_addr connectivity and POST_OUT port)"
             )
         self._lwd_cross_check_hello()
+        self._lwd_configure_prefix_cache()
 
         self.scheduler.lwd_edge_publishers = self._edge_senders
+        if self._lwd_prefix_control is not None:
+            self.scheduler._lwd_prefix_pending = self._lwd_prefix_control.pending
+            self.scheduler._lwd_prefix_hash_block_size = (
+                self._lwd_prefix_control.hash_block_size
+            )
         # FIRST_REQ 唤醒钩子:仅多云(有 coordinator)时接上;单云 None,
         # 调度器侧跳过
         self.scheduler.lwd_first_req_hook = (
@@ -219,6 +238,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
                     self._lwd_coord_client = LwdCoordClient(msg.coord_stats_addr)
                 if len(self._lwd_peer_hellos) >= self._lwd_expected_engines:
                     hello_event.set()
+            elif isinstance(msg, (LwdPrefixReadyNotify, LwdRefillNotify)):
+                self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, msg))
             elif isinstance(msg, LwdC2eNotify):
                 logger.info(
                     "[Lwd][edge-ctrl] C2eNotify reqs=%d down_seqno=%s",
@@ -234,6 +255,9 @@ class LwdEdgeEngineCore(EngineCoreProc):
 
     def _lwd_shutdown_planes(self) -> None:
         """两面关停(幂等):receiver 先关断输入,publisher 与 coord 收尾。"""
+        control = getattr(self, "_lwd_prefix_control", None)
+        if control is not None:
+            control.shutdown()
         receiver = getattr(self, "_edge_receiver", None)
         if receiver is not None:
             receiver.shutdown()
@@ -260,6 +284,13 @@ class LwdEdgeEngineCore(EngineCoreProc):
         )
         if not hellos:
             return
+        expected = set(range(self._lwd_expected_engines))
+        if set(hellos) != expected:
+            self._lwd_shutdown_planes()
+            raise RuntimeError(
+                f"[LWD] cloud HELLO engine set mismatch: "
+                f"expected={sorted(expected)}, got={sorted(hellos)}"
+            )
         if self._lwd_expected_engines > 1:
             for eng, hello in hellos.items():
                 if hello.wire_version < LWD_WIRE_VERSION:
@@ -313,18 +344,81 @@ class LwdEdgeEngineCore(EngineCoreProc):
             len(hellos),
         )
 
+    def _lwd_configure_prefix_cache(self) -> None:
+        """逐 engine 互校 PC 能力,所有 engine 的哈希规则必须一致。"""
+        hellos = self._lwd_peer_hellos
+        capabilities = set()
+        for eng, hello in hellos.items():
+            if self._lwd_prefix_enabled != hello.prefix_caching:
+                self._lwd_shutdown_planes()
+                raise RuntimeError(
+                    f"[LWD] prefix caching mismatch on engine {eng}: "
+                    f"edge={self._lwd_prefix_enabled} "
+                    f"cloud={hello.prefix_caching}"
+                )
+            if self._lwd_prefix_enabled and hello.wire_version < LWD_WIRE_VERSION:
+                self._lwd_shutdown_planes()
+                raise RuntimeError(
+                    f"[LWD] cloud engine {eng} does not support prefix wire "
+                    f"version {LWD_WIRE_VERSION}"
+                )
+            capabilities.add((
+                hello.hash_block_size,
+                hello.prefix_alignment_tokens,
+                hello.prefix_alignment_required,
+                hello.prefix_use_eagle,
+            ))
+        if self._lwd_prefix_control is not None:
+            if len(capabilities) != 1:
+                self._lwd_shutdown_planes()
+                raise RuntimeError(
+                    f"[LWD] inconsistent prefix capabilities across engines: "
+                    f"{sorted(capabilities)}"
+                )
+            self._lwd_prefix_control.configure(next(iter(hellos.values())))
+
     # ------------------------------------------------------------------ #
     # 引擎接口覆写                                                        #
     # ------------------------------------------------------------------ #
     def add_request(self, request, _request_wave: int = 0) -> None:
-        """边校验 + 云预告 + 本地入队。
+        if self._lwd_prefix_control is not None and not request.abort_immediately:
+            self._lwd_prefix_control.add_request(request)
+        else:
+            self.scheduler.lwd_edge_add_request(request)
 
-        _request_wave:原生主循环按位置传入(core.py ADD 分发),本模式
-        无 DP wave 语义,仅保形参契约,不消费。"""
-        self.scheduler.lwd_edge_add_request(request)
+    def _handle_client_request(self, request_type, request) -> None:
+        control = self._lwd_prefix_control
+        if control is not None and control.handle_client_request(
+            request_type, request
+        ):
+            return
+        if request_type == EngineCoreRequestType.WAKEUP and isinstance(
+            request, LwdRefillNotify
+        ):
+            self._lwd_handle_refill(request)
+            return
+        super()._handle_client_request(request_type, request)
+
+    def _lwd_handle_refill(self, notify: LwdRefillNotify) -> None:
+        scheduler_output = self.scheduler.lwd_edge_build_refill(notify)
+        if scheduler_output is None:
+            logger.error(
+                "[Lwd][edge-ctrl] refill req=%s cannot be served",
+                notify.request_id,
+            )
+            self.abort_requests([notify.request_id])
+            return
+        self._lwd_pending_refills.append(scheduler_output)
 
     def abort_requests(self, request_ids: list[str]) -> None:
         """abort 信号先出云,再走原生本地清理。"""
+        aborted = set(request_ids)
+        self._lwd_pending_refills = deque(
+            output for output in self._lwd_pending_refills
+            if not aborted.intersection(output.lwd_batch.batch_meta.req_ids)
+        )
+        if self._lwd_prefix_control is not None:
+            self._lwd_prefix_control.prepare_abort(request_ids)
         self.scheduler.lwd_edge_abort(request_ids)
         super().abort_requests(request_ids)
 
@@ -340,7 +434,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         批队列非空必须计入——否则最后一批派发后引擎睡眠,最终 token
         永不收割交付。"""
         return (super().has_work() or not self.lwd_c2e_meta_queue.empty()
-                or self._lwd_batch_queue)
+                or self._lwd_batch_queue or self._lwd_pending_refills)
 
     def _lwd_edge_step(self) -> tuple[dict[int, object] | None, bool]:
         """单步编排(批队列异步化+多批在飞,embed 优先):收割队首直至
@@ -407,6 +501,19 @@ class LwdEdgeEngineCore(EngineCoreProc):
                     kind, self._lwd_batch_seqno(kind, payload), wait_ms,
                 )
         d_emb = 0
+        while (
+            self._lwd_pending_refills
+            and len(self._lwd_batch_queue) < LWD_EDGE_BATCH_QUEUE_DEPTH
+        ):
+            refill_output = self._lwd_pending_refills.popleft()
+            future = self.model_executor.execute_model(
+                refill_output, non_block=True
+            )
+            self._lwd_batch_queue.append(
+                ("embed", refill_output, time.monotonic(), future)
+            )
+            prefill_work = True
+            d_emb += 1
         while (len(self._lwd_batch_queue) < LWD_EDGE_BATCH_QUEUE_DEPTH
                and self.scheduler.has_requests()):
             scheduler_output = self.scheduler.schedule()
@@ -570,6 +677,12 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 self.scheduler.lwd_edge_note_send_watermark(
                     int(getattr(notify, "engine_index", 0) or 0), wm
                 )
+            watermarks = getattr(result, "lwd_up_send_watermarks", None) or {}
+            for eng, engine_wm in watermarks.items():
+                if engine_wm >= 0:
+                    self.scheduler.lwd_edge_note_send_watermark(
+                        eng, engine_wm
+                    )
             # req_ids x sampled_token_ids 按位对齐:worker lm_head 恢复的采样
             # token,即该请求本步的生成内容;后续仅两处流向——
             # lwd_edge_deliver_tokens(调度器只对账 awaiting 生命周期,

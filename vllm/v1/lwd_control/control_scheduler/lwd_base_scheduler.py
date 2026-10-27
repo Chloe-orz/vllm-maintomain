@@ -83,6 +83,14 @@ class LwdBaseScheduler(AsyncScheduler):
         out: SchedulerOutput | None = None
         try:
             out = super().schedule()
+            # 前缀预留短窗口语义:reserve 钉住命中块防准入前被逐出,
+            # 首次成功分配(进入本步排程)后即释放——运行期保护由请求
+            # 自身 KV 链引用承担,预留不再长期占块(抢占重算要复刻原生
+            # 逐出语义)。少排(got=0)的请求保留预留,下步重试。
+            reservations = getattr(self, "lwd_prefix_reservations", None)
+            if reservations is not None and out is not None:
+                for request_id in out.num_scheduled_tokens:
+                    reservations.release(request_id)
         finally:
             # 按原队列拼回:running 存活者接尾,skipped 被跳过者排队首,
             # waiting 被抢占者插队首(见 docstring)
@@ -111,6 +119,20 @@ class LwdBaseScheduler(AsyncScheduler):
     # ------------------------------------------------------------------ #
     # 云侧 abort:先把未处理完的 chunk 算完,再终结请求                       #
     # ------------------------------------------------------------------ #
+    def _free_request(self, request: Request, delay_free_blocks: bool = False):
+        """兜底释放未消费的前缀预留与 refill 闸门(reserve->首分配窗口
+        内的 abort、协商失败回滚、refill 在途 abort 都经此收口)。"""
+        reservations = getattr(self, "lwd_prefix_reservations", None)
+        if reservations is not None:
+            reservations.release(request.request_id)
+        refill_gate = getattr(self, "_lwd_refill_gate", None)
+        if refill_gate is not None:
+            refill_gate.discard(request.request_id)
+            refill_pending = getattr(self, "_lwd_refill_pending", None)
+            if refill_pending is not None:
+                refill_pending.pop(request.request_id, None)
+        return super()._free_request(request, delay_free_blocks)
+
     def _lwd_notify_queue(self):
         """云侧 prefill 预告队列;边侧调度器没有该队列(返回 None)。"""
         return getattr(self, "prefill_notify_queue", None)

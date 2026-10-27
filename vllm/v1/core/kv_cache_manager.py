@@ -131,6 +131,10 @@ class KVCacheManager:
             max_num_batched_tokens = max_model_len
 
         self.enable_caching = enable_caching
+        # LWD prefill-only 云侧前缀协商开关:默认 False 保持集中式查询;
+        # 仅 LwdPrefixReservations 装配(云引擎 init_lwd_prefix_cache)
+        # 时置 True,get_computed_blocks 改走协商快照(fail-closed)。
+        self.lwd_prefix_caching = False
         self.use_eagle = use_eagle
         self.log_stats = log_stats
         self.metrics_collector = metrics_collector
@@ -219,11 +223,24 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
-        computed_blocks, num_new_computed_tokens = (
-            self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
+        if self.lwd_prefix_caching:
+            # LWD prefill-only 云侧:命中边界在协商/重准入时刻定死,
+            # 边侧已按它裁掉输入,只能复用预留快照(fail-closed),
+            # 不允许此时重查改变边界。
+            reservations = getattr(self, "lwd_prefix_reservations", None)
+            if reservations is None:
+                raise RuntimeError(
+                    "LWD prefix reservations are not initialized"
+                )
+            computed_blocks, num_new_computed_tokens = (
+                reservations.get_computed_blocks(request)
             )
-        )
+        else:
+            computed_blocks, num_new_computed_tokens = (
+                self.coordinator.find_longest_cache_hit(
+                    request.block_hashes, max_cache_hit_length
+                )
+            )
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None

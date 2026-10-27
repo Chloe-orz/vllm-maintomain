@@ -40,14 +40,10 @@ class TestPrefillBatchLimit(unittest.TestCase):
         )
 
     def runner(self, model_type="deepseek_v4", running=(), waiting=(), skipped=()):
-        return NS(
+        runner = NS(
             vllm_config=NS(model_config=NS(hf_text_config=NS(model_type=model_type))),
             _lwd_mixed=True,
             _lwd_awaiting={},
-            # 多 DP 路由账(空表 = 全部归 engine 0,与单云语义一致)与
-            # per-engine 负载访问器(无 awaiting 时 = 旧全局口径)
-            _lwd_route={},
-            _lwd_engine_load=lambda engine: (len(running), 0),
             _lwd_spec_factor=2,
             _lwd_chunk_unit=8196,
             max_num_scheduled_tokens=20000,
@@ -55,7 +51,14 @@ class TestPrefillBatchLimit(unittest.TestCase):
             running=list(running),
             waiting=list(waiting),
             skipped_waiting=list(skipped),
+            _lwd_route={r.request_id: 0 for r in (*running, *waiting, *skipped)},
+            _lwd_prefix_pending={},
         )
+        runner._lwd_engine_load = lambda engine: (
+            len(runner.running) + len(runner._lwd_prefix_pending),
+            len(runner._lwd_awaiting),
+        )
+        return runner
 
     def test_dsv4_waiting_batch_contains_only_first_request(self):
         runner = self.runner(waiting=[self.request("a"), self.request("b")])
@@ -85,11 +88,14 @@ class TestPrefillBatchLimit(unittest.TestCase):
         )
         runner.max_num_scheduled_tokens = 102
         runner.max_num_running_reqs = 1
-        self.assertEqual(self.pick(runner), (["a"], {"a": 100}, 100))
+        # host 暂存后 cap = 整步预算(不再有 decode 预留系数):续传块
+        # 被剩余额度截尾成 102
+        self.assertEqual(self.pick(runner), (["a"], {"a": 102}, 102))
         runner.running[0].num_computed_tokens = 8196
-        self.assertEqual(self.pick(runner), ([], {}, 100))
+        # 续传已完结 + free_seq = 0(inflight=1 占满名额):无新准入
+        self.assertEqual(self.pick(runner), ([], {}, 102))
         runner.max_num_scheduled_tokens = 2
-        self.assertEqual(self.pick(runner), ([], {}, 0))
+        self.assertEqual(self.pick(runner), ([], {}, 2))
 
     def test_other_models_keep_multi_request_batches(self):
         for model_type in ("deepseek_v3", "qwen3_5"):
@@ -154,6 +160,33 @@ class TestPrefillBatchLimit(unittest.TestCase):
         self.assertEqual(
             self.pick(runner)[:2], (["a", "b", "c"], {"a": 10, "b": 10, "c": 10})
         )
+
+    def test_prefix_hit_new_request_plans_remaining_only(self):
+        # 真机事故:命中请求 num_computed=1536(12×128 块),picker 曾按
+        # 全长 4106 记账,原生按剩余 2570 排程,核验当场误炸
+        runner = self.runner(
+            waiting=[self.request("hit", prompt=4106, computed=1536)]
+        )
+        self.assertEqual(self.pick(runner)[:2], (["hit"], {"hit": 2570}))
+
+    def test_prefix_hit_chunk_capped_by_unit(self):
+        runner = self.runner(
+            model_type="qwen3_5",
+            waiting=[self.request("hit", prompt=6000, computed=1536)],
+        )
+        runner._lwd_chunk_unit = 2000
+        # 剩余 4468 被 chunk 单元截到 2000(与全长无关)
+        self.assertEqual(self.pick(runner)[:2], (["hit"], {"hit": 2000}))
+
+    def test_fully_computed_waiting_request_is_skipped(self):
+        runner = self.runner(
+            model_type="qwen3_5",
+            waiting=[
+                self.request("done", prompt=1536, computed=1536),
+                self.request("new", prompt=10),
+            ],
+        )
+        self.assertEqual(self.pick(runner)[:2], (["new"], {"new": 10}))
 
 
 if __name__ == "__main__":
