@@ -189,7 +189,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if (
             len(self.running) >= self.max_num_running_reqs
             or pending_chunks >= _LWD_MAX_PENDING_CHUNKS
-            or not (self.waiting or self.skipped_waiting)
+            or not (self.waiting or self.kv_holding_waiting)
         ):
             if (
                 pending_chunks >= _LWD_MAX_PENDING_CHUNKS
@@ -404,7 +404,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         ]
         waiting = [
             LwdPrefillCandidate(r.request_id, r.num_prompt_tokens, 0)
-            for r in [*self.skipped_waiting, *self.waiting]
+            for r in [*self.kv_holding_waiting, *self.waiting]
         ]
         req_ids, expected = lwd_pick_prefill_batch(
             running,
@@ -436,11 +436,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         num_new_tokens: int,
         encoder_compute_budget: int,
         shift_computed_tokens: int = 0,
-    ) -> tuple[list[int], int, int, list[int]]:
+    ) -> tuple[list[int], int, int, list[int], list[int]]:
         """Edge-side passthrough: encoder execution and caching are managed
         by the worker itself; native rollback would break the chunk
         contract, so nothing is scheduled, consumed, or rolled back."""
-        return [], num_new_tokens, encoder_compute_budget, []
+        return [], num_new_tokens, encoder_compute_budget, [], []
 
     def _lwd_has_prefill_chunk_inflight(self) -> bool:
         """Whether running has an embed request not fully sent; same

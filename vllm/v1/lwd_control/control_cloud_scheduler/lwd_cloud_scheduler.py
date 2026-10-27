@@ -255,7 +255,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
 
     def _lwd_collect_decode_requests(self) -> list[str]:
         """Collect req_ids of decode-phase requests (prompt fully computed)
-        in running/waiting/skipped order; the output can directly serve as
+        in running/KV-holding/waiting order; the output can directly serve as
         input to visible-set scheduling; mid-prefill requests (num_computed
         still ramping up) do not enter the decode set -- they stay in the
         hidden set waiting for their own next chunk notify to drive their
@@ -265,8 +265,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
             for req in self._lwd_reqs_in_phase(
                 LwdReqPhase.DECODE,
                 self.running,
+                self.kv_holding_waiting,
                 self.waiting,
-                self.skipped_waiting,
             )
         ]
 
