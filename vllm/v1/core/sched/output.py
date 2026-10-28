@@ -74,11 +74,21 @@ class LwdUnembedBatch:
     """LWD prefill_only mode edge token-recovery batch (spec-decode aware)."""
 
     req_ids: list[str] = field(default_factory=list)
-    num_accept_tokens: list[int] = field(default_factory=list)  # per request: accepted count (<= K)
-    recv_num_elements: int = 0  # total DOWN hidden elements for the whole batch = rows_total * hidden_size
-    out_token_idxs: list[list[int]] = field(default_factory=list)  # per request: generation ordinal of each token (order-preserving emit)
-    top_id_ths: list[list[int]] = field(default_factory=list)  # per request: received Nth most probable token index (position in descending logits)
-    token_ids: list[list[int]] = field(default_factory=list)  # diagnostic bypass: per-request accepted token ids from cloud (skip-sample mode)
+    num_accept_tokens: list[int] = field(
+        default_factory=list
+    )  # per request: accepted count (<= K)
+    recv_num_elements: int = (
+        0  # total DOWN hidden elements for the whole batch = rows_total * hidden_size
+    )
+    out_token_idxs: list[list[int]] = field(
+        default_factory=list
+    )  # per request: generation ordinal of each token (order-preserving emit)
+    # Per request: rank of the received Nth most probable token
+    # (position in the descending logits order).
+    top_id_ths: list[list[int]] = field(default_factory=list)
+    token_ids: list[list[int]] = field(
+        default_factory=list
+    )  # diagnostic bypass: per-request accepted token ids from cloud (skip-sample mode)
     dp_idx: int = 0
     """Cloud DP rank this batch arrived from; the edge worker picks the
     DOWN channel of this DP connection. 0 keeps single-cloud behaviour."""

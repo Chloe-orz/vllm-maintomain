@@ -83,10 +83,12 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             if not self._lwd_cloud_params_received.wait(
                 max(0.0, deadline - time.monotonic())
             ):
+                missing = expected - len(self._lwd_cloud_params)
                 raise RuntimeError(
-                    f"[LWD] edge engine init failed: {expected - len(self._lwd_cloud_params)} "
-                    f"of {expected} cloud DP ranks accepted the handshake but "
-                    f"sent no scheduling limits within {handshake_timeout_s}s"
+                    f"[LWD] edge engine init failed: {missing} of "
+                    f"{expected} cloud DP ranks accepted the handshake "
+                    f"but sent no scheduling limits within "
+                    f"{handshake_timeout_s}s"
                 )
             self._lwd_cloud_params_received.clear()
         for dp_idx, params in self._lwd_cloud_params.items():

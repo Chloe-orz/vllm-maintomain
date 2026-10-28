@@ -585,7 +585,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # (runs on the edge engine main thread; the scheduling loop stalls
         # meanwhile; used for MM degradation attribution)
 
-    def lwd_edge_notify_range(self, dp_idx: int, scheduler_output: SchedulerOutput) -> None:
+    def lwd_edge_notify_range(
+        self, dp_idx: int, scheduler_output: SchedulerOutput
+    ) -> None:
         """Send one batch RangeNotify of dp_idx and attach the EMBED batch;
         a seqno of that engine is only taken by a notify that was sent."""
         built = self._lwd_build_range_items(scheduler_output.num_scheduled_tokens)

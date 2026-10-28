@@ -1338,8 +1338,10 @@ class EngineCoreProc(EngineCore):
                     engine_core = LwdEdgeEngineCore(
                         *args, engine_index=dp_rank, lwd_dp_size=lwd_dp_size, **kwargs
                     )
-                elif lwd.role == "cloud" and vllm_config.model_config.is_moe and (
-                    lwd_dp_size > 1
+                elif (
+                    lwd.role == "cloud"
+                    and vllm_config.model_config.is_moe
+                    and (lwd_dp_size > 1)
                 ):
                     from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (  # noqa: E501
                         LwdCloudDPEngineCore,

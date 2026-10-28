@@ -116,10 +116,14 @@ def test_single_instance_multi_dp_serves_every_cloud_dp_from_one_edge() -> None:
 def test_edge_instances_sharing_ranks_are_rejected() -> None:
     topology = _topology(
         "edge_share",
-        [_instance(0, [[0]], cloud=False, addr="10.0.0.1"),
-         _instance(1, [[0]], cloud=False, addr="10.0.0.1")],
-        [_instance(0, [[1]], cloud=True, addr="10.1.0.1"),
-         _instance(1, [[2]], cloud=True, addr="10.1.0.2")],
+        [
+            _instance(0, [[0]], cloud=False, addr="10.0.0.1"),
+            _instance(1, [[0]], cloud=False, addr="10.0.0.1"),
+        ],
+        [
+            _instance(0, [[1]], cloud=True, addr="10.1.0.1"),
+            _instance(1, [[2]], cloud=True, addr="10.1.0.2"),
+        ],
         [(0, 0), (1, 1)],
     )
 

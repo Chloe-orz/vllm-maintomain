@@ -116,9 +116,7 @@ class LwdCloudDpAccount:
 
     # ------------------------------------------------------------------ gate
 
-    def is_gated(
-        self, max_num_running_reqs: int, has_resume_inflight: bool
-    ) -> bool:
+    def is_gated(self, max_num_running_reqs: int, has_resume_inflight: bool) -> bool:
         """Whether new prefill admission to this engine must wait.
 
         A resume in flight is exempt (finish in-flight chunks before new

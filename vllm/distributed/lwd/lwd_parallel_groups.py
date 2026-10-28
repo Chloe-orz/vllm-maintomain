@@ -115,7 +115,9 @@ class LwdParallelGroupsSpec:
                 for endpoints in channel_endpoints
                 for rank in (endpoints.edge_rank, endpoints.cloud_rank)
             )
-            overloaded = sorted(rank for rank, uses in endpoint_uses.items() if uses > 1)
+            overloaded = sorted(
+                rank for rank, uses in endpoint_uses.items() if uses > 1
+            )
             if overloaded:
                 # TODO(lwd): key the data-plane channels by DP connection.
                 raise NotImplementedError(

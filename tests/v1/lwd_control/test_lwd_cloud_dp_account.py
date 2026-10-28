@@ -60,7 +60,9 @@ def test_settling_a_prefill_request_covers_abort_before_first_token() -> None:
 def test_pending_batches_drop_on_first_token_and_finish() -> None:
     account = LwdCloudDpAccount(0)
     for seqno in range(3):
-        account.register_batch(account.take_seqno(), {"r1", "r2"} if seqno < 2 else {"r3"})
+        account.register_batch(
+            account.take_seqno(), {"r1", "r2"} if seqno < 2 else {"r3"}
+        )
     assert account.pending_chunks() == 3
     assert account.seqno == 3
 
