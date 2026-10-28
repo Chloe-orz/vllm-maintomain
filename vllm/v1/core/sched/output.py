@@ -15,6 +15,9 @@ if TYPE_CHECKING:
     import numpy.typing as npt
     import torch
 
+    from vllm.distributed.aux_output_connector.connector import (
+        AuxOutputConnectorMetadata,
+    )
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
     from vllm.lora.request import LoRARequest
@@ -24,6 +27,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
     from vllm.v1.request import Request
 else:
+    AuxOutputConnectorMetadata = object
     ECConnectorMetadata = object
     KVConnectorMetadata = object
     KVCacheBlockCopy = object
@@ -71,11 +75,17 @@ class LwdUnembedBatch:
     """LWD prefill_only mode edge token-recovery batch (spec-decode aware)."""
 
     req_ids: list[str] = field(default_factory=list)
-    num_accept_tokens: list[int] = field(default_factory=list)  # per request: accepted count (<= K)
-    recv_num_elements: int = 0  # total DOWN hidden elements for the whole batch = rows_total * hidden_size
-    out_token_idxs: list[list[int]] = field(default_factory=list)  # per request: generation ordinal of each token (order-preserving emit)
-    top_id_ths: list[list[int]] = field(default_factory=list)  # per request: received Nth most probable token index (position in descending logits)
-    token_ids: list[list[int]] = field(default_factory=list)  # diagnostic bypass: per-request accepted token ids from cloud (skip-sample mode)
+    # per request: accepted count (<= K)
+    num_accept_tokens: list[int] = field(default_factory=list)
+    # total DOWN hidden elements for the whole batch = rows_total * hidden_size
+    recv_num_elements: int = 0
+    # per request: generation ordinal of each token (order-preserving emit)
+    out_token_idxs: list[list[int]] = field(default_factory=list)
+    # per request: received Nth most probable token index
+    # (position in descending logits)
+    top_id_ths: list[list[int]] = field(default_factory=list)
+    # diagnostic bypass: per-request accepted token ids from cloud (skip-sample mode)
+    token_ids: list[list[int]] = field(default_factory=list)
 
 
 @dataclass
@@ -102,6 +112,8 @@ class NewRequestData:
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
+    # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
+    replay_start: int = 0
 
     @classmethod
     def from_request(
@@ -127,6 +139,7 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
+            replay_start=request.replay_start,
         )
 
     @property
@@ -300,9 +313,6 @@ class SchedulerOutput:
     # E.g., if a request has [0, 1], it could mean the vision encoder needs
     # to process that the request's 0-th and 1-th images in the current step.
     scheduled_encoder_inputs: dict[str, list[int]]
-    # Number of common prefix blocks for all requests in each KV cache group.
-    # This can be used for cascade attention.
-    num_common_prefix_blocks: list[int]
 
     # Request IDs that are finished in between the previous and the current
     # steps. This is used to notify the workers about the finished requests
@@ -336,6 +346,9 @@ class SchedulerOutput:
     # synchronously during this step (load_async=False).
     has_sync_kv_loads: bool = False
 
+    # Execution-auxiliary output control metadata consumed by the worker connector.
+    aux_output_connector_metadata: AuxOutputConnectorMetadata | None = None
+
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
     # EC Cache Manager metadata
@@ -348,15 +361,16 @@ class SchedulerOutput:
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
 
-    # Complete block-table rows that replace incrementally appended block IDs.
-    block_table_updates: dict[str, tuple[list[int], ...]] | None = None
-
     # Scheduler-local; always None by the time this reaches a worker.
     kv_connector_block_state: KVConnectorBlockState | None = None
 
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
+
+    # Deprecated: cascade attention has been removed, so this is always empty.
+    # Kept for out-of-tree schedulers and workers.
+    num_common_prefix_blocks: list[int] = field(default_factory=list)
 
     # LWD batch metadata dispatch to the worker.
     lwd_batch: LwdBatch | None = None
@@ -370,7 +384,6 @@ class SchedulerOutput:
             total_num_scheduled_tokens=0,
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             lwd_batch=None,
@@ -383,3 +396,8 @@ class GrammarOutput:
     structured_output_request_ids: list[str]
     # Bitmask ordered as structured_output_request_ids.
     grammar_bitmask: "npt.NDArray[np.int32]"
+    # Per request, ordered as structured_output_request_ids: how many leading
+    # drafts the bitmask constrained. `grammar_bitmask` fills every row after
+    # the first -1 placeholder with the all-permissive `_full_mask`, so drafts
+    # from this index on must not be accepted. None invalidates every draft.
+    num_acceptable_drafts: list[int] | None = None
