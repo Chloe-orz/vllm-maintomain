@@ -4,7 +4,7 @@ import dataclasses
 import glob
 import os
 import time
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from typing import cast
 
 import torch
@@ -213,7 +213,7 @@ class DefaultModelLoader(BaseModelLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self, source: "Source"
+        self, source: "Source", skip_name: Callable[[str], bool] | None = None
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
@@ -260,6 +260,7 @@ class DefaultModelLoader(BaseModelLoader):
                         self.load_config.use_tqdm_on_load,
                         self.load_config.safetensors_load_strategy,
                         local_expert_ids=self.local_expert_ids,
+                        skip_name=skip_name,
                         safetensors_prefetch_num_threads=(
                             self.load_config.safetensors_prefetch_num_threads
                         ),
@@ -301,8 +302,20 @@ class DefaultModelLoader(BaseModelLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
+        # LWD: hand the placeholder filter to the safetensors iterator so the
+        # skipped tensors are never read from disk. The outer filter below stays
+        # as the fallback for the load formats that iterator does not cover.
+        skip_keys = parse_skip_keys(self._placeholder_module_names(model))
+        skip_name = (
+            (lambda name: name_is_skipped(name, skip_keys)) if skip_keys else None
+        )
+        if skip_name is not None:
+            logger.info_once(
+                "LWD weight filter: %d placeholder module(s) skipped before reading",
+                len(skip_keys),
+            )
         yield from self._skip_unbuilt_weights(
-            model, self._get_weights_iterator(primary_weights)
+            model, self._get_weights_iterator(primary_weights, skip_name)
         )
 
         secondary_weights = cast(
@@ -311,7 +324,7 @@ class DefaultModelLoader(BaseModelLoader):
         )
         for source in secondary_weights:
             yield from self._skip_unbuilt_weights(
-                model, self._get_weights_iterator(source)
+                model, self._get_weights_iterator(source, skip_name)
             )
 
     def _skip_unbuilt_weights(
@@ -324,9 +337,11 @@ class DefaultModelLoader(BaseModelLoader):
         A trimmed LWD role (edge or cloud) holds ``PPMissingLayer`` /
         ``StageMissingLayer`` placeholders for the modules it never runs.
         Their tensors are neither materialized nor used, so they are dropped
-        here -- ahead of ``safetensors``' ``get_tensor`` -- instead of being
-        read from disk only to be discarded downstream.  The filter is a no-op
-        outside LWD and when the model has no placeholders.
+        here instead of being passed downstream. The safetensors path already
+        skips them **before** ``get_tensor`` (see ``skip_name`` in
+        ``safetensors_weights_iterator``); this wrapper is the fallback for the
+        load formats that path does not cover, and is a no-op outside LWD and
+        when the model has no placeholders.
         """
         skip_keys = parse_skip_keys(self._placeholder_module_names(model))
         if not skip_keys:
