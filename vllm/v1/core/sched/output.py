@@ -68,6 +68,9 @@ class LwdEmbedBatch:
     prompt_offsets: list[int] = field(default_factory=list)
     has_mrope: list[bool] = field(default_factory=list)
     mrope_positions: list[bytes] = field(default_factory=list)
+    dp_idx: int = 0
+    """Cloud DP rank this batch travels to; the edge worker picks the UP
+    channel of this DP connection. 0 keeps single-cloud behaviour."""
 
 
 @dataclass
@@ -86,6 +89,9 @@ class LwdUnembedBatch:
     top_id_ths: list[list[int]] = field(default_factory=list)
     # diagnostic bypass: per-request accepted token ids from cloud (skip-sample mode)
     token_ids: list[list[int]] = field(default_factory=list)
+    dp_idx: int = 0
+    """Cloud DP rank this batch arrived from; the edge worker picks the
+    DOWN channel of this DP connection. 0 keeps single-cloud behaviour."""
 
 
 @dataclass
