@@ -27,6 +27,8 @@ c = min(剩余, chunk 单元 C) 切块,批 = 续传 chunk 优先 + waiting FCFS
 from __future__ import annotations
 
 import copy
+import dataclasses
+import json
 import os
 import time
 from typing import TYPE_CHECKING
@@ -229,6 +231,21 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def _lwd_any_busy(self) -> bool:
         return bool(self.running or self.waiting or self.skipped_waiting)
 
+    @staticmethod
+    def _lwd_grammar_ready(request: Request) -> bool:
+        """结构化请求 grammar 编译是否就绪(普通请求恒 True)。
+
+        grammar 在引擎 IO 线程异步编译(线程池);原生 waiting 循环对
+        WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR 是 defer 语义(未就绪
+        本步不排)。picker 的选中集必须被原生调度逐请求复现(步后
+        chunk 核验),不过滤编译中的请求即核验失守炸引擎。只读不迁
+        状态:grammar property 解析 future,状态提升仍由原生循环
+        (_try_promote_blocked_waiting_request)完成。"""
+        if request.status != RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+            return True
+        structured_req = request.structured_output_request
+        return bool(structured_req and structured_req.grammar)
+
     def _lwd_pick_prefill_batch(
         self, engine: int = 0
     ) -> tuple[list[str], dict[str, int], int]:
@@ -331,6 +348,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             c
             for c in list(self.skipped_waiting) + list(self.waiting)
             if self._lwd_route.get(c.request_id, 0) == engine
+            and self._lwd_grammar_ready(c)
         ]
         for request in candidates:
             if single_prefill and picked:
@@ -893,7 +911,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
         sampling_params 只透传影响云侧 token 选择的字段(采样核/惩罚/
         EOS 策略/min_tokens);stop 字符串等 detokenizer 层参数留在
-        边侧前端原生处理,不上 wire。
+        边侧前端原生处理,不上 wire。结构化输出约束(wire_version 5
+        起)例外上 wire:云侧采样前要施加 bitmask,约束丢即错算。
 
         失败语义 fail-fast:发布队满时短退避重试(瞬态背压几乎必在
         秒级窗口内腾出),耗尽即抛 RuntimeError——异常沿 add_request
@@ -911,6 +930,15 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # HELLO 未收齐的构造窗口(legacy 单云路径同款静默)
             return
         sp = sampling_params
+        # 结构化输出约束(wire_version 5):边侧 Processor 已校验的
+        # StructuredOutputsParams 原样序列化(json 字段可为 dict,
+        # asdict 后 json.dumps 兜住);_backend 一并上 wire,云侧重建
+        # 后 mixed-backend 校验与 grammar_init 都要读它。
+        structured_outputs_payload = (
+            json.dumps(dataclasses.asdict(sp.structured_outputs))
+            if sp is not None and sp.structured_outputs is not None
+            else ""
+        )
         # 全量 mrope positions(wire_version 3):准入时已按全 prompt 算好,
         # 随元数据一次下发;云侧调度改为 arrival 驱动后不再按 chunk 携带。
         mrope_bytes = b""
@@ -943,6 +971,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             ),
             min_tokens=sp.min_tokens if sp is not None else 0,
             eos_token_id=sp.eos_token_id if sp is not None else None,
+            structured_outputs=structured_outputs_payload,
         )
         for attempt in range(_LWD_ADD_RETRY_STEPS):
             if publisher.publish(message):
@@ -1083,8 +1112,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         add_request 调用链回到客户端 error 路径。
 
         边界 = 边侧能力面:边是 embedding 属主(拒绝客户端自带
-        prompt_embeds),只处理纯文本补全(拒 pooling/结构化
-        输出),prompt 非空;不上 wire 的采样参数(logit_bias/
+        prompt_embeds),只处理纯文本补全(拒 pooling),prompt 非空;
+        结构化输出约束随预告上 wire 由云侧施加(bitmask 在云侧采样
+        前);不上 wire 的采样参数(logit_bias/
         allowed_token_ids/logprobs)缺省即拒,不静默丢约束。
 
         多模态白名单:仅 image;video/audio 等其余模态与 EVS
@@ -1122,11 +1152,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if request.pooling_params is not None:
             raise ValueError(
                 "[LWD] prefill-only mode does not support pooling requests "
-                f"(request {request.request_id})"
-            )
-        if request.use_structured_output:
-            raise ValueError(
-                "[LWD] prefill-only mode does not support structured output "
                 f"(request {request.request_id})"
             )
         sp = request.sampling_params

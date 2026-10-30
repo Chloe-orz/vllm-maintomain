@@ -53,9 +53,10 @@ VL 包装(model.language_model.*)、model.* 布局(Qwen3.5/GLM-5.x 等)、以及
 
 非权重条目按角色拷贝(--metadata auto,默认;规则支持 * 通配)。目录默认不拷,只有
 规则里显式点名(例如 "optional")或 --metadata all 才整目录拷贝。边侧对外服务,
-tokenizer/processor/chat_template 等文件全拷;云侧配套 vllm 的 LWD 改动(强制
-skip_tokenizer_init + mm_encoder_remote),只拷 config.json、configuration.json、
-量化描述(*quant*description*.json)与 chat_template.jinja;QuaRot 旋转矩阵
+tokenizer/processor/chat_template 等文件全拷;云侧因结构化输出(grammar 编译在云
+侧,需 tokenizer/词表)拷 tokenizer 文件,但 mm_encoder_remote 仍强制(多模态
+processor 不建),故只拷 config.json、configuration.json、量化描述
+(*quant*description*.json)、chat_template.jinja 与 tokenizer 条目;QuaRot 旋转矩阵
 (rot.safetensors / optional)两侧都拷。
 
 输出:按 --max-shard-gb 切成若干 model-XXXXX-of-YYYYY.safetensors;多于一个分片、
@@ -179,6 +180,17 @@ METADATA_RULES: dict[str, tuple[str, ...]] = {
         # 仅为兼容启动脚本里 "--chat-template <模型目录>/chat_template.jinja" 的写法;
         # 云侧不渲染模板(请求都在边侧),启动命令里没传 --chat-template 时可以去掉。
         "chat_template.jinja",
+        # tokenizer/词表:云侧结构化输出的 grammar 编译要加载 tokenizer
+        # (StructuredOutputManager -> XgrammarBackend)。mm_encoder_remote
+        # 仍强制,多模态 processor 不建,processor 相关文件不拷。
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "vocab.json",
+        "merges.txt",
+        "vocab.*",
+        "tokenizer.model",
         # QuaRot 旋转矩阵(EAGLE3 drafter 用;drafter 在云侧)。
         "rot.safetensors",
         "optional",

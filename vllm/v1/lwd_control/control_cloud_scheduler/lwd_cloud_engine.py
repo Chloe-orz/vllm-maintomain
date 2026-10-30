@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -11,7 +12,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.logger import init_logger
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.engine import EngineCoreRequestType, FinishReason
 from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc
@@ -64,6 +65,21 @@ LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
 
 # 步元数据队满重试小睡:元数据不可丢(边侧据此预挂精确尺寸 recv)
 _LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
+
+
+def _lwd_decode_structured_outputs(payload: str) -> StructuredOutputsParams | None:
+    """自 LwdRequestNotify.structured_outputs 重建约束(wire_version 5)。
+
+    边侧 Processor 已校验,云侧只反序列化:私有字段(_backend*,
+    init=False)不进构造,单独回填;空串 = 普通请求。"""
+    if not payload:
+        return None
+    data = json.loads(payload)
+    backend = data.pop("_backend", None)
+    data.pop("_backend_was_auto", None)
+    params = StructuredOutputsParams(**data)
+    params._backend = backend
+    return params
 
 
 class LwdCloudEngineCoreMixin:
@@ -474,6 +490,12 @@ class LwdCloudEngineCoreMixin:
         wire = self._lwd_gate_pending.pop(request_id, None)
         if wire is not None:
             request = self._lwd_build_request(wire)
+            if request.use_structured_output:
+                # promote 路径绕过 IO 线程的 preprocess_add_request
+                #(那是唯一自动触发 grammar_init 的入口,core.py:1592-
+                # 1595),云侧采样要 bitmask,必须显式编译;grammar 异步
+                # 就绪后调度器原生门自动放行。
+                self.structured_output_manager.grammar_init(request)
             self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
             logger.info("[Lwd] cloud request %s admitted via gate", request_id)
 
@@ -481,7 +503,9 @@ class LwdCloudEngineCoreMixin:
         """请求构建(唯一建请求点,Request/SamplingParams 留 L3)。
 
         采样参数自边侧 LwdRequestNotify 透传(采样核/惩罚/EOS 策略/
-        min_tokens),云侧按客户端真实参数采样,不再落默认值。"""
+        min_tokens),云侧按客户端真实参数采样,不再落默认值。
+        structured_outputs(wire_version 5 起)同样透传:云侧采样前
+        施加 bitmask,Request 构造即派生 structured_output_request。"""
         sampling_params = SamplingParams(
             max_tokens=wire.max_tokens,
             skip_reading_prefix_cache=wire.skip_reading_prefix_cache,
@@ -496,6 +520,9 @@ class LwdCloudEngineCoreMixin:
             ignore_eos=wire.ignore_eos,
             stop_token_ids=list(wire.stop_token_ids),
             min_tokens=wire.min_tokens,
+            structured_outputs=_lwd_decode_structured_outputs(
+                wire.structured_outputs
+            ),
         )
         # eos_token_id 非构造入参,走原生回填入口(同边侧前端
         # input_processor):设 _eos_token_id 并计入 _all_stop_token_ids

@@ -20,9 +20,11 @@ if TYPE_CHECKING:
 # engine_index;RangeNotify 不再驱动调度(只驱动数据面提前收),mrope
 # positions 随 LwdRequestNotify 全量一次下发;4 = prefix caching 协商
 # (HELLO 前缀能力位 + RequestNotify.prefix_nonce + READY/Refill 下行 +
-# RangeItem.is_refill)。两侧必须同版本部署:msgspec 容忍未知字段,
-# 版本错配时旧端不会报错,只会 mrope/prefix 协商静默缺失。
-LWD_WIRE_VERSION = 4
+# RangeItem.is_refill);5 = RequestNotify 携带 structured_outputs(结构化
+# 输出约束,云侧采样前施加 grammar bitmask)。两侧必须同版本部署:
+# msgspec 容忍未知字段,版本错配时旧端不会报错,只会 mrope/prefix/
+# structured_outputs 静默缺失。
+LWD_WIRE_VERSION = 5
 
 
 class LwdRangeItem(msgspec.Struct, gc=False):
@@ -104,6 +106,11 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):
     int64 CPU 张量的连续字节流,边侧准入时一次算好、随请求预告一次
     下发 —— 云侧调度按 arrival 驱动后不再按 chunk 携带。空 = 纯文本
     请求(零路径变化)。"""
+
+    structured_outputs: str = ""
+    """结构化输出约束(wire_version 5 起):边侧 Processor 已校验的
+    StructuredOutputsParams(含 _backend)JSON 序列化,云侧重建后
+    grammar_init 编译并在采样前施加 bitmask。空 = 普通请求。"""
 
 
 class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):
