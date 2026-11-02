@@ -24,7 +24,11 @@ LWD_MAX_PENDING_CHUNKS = 10
 class LwdCloudDpAccount:
     """The edge-side bookkeeping of one cloud DP rank."""
 
-    def __init__(self, dp_idx: int) -> None:
+    def __init__(
+        self,
+        dp_idx: int,
+        max_pending_chunks: int = LWD_MAX_PENDING_CHUNKS,
+    ) -> None:
         self.dp_idx = dp_idx
         self.seqno = 0
         """Next UP pairing number of this engine; taken only by a range
