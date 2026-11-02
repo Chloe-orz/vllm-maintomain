@@ -14,7 +14,7 @@ from typing import TypeAlias
 
 import msgspec
 
-LWD_MESSAGE_VERSION = 1
+LWD_MESSAGE_VERSION = 3
 
 LWD_NOT_FINISHED = -1
 """`LwdC2eNotify.finish_reasons` value of a request still running."""
@@ -30,8 +30,12 @@ class LwdRangeItem(msgspec.Struct, gc=False):  # type: ignore[call-arg]
     num_tokens: int
     has_mrope: bool = False
     mrope_positions: bytes = b""
-    """Contiguous int64 [3, num_tokens] M-RoPE positions of the chunk; empty
-    when unused. `has_mrope` with empty bytes is a protocol error."""
+    """Legacy per-chunk positions; empty on the current protocol path. Full
+    prompt positions travel in LwdRequestNotify."""
+    is_refill: bool = False
+    """Out-of-band embedding refill after cloud preemption."""
+    prefix_nonce: int = 0
+    """Generation of the request that owns this chunk."""
 
 
 class LwdRangeNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
@@ -58,6 +62,9 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call
     block_hashes: list[bytes] = []
     """Full-block hash chain of the prompt for cloud prefix cache hits; empty
     makes the cloud hash locally."""
+    prefix_nonce: int = 0
+    """Nonzero while the edge waits for a matching LwdPrefixReadyNotify."""
+    skip_reading_prefix_cache: bool = False
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = 0
@@ -72,6 +79,9 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call
     eos_token_id: int | None = None
     """Resolved by the edge tokenizer; the cloud cannot derive it. None leaves
     `max_tokens` as the only stop condition on the cloud."""
+    mrope_positions: bytes = b""
+    """Contiguous int64 [3, num_prompt_tokens] M-RoPE positions of the full
+    prompt; empty when unused."""
 
 
 LWD_SAMPLING_FIELDS: tuple[tuple[str, object], ...] = (
@@ -98,6 +108,8 @@ class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-a
     """Edge -> cloud. Aborts a request."""
 
     request_id: str
+    prefix_nonce: int = 0
+    """Generation to abort; zero is the legacy form."""
 
 
 class LwdCloudParamsNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
@@ -115,6 +127,30 @@ class LwdCloudParamsNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[
     """Frontend stats endpoint of this DP rank's coordinator, for the edge to
     trigger the first DP wave; empty when the cloud runs no coordinator
     (single DP or non-MoE engines)."""
+    prefix_caching: bool = False
+    hash_block_size: int = 0
+    prefix_alignment_tokens: int = 0
+    prefix_alignment_required: bool = False
+    prefix_use_eagle: bool = False
+
+
+class LwdPrefixReadyNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
+    """Cloud -> edge. Result of one nonce-scoped prefix reservation."""
+
+    request_id: str
+    hit_tokens: int
+    nonce: int
+    error: str = ""
+
+
+class LwdRefillNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
+    """Cloud -> edge. Re-embed an absolute prompt range after preemption."""
+
+    request_id: str
+    start_row: int
+    end_row: int
+    prefix_nonce: int = 0
+    """Request generation that requested this refill; zero is the legacy form."""
 
 
 class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
@@ -137,10 +173,14 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg
     token_ids: list[list[int]] = []
     """Diagnostics only: accepted token ids per request; empty unless the
     edge skips sampling."""
+    prefix_nonces: list[int] = []
+    """Generation of each request row, aligned with req_ids."""
 
 
 LwdEdgeToCloudMessage: TypeAlias = LwdRequestNotify | LwdRangeNotify | LwdAbortNotify
-LwdCloudToEdgeMessage: TypeAlias = LwdCloudParamsNotify | LwdC2eNotify
+LwdCloudToEdgeMessage: TypeAlias = (
+    LwdCloudParamsNotify | LwdC2eNotify | LwdPrefixReadyNotify | LwdRefillNotify
+)
 LwdMessage: TypeAlias = LwdEdgeToCloudMessage | LwdCloudToEdgeMessage
 
 _LWD_EDGE_TO_CLOUD_DECODER = msgspec.msgpack.Decoder(LwdEdgeToCloudMessage)
@@ -157,6 +197,7 @@ def lwd_decode_edge_to_cloud(data: bytes | memoryview) -> LwdEdgeToCloudMessage:
     Raises:
         msgspec.DecodeError: Not valid msgpack.
         msgspec.ValidationError: Not an edge -> cloud message.
+
     """
     return _LWD_EDGE_TO_CLOUD_DECODER.decode(data)
 
@@ -167,5 +208,6 @@ def lwd_decode_cloud_to_edge(data: bytes | memoryview) -> LwdCloudToEdgeMessage:
     Raises:
         msgspec.DecodeError: Not valid msgpack.
         msgspec.ValidationError: Not a cloud -> edge message.
+
     """
     return _LWD_CLOUD_TO_EDGE_DECODER.decode(data)
