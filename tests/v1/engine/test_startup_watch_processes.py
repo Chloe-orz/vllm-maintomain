@@ -240,6 +240,7 @@ def test_freeze_gc_after_clean_rocm_engine_core_shutdown(
     calls: list[str] = []
     vllm_config = SimpleNamespace(
         shutdown_timeout=shutdown_timeout,
+        lwd_config=None,
         # run_engine_core starts the watchdog from this field. The default
         # config has no dump_dir, so start_watch_dog returns immediately.
         watchdog_config=WatchdogConfig(),

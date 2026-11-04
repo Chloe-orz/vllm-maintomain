@@ -275,6 +275,10 @@ def _configure_vllm_root_logger(config: "LoggingConfig | None" = None) -> None:
 
     if logging_config:
         dictConfig(logging_config)
+        # dictConfig resets child loggers; restore LWD only if already loaded.
+        lwd_logger_module = sys.modules.get("vllm.lwd_logger")
+        if lwd_logger_module is not None:
+            lwd_logger_module.reconfigure_lwd_loggers()
 
     # Transformers uses httpx to access the Hugging Face Hub. httpx is quite verbose,
     # so we set its logging level to WARNING when vLLM's logging level is INFO.

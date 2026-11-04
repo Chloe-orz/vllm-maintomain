@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     VLLM_USAGE_SOURCE: str = "production"
     VLLM_CONFIGURE_LOGGING: bool = True
     VLLM_LOGGING_LEVEL: str = "INFO"
+    VLLM_LWD_LOG_LEVEL: str = "DISABLE"
     VLLM_LOGGING_PREFIX: str = ""
     VLLM_LOGGING_STREAM: str = "ext://sys.stdout"
     VLLM_LOGGING_CONFIG_PATH: str | None = None
@@ -885,6 +886,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_LOGGING_CONFIG_PATH": lambda: os.getenv("VLLM_LOGGING_CONFIG_PATH"),
     # this is used for configuring the default logging level
     "VLLM_LOGGING_LEVEL": lambda: os.getenv("VLLM_LOGGING_LEVEL", "INFO").upper(),
+    # Valid values: disable, debug, info, warning, error, critical.
+    # Default: disable.
+    "VLLM_LWD_LOG_LEVEL": lambda: os.getenv("VLLM_LWD_LOG_LEVEL", "DISABLE").upper(),
     # this is used for configuring the default logging stream
     "VLLM_LOGGING_STREAM": lambda: os.getenv("VLLM_LOGGING_STREAM", "ext://sys.stdout"),
     # if set, VLLM_LOGGING_PREFIX will be prepended to all log messages
@@ -2466,6 +2470,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_NO_USAGE_STATS",
         "VLLM_DO_NOT_TRACK",
         "VLLM_LOGGING_LEVEL",
+        "VLLM_LWD_LOG_LEVEL",
         "VLLM_LOGGING_PREFIX",
         "VLLM_LOGGING_STREAM",
         "VLLM_LOGGING_CONFIG_PATH",

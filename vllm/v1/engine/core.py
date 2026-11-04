@@ -1591,8 +1591,52 @@ class EngineCoreProc(EngineCore):
             signal.signal(signal.SIGINT, signal_handler)
 
             parallel_config.data_parallel_index = dp_rank
-            if data_parallel and vllm_config.model_config.is_moe:
-                # Set data parallel rank for this engine process.
+            lwd = vllm_config.lwd_config
+            if lwd is not None:
+                # LWD cloud engines are one per DP rank regardless of MoE:
+                # a MoE cloud keeps the native DP semantics (wave state
+                # machine, dummy batches, DP collectives) on the DP engine
+                # base; non-MoE engines stay independent. The edge runs one
+                # process for all its DP connections.
+                lwd_dp_size = parallel_config.data_parallel_size
+                if lwd.role == "edge":
+                    if lwd_dp_size > 1:
+                        raise ValueError(
+                            "[LWD] one edge process serves every DP "
+                            "connection; start the edge with data parallel "
+                            f"size 1, got {lwd_dp_size}"
+                        )
+                    from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (  # noqa: E501
+                        LwdEdgeEngineCore,
+                    )
+
+                    engine_core = LwdEdgeEngineCore(
+                        *args, engine_index=dp_rank, lwd_dp_size=lwd_dp_size, **kwargs
+                    )
+                elif (
+                    lwd.role == "cloud"
+                    and vllm_config.model_config.is_moe
+                    and (lwd_dp_size > 1)
+                ):
+                    from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (  # noqa: E501
+                        LwdCloudDPEngineCore,
+                    )
+
+                    parallel_config.data_parallel_rank = dp_rank
+                    engine_core = LwdCloudDPEngineCore(
+                        *args, lwd_dp_size=lwd_dp_size, **kwargs
+                    )
+                else:
+                    from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (  # noqa: E501
+                        LwdCloudEngineCore,
+                    )
+
+                    parallel_config.reconfigure_for_independent_dp_rank()
+                    engine_core = LwdCloudEngineCore(
+                        *args, engine_index=dp_rank, lwd_dp_size=lwd_dp_size, **kwargs
+                    )
+            elif data_parallel and vllm_config.model_config.is_moe:
+                # Native MoE DP: set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
                 engine_core = DPEngineCoreProc(*args, **kwargs)
             else:

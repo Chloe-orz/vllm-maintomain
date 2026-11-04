@@ -1675,6 +1675,40 @@ def test_long_prefill_threshold_floored_by_fair_share():
     assert output.num_scheduled_tokens[short_req.request_id] == 10
 
 
+@pytest.mark.parametrize("num_requests", [1, 2])
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_lwd_window_cap_bounds_single_and_adaptive_prefill(
+    num_requests: int, adaptive: bool
+) -> None:
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        long_prefill_token_threshold=100,
+        long_prefill_token_threshold_adaptive=adaptive,
+    )
+    requests = create_requests(num_requests=num_requests, num_tokens=2000)
+    chunk_cap = 64
+    for request in requests:
+        request.lwd_window_cap = chunk_cap
+        scheduler.add_request(request)
+
+    expected = {request.request_id: chunk_cap for request in requests}
+    for _ in range(2):
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens == expected
+        req_ids = list(output.num_scheduled_tokens)
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index={req_id: index for index, req_id in enumerate(req_ids)},
+                sampled_token_ids=[[] for _ in req_ids],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+
 def test_update_from_output_routes_sampling_masks_by_request():
     """Each request receives the sampler row at its own batch index."""
     scheduler = create_scheduler()

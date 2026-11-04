@@ -36,6 +36,8 @@ import queue
 import signal as signal_module
 from typing import Any
 
+import pytest
+
 from vllm.config import WatchdogConfig
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine import core as core_module
@@ -112,6 +114,7 @@ class _StubVllmConfig:
         self.parallel_config = _StubParallelConfig()
         self.model_config = _StubModelConfig()
         self.logging_config = None
+        self.lwd_config = None
         self.kv_transfer_config = None
         self.shutdown_timeout = 0
         # run_engine_core starts the watchdog from this field. The default
@@ -124,6 +127,7 @@ def _run_engine_core(
     *,
     signal_during_construction=False,
     signal_while_idle=False,
+    dp_rank: int = 0,
 ):
     _FakeSignalCallback.instances.clear()
     fake_signal = _FakeSignal()
@@ -131,6 +135,7 @@ def _run_engine_core(
 
     class StubEngineCoreProc:
         def __init__(self, *args, **kwargs):
+            trace["engine_index"] = kwargs.get("engine_index", 0)
             self.shutdown_state = EngineShutdownState.RUNNING
             # Same queue type as EngineCore, so the wakeup path under test is
             # the real one.
@@ -174,7 +179,7 @@ def _run_engine_core(
     monkeypatch.setattr(core_module, "maybe_init_worker_tracer", lambda *a, **k: None)
     monkeypatch.setattr(core_module, "decorate_logs", lambda *a, **k: None)
 
-    EngineCoreProc.run_engine_core(vllm_config=_StubVllmConfig())
+    EngineCoreProc.run_engine_core(vllm_config=_StubVllmConfig(), dp_rank=dp_rank)
     return trace
 
 
@@ -221,8 +226,10 @@ def test_signal_while_idle_still_wakes_the_loop(monkeypatch):
     assert trace["wakeup"] == WAKEUP_ITEM
 
 
-def test_no_signal_leaves_the_loop_running(monkeypatch):
-    trace = _run_engine_core(monkeypatch)
+@pytest.mark.parametrize("dp_rank", [0, 1])
+def test_no_signal_leaves_the_loop_running(monkeypatch, dp_rank: int):
+    trace = _run_engine_core(monkeypatch, dp_rank=dp_rank)
 
+    assert trace["engine_index"] == dp_rank
     assert trace["state_at_loop_entry"] == EngineShutdownState.RUNNING
     assert trace["wakeup"] is None

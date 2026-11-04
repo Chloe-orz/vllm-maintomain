@@ -78,6 +78,7 @@ class DPCoordinator:
         parallel_config: ParallelConfig,
         enable_wave_coordination: bool = True,
         logging_config: LoggingConfig | None = None,
+        lwd_cloud_addr: str | None = None,
     ):
         dp_size = parallel_config.data_parallel_size
         assert dp_size > 1, "Coordinator only used for data parallel"
@@ -92,6 +93,13 @@ class DPCoordinator:
         if parallel_config.enable_elastic_ep:
             local_only_eng = False
 
+        # In an LWD deployment the front-end is the edge process on another
+        # host: the stats XPUB must be a routable TCP endpoint even in the
+        # single-node internal-LB shape (which would otherwise pick an IPC
+        # path), or the edge can never trigger the first DP wave.
+        if lwd_cloud_addr is not None and local_only:
+            local_only = False
+            host = lwd_cloud_addr
         front_publish_address = get_engine_client_zmq_addr(local_only, host=host)
         back_publish_address = get_engine_client_zmq_addr(local_only_eng, host=host)
         back_output_address = get_engine_client_zmq_addr(local_only_eng, host=host)

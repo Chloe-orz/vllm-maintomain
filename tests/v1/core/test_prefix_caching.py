@@ -69,6 +69,9 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowSpec,
 )
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
+    LwdPrefixReservations,
+)
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
@@ -3086,6 +3089,51 @@ def test_fixed_token_scores_reuse_only_unscored_prefix(
     if expected_hit:
         assert lookup(scoring, max_cache_hit_length=len(tokens))[1] == expected_hit
         assert lookup(scoring, max_cache_hit_length=block_size - 1)[1] == 0
+
+
+@pytest.mark.parametrize(
+    "start,skip,expected_hit", [(None, False, 48), (20, False, 16), (None, True, 0)]
+)
+def test_lwd_reservation_obeys_request_limit_and_preserves_negotiated_hit(
+    start: int | None, skip: bool, expected_hit: int
+) -> None:
+    block_size = 16
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 8),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    tokens = list(range(64))
+    warm = make_request("warm", tokens, block_size, sha256)
+    assert manager.allocate_slots(warm, len(tokens)) is not None
+    manager.free(warm)
+    request = make_request(
+        "bounded",
+        tokens,
+        block_size,
+        sha256,
+        sampling_params=SamplingParams(
+            prompt_logprobs=1 if start is not None else None,
+            prompt_logprob_start=start,
+            skip_reading_prefix_cache=skip,
+        ),
+    )
+    assert manager.get_computed_blocks(request)[1] == expected_hit
+    reservations = LwdPrefixReservations(manager)
+    assert reservations.snapshot(request)[1] == expected_hit
+    assert reservations.snapshot(request, block_size)[1] == min(expected_hit, block_size)
+    assert reservations.reserve(request) == expected_hit
+    frozen = reservations.snapshot(request)
+    for lookup in (
+        manager.get_computed_blocks,
+        manager.get_computed_blocks_for_connector,
+    ):
+        assert lookup(request)[1:3] == (expected_hit, 0)
+        if expected_hit:
+            with pytest.raises(RuntimeError, match="exceeds cache hit limit"):
+                lookup(request, max_cache_hit_length=expected_hit - 1)
+    assert reservations.snapshot(request) == frozen
 
 
 @pytest.mark.parametrize(

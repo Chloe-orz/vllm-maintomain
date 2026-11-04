@@ -227,6 +227,8 @@ k_ot = "k_ot"
 view_seperator = "view_seperator"
 inverse_std_variences = "inverse_std_variences"
 stride_bse = "stride_bse"
+# LWD wire field: rank ("Nth") of each received token among the logits
+top_id_ths = "top_id_ths"
 
 [tool.typos.default.extend-words]
 certifi = "certifi"
