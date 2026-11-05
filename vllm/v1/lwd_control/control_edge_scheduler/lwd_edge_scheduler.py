@@ -253,6 +253,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if account.is_gated(
                 self.max_num_running_reqs,
                 self._lwd_has_prefill_chunk_inflight(dp_idx),
+                num_running_reqs=len(self.running),
             ):
                 self._lwd_log_gate_transition(account)
                 continue
@@ -498,12 +499,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def _lwd_pick_prefill_batch(
         self, dp_idx: int
     ) -> tuple[list[str], dict[str, int], int]:
-        """Picker adapter layer: candidates routed to dp_idx, cap and
-        free_seq from that engine's account."""
-        account = self._lwd_accounts[dp_idx]
-        inflight = account.load
+        """Pick one DP's batch within its token budget and native edge slots."""
         cap = self.max_num_scheduled_tokens
-        free_seq = self.max_num_running_reqs - inflight
+        # Native edge slots are shared across DP routes. Waiting requests
+        # contribute routing load, but must not reserve slots before admission.
+        free_seq = self.max_num_running_reqs - len(self.running)
         # Resume candidates take only the prefill phase (decode-phase
         # residents have remaining=0, which the picker would skip anyway;
         # after the filter, a non-empty candidate list is itself the resume
