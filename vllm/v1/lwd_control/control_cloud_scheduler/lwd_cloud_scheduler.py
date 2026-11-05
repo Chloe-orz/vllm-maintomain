@@ -116,8 +116,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
             for request in self._lwd_reqs_in_phase(
                 LwdReqPhase.DECODE,
                 self.running,
+                self.kv_holding_waiting,
                 self.waiting,
-                self.skipped_waiting,
             )
         ]
 
@@ -235,7 +235,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         reservations = getattr(self, "lwd_prefix_reservations", None)
         prefix_enabled = getattr(self, "_lwd_prefix_enabled", False)
         for request in itertools.chain(
-            self.running, self.waiting, self.skipped_waiting
+            self.running, self.kv_holding_waiting, self.waiting
         ):
             if room <= 0:
                 break

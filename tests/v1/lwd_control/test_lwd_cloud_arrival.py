@@ -63,7 +63,8 @@ def _visible_set_scheduler(running, waiting) -> LwdBaseScheduler:
     scheduler = LwdBaseScheduler.__new__(LwdBaseScheduler)
     scheduler.running = running
     scheduler.waiting = FCFSRequestQueue(waiting)
-    scheduler.skipped_waiting = FCFSRequestQueue()
+    scheduler.kv_holding_waiting = FCFSRequestQueue()
+    scheduler.deferred_waiting = set()
     scheduler.requests = {r.request_id: r for r in running + waiting}
     scheduler.policy = SchedulingPolicy.FCFS
     scheduler.max_num_running_reqs = len(running)
@@ -76,7 +77,8 @@ def _scheduler(request) -> LwdCloudScheduler:
     scheduler = LwdCloudScheduler.__new__(LwdCloudScheduler)
     scheduler.running = [request]
     scheduler.waiting = []
-    scheduler.skipped_waiting = []
+    scheduler.kv_holding_waiting = []
+    scheduler.deferred_waiting = set()
     scheduler.requests = {request.request_id: request}
     scheduler.lwd_recv_rows = {}
     scheduler._lwd_dropped = set()
