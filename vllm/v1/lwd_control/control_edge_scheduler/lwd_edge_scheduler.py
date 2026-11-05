@@ -529,12 +529,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             cap=cap,
             free_seq=free_seq,
             chunk_unit=self._lwd_chunk_unit,
-            single_prefill_min_tokens=(
-                8000
-                if self.vllm_config.model_config.hf_text_config.model_type
-                == "deepseek_v4"
-                else 0
-            ),
         )
         return req_ids, expected, cap
 
