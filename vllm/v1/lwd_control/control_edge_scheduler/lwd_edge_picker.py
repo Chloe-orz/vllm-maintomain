@@ -34,7 +34,6 @@ def lwd_pick_prefill_batch(
     cap: int,
     free_seq: int,
     chunk_unit: int,
-    single_prefill_min_tokens: int = 0,
 ) -> tuple[list[str], dict[str, int]]:
     """Pick the next embed batch, returning (req_ids, expected).
 
@@ -46,20 +45,12 @@ def lwd_pick_prefill_batch(
     new requests is clamped by free_seq; tail truncation: the last entry
     in the batch may be cut short by the remaining budget (cap − used),
     and a truncation closes the batch.
-
-    single_prefill_min_tokens: when > 0, a request whose total prompt
-    length reaches this value takes the prefill batch exclusively
-    (resumes included; no other entries are packed before or after it in
-    the batch); 0 = disabled (DeepSeek V4 passes 8000, other models pass 0).
-
     """
     picked: list[str] = []
     expected: dict[str, int] = {}
     if cap < 1:
         return picked, expected
-    used, single_prefill = _pick_resumes(
-        running, picked, expected, cap, chunk_unit, single_prefill_min_tokens
-    )
+    used = _pick_resumes(running, picked, expected, cap, chunk_unit)
     _pick_new_requests(
         waiting,
         picked,
@@ -68,18 +59,8 @@ def lwd_pick_prefill_batch(
         cap,
         free_seq,
         chunk_unit,
-        single_prefill_min_tokens,
-        single_prefill,
     )
     return picked, expected
-
-
-def _is_single_prefill(single_prefill_min_tokens: int, num_prompt_tokens: int) -> bool:
-    """Whether this request triggers the exclusive rule (total prompt
-    length reaches the threshold)."""
-    return (
-        single_prefill_min_tokens > 0 and num_prompt_tokens >= single_prefill_min_tokens
-    )
 
 
 def _append_chunk(
@@ -113,33 +94,14 @@ def _pick_resumes(
     expected: dict[str, int],
     cap: int,
     chunk_unit: int,
-    single_prefill_min_tokens: int,
-) -> tuple[int, bool]:
+) -> int:
     """Resume loop: walk requests in running order, each taking
-    c = min(remaining, C).
-
-    Exclusive rule: a qualifying request sets the single_prefill flag; if
-    the batch already has entries, close it on the spot (long requests
-    are never batched with short ones); the flag carries across loops
-    (this batch closes, and the new-start loop packs nothing more).
-    Returns (used, single_prefill flag)."""
+    c = min(remaining, C). Returns used."""
     used = 0
-    single_prefill = False
     for cand in running:
-        if single_prefill and picked:
-            break
         remaining = cand.num_prompt_tokens - cand.num_computed_tokens
         if remaining <= 0:
             continue
-        # The exclusive check uses total prompt length, not this chunk's
-        # remaining tokens: when a long request arrives later, close the
-        # current batch first and leave the next batch to it alone, so
-        # waiting new-starts cannot bypass it
-        single_prefill = _is_single_prefill(
-            single_prefill_min_tokens, cand.num_prompt_tokens
-        )
-        if single_prefill and picked:
-            break
         used, batch_closed = _append_chunk(
             picked,
             expected,
@@ -150,7 +112,7 @@ def _pick_resumes(
         )
         if batch_closed:
             break
-    return used, single_prefill
+    return used
 
 
 def _pick_new_requests(
@@ -161,22 +123,11 @@ def _pick_new_requests(
     cap: int,
     free_seq: int,
     chunk_unit: int,
-    single_prefill_min_tokens: int,
-    single_prefill: bool,
 ) -> int:
     """New-start loop: take the FCFS prefix of the waiting order,
     c = min(prompt, C), new-start count ≤ free_seq; never skip the queue
-    head (preserves FCFS and seqno chain order). single_prefill is passed
-    in from the resume loop (True means this batch is already closed).
-    Returns used."""
+    head (preserves FCFS and seqno chain order). Returns used."""
     for new_count, cand in enumerate(waiting):
-        if single_prefill and picked:
-            break
-        single_prefill = _is_single_prefill(
-            single_prefill_min_tokens, cand.num_prompt_tokens
-        )
-        if single_prefill and picked:
-            break
         remaining = cand.num_prompt_tokens - cand.num_computed_tokens
         if remaining <= 0:
             continue

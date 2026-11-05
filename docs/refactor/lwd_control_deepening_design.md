@@ -17,7 +17,7 @@
 - **E 引擎基类**：`LwdBaseEngineCore`（调度器注入时序、chunked prefill 恢复、两面生命周期、shutdown）；`Subscriber.start(handler)` 起接收线程；云引擎 PRE_OUT 线程改构造期启动（删 `process_input_sockets` 覆写，socket 仍在 IO 线程内建保 zmq 亲和）；门池 gate_pending 改 seen 集合消息直投（删 `_lwd_promote`）。
 - **c2e 收编（2026-10-08 二次评估后落地，沿 refact 分支形态）**：此前缓议的顾虑（update_from_output 拿不到 engine_core_outputs）不成立——原生 `super().update_from_output()` 的返回值即 engine_core_outputs，finish 码来源不变。落地：调度器 `update_from_output` 解 carrier 组 c2e 入 `pending_c2e`（纯记账不做 I/O），引擎 `post_step` 原生钩子统一冲刷发边；core.py 删除 `lwd_process_model_output`/`lwd_handle_model_output` 钩子链、两处 [Lwd][trace] 与 'start send' 调试日志，LWD 残留仅剩引擎选择块（10 行）。云引擎 451→330 行，mixed 373→488（承接搬迁），lwd_debug 改指调度器静态方法。
 - **J awaiting 生命周期迁移（2026-10-08，用户拍板）**：嵌入完结不再 finish 出调度器，请求留原生 running 转 decode 相位（与云侧收集谓词同款）；`_lwd_awaiting` 删除，inflight/max_seqs 改读 len(running)；迟到结果判定改原生 requests 成员检查；终结改云端完成码映射（_LWD_FINISH_STATUS）走原生 finish_requests（KV/缓存释放与 finished_req_ids 交接白拿）。本轮原生步进 + 自定义收割 + wire 携带 finish_reasons 三项前提齐备后，历史风险主体（token 走原生入账）不存在。pending 闸门两本账（first_token/batch_requests）不随迁，需协议携带消费 seqno 才能去除。冒烟重点：长驻 decode 相位请求在 AsyncScheduler 旁路（preemption 统计等）的行为。
-- **K 变量/接口盘点清理（2026-10-09，用户拍板"改一改"）**：删 6 项（Publisher.endpoint 与 Communicator.endpoint 只写不读属性、LwdHelloNotify.wire_version 字段与 LWD_WIRE_VERSION 常量（唯一读者已随防御清除删）、LwdRangeNotify 顶层 request_id/offset/num_tokens 三字段与边侧填充（wire 上每条通告重复发首条目两遍的死重；连带 purge legacy 分支）、spec _lwd_spec_drafts 计数与 mean_accept_len 指标）；合 4 项（5000 超时双份收进 subscriber 常量、空占位与旁路 DTO 合一为 _LwdStubModelOutput、_lwd_notify_items 内联、lwd_edge_max_num_seqs_check 内联）；_LWD_ENV_PREFIX 双份保留（合并需包 __init__ 引 vllm.config，拉起 py3.9 不兼容链、破坏 picker 纯模块可测性，得不偿失）。wire 变更两项（HELLO 少 1 字段、RangeNotify 少 3 字段）为同版本部署内安全（msgspec 按字段名，ascend 对两结构体零代码引用）。过程修复两处前轮静默伤：_lwd_verify_full_admission 删除时孤儿 @staticmethod 落在 _schedule_impl 头上（真机首步即 TypeError）、classify 调用内联替换缩进未匹配调用已删方法——已修并全包扫描同类（无）。教训：索引式/字面替换必须带命中断言。
+- **K 变量/接口盘点清理（2026-10-09，用户拍板"改一改"）**：删 6 项（Publisher.endpoint 与 Communicator.endpoint 只写不读属性、LwdHelloNotify.wire_version 字段与 LWD_WIRE_VERSION 常量（唯一读者已随防御清除删）、LwdRangeNotify 顶层 request_id/offset/num_tokens 三字段与边侧填充（wire 上每条通告重复发首条目两遍的死重；连带 purge legacy 分支）、spec `_lwd_spec_drafts` 计数与 mean_accept_len 指标）；合 4 项（5000 超时双份收进 subscriber 常量、空占位与旁路 DTO 合一为 `_LwdStubModelOutput`、_lwd_notify_items 内联、lwd_edge_max_num_seqs_check 内联）；_LWD_ENV_PREFIX 双份保留（合并需包 `__init__` 引 vllm.config，拉起 py3.9 不兼容链、破坏 picker 纯模块可测性，得不偿失）。wire 变更两项（HELLO 少 1 字段、RangeNotify 少 3 字段）为同版本部署内安全（msgspec 按字段名，ascend 对两结构体零代码引用）。过程修复两处前轮静默伤：_lwd_verify_full_admission 删除时孤儿 @staticmethod 落在 `_schedule_impl` 头上（真机首步即 TypeError）、classify 调用内联替换缩进未匹配调用已删方法——已修并全包扫描同类（无）。教训：索引式/字面替换必须带命中断言。
 - **I 防御性编程清除（2026-10-08，用户拍板：开发阶段保证不报错）**：删除自洽断言与不可能状态守卫——picker 预算断言、unembed 长度断言、边侧 chunk 步后核验、云侧准入核验与 offset/mrope 对账循环、wire_version 互校、HELLO legacy peer 分支、通知 items 旧版单请求回退（两处）、云侧重复元数据守卫、边侧 publisher None 守卫、_lwd_hello_seen 日志去重标志。保留：部署校验（master_addr/pre_out_host/死锁配置/三元组互裁）、协议竞态语义（classify unknown/stale、abort 清扫、迟到结果丢弃）、请求边界校验。风险须知：chunk 契约漂移（上游原生调度演进）从当场报错变为静默错算，回归防线后移到 CI/联调。
 - **H awaiting 台账并入调度器（2026-10-08，用户拍板删文件）**：三本账（awaiting 集/首 token 集/seqno→批内请求）内联为 LwdEdgeScheduler 私有字段，转换逻辑为调度器私有段（语义按用户已回退的原语义版；I5a 后于同日修复，见 §8）；`lwd_edge_awaiting_tracker.py` 与其测试删除，生命周期转换的独立单测面随之消失，靠真机冒烟兜底；时间戳账（无人读）一并去除。
 - **F 步进原生化（评估后改道，2026-10-08）**：目标是 refact 分支的"边引擎步进全走父类 step_with_batch_queue"。读原生收割段后确认三处硬冲突：① EMBED 批会落原生 `sample_tokens` 采样分支（边侧 embed 不采样）；② DISABLE_DOWN 的 `future=None` 直通无法进原生批队列（原生只收真 future，合成假 future 即 refact 分支 total=0 事故形状）；③ awaiting 请求已 finish 出调度器，原生 `update_from_output` 无从入账。refact 分支能走通是因它同时换了生命周期模型（请求留 running + 占位欠条）。**落地改为安全瘦身**：批队列元组去只写不读的时间戳、两个单行体派发方法内联，边引擎 360 → 351。全量原生化与生命周期迁移绑定，列为独立立项。奥林边侧六项改动（pending 闸门/HELLO 互裁/mrope 切片/encoder 绕过/DISABLE_DOWN 直通/chunk 化）均不在本次触碰面或已显式保留。
@@ -86,7 +86,7 @@ LWD prefill_only 把推理拆到两个进程：边侧持有真实 prompt 只做 
 
 ## 5 目标架构
 
-```
+```text
 lwd_control/
 ├── __init__.py            入口（serve 守卫 + 引擎类分流；无条件注入 Mixed）
 ├── lwd_config.py          ★新增：配置 + 模式判定 + spec factor 公式 + 诊断 helper
@@ -128,11 +128,12 @@ class LwdPrefillCandidate(NamedTuple):
 def lwd_pick_prefill_batch(
     running: Sequence[LwdPrefillCandidate], waiting: Sequence[LwdPrefillCandidate],
     *, cap: int, free_seq: int, chunk_unit: int,
-    single_prefill_min_tokens: int = 0,   # >0：总长达到该值的请求独占整批
 ) -> tuple[list[str], dict[str, int]]
 ```
 
-命名沿用原实现词汇：候选（原 `candidates` 变量）、`single_prefill`（原独占规则变量名）、`chunk_unit`（原 `_lwd_chunk_unit`）。内部 `_append_chunk / _pick_resumes / _pick_new_requests` 三函数逐句翻译原两个循环（含 single_prefill 标志跨循环传递、末位截断、free_seq 门）；预算断言随行。调度器侧缩为约 40 行适配层（候选组装 + cap/free_seq 计算 + deepseek_v4 → `single_prefill_min_tokens=8000`），逃生通道分支不复存在。
+命名沿用原实现词汇：候选（原 `candidates` 变量）、`chunk_unit`（原 `_lwd_chunk_unit`）。内部 `_append_chunk / _pick_resumes / _pick_new_requests` 三函数逐句翻译原两个循环（末位截断、free_seq 门）；预算断言随行。调度器侧缩为约 40 行适配层（候选组装 + cap/free_seq 计算），逃生通道分支不复存在。
+
+> 后记：picker 原有的 `single_prefill` 独占规则（长 prompt 独占整批，调度器对 DeepSeek V4 传 8000）已于后续变更移除，长请求与短请求正常合批，签名不再带 `single_prefill_min_tokens`。
 
 ### 6.3 `lwd_edge_awaiting_tracker.py`（约 105 行）——P6
 
@@ -181,7 +182,7 @@ class LwdPrefillNotifyQueue:   # 一把 threading.Lock + deque
 | I1 | wire 协议字节零变化 | 改动集不含 notify/传输层 |
 | I2 | PD_mix 路径行为逐字节不变（选型、组批、闸门、preflight、双钳制、日志行） | 单测 + 真机冒烟比对 |
 | I3 | 诊断开关严格 `== "1"`，env 名不变，调用点现读时机不变，vllm-ascend 侧不动 | `test_lwd_config` |
-| I4 | picker 输出与原实现逐请求一致（续传序、FCFS、末位截断、独占规则、Σ≤cap） | `test_lwd_edge_picker` 表驱动（含边界：cap<1、c=0 不入批、free_seq=0、single_prefill 跨循环传递） |
+| I4 | picker 输出与原实现逐请求一致（续传序、FCFS、末位截断、Σ≤cap） | `test_lwd_edge_picker` 表驱动（含边界：cap<1、c=0 不入批、free_seq=0） |
 | I5 | 台账语义：迟到幂等丢弃、abort 三账齐摘、pending_chunks 定义不变、批全到齐即移除 | `test_lwd_edge_awaiting_tracker` |
 | I5a | 已修复（2026-10-08，移植 aolin PR #10）：原语义下首 token 即终结的请求被摘出首 token 集后，其所在批若仍有未到账成员将永久留存——bench 长跑泄漏累积使 pending 水位只涨不降，prefill 闸门永久 HOLD（4 卡 + MTP 实测：云侧空转刷 c2e_meta=None）。修复方式：finish 路径复用 abort 的摘账逻辑（`_lwd_purge_request_ledger`：摘首 token 集 + 各批剔除该请求，批摘空或只剩已见者整条移除），与"finish 视同已消费"等价防漏且与 abort 语义对齐；tracker 内联时该行为曾按用户决定回退为原语义并视作良性，PR #10 证实为死锁，予以修复 | 代码评审 + 真机冒烟（长跑 bench 观察闸门不再永久 HOLD） |
 | I6 | inbox 次序语义：FIFO、条目级 purge、purge 与 peek 并发安全 | `test_lwd_prefill_notify_queue`（含双线程烟雾） |
