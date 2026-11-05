@@ -3,8 +3,7 @@
 
 """lwd_pick_prefill_batch 表驱动测试:chunk 组批算术的边界锁死。
 
-用例覆盖原实现注释里记录的事故形态(末位截断漏记、预算超批)与
-single_prefill 独占规则的全部次序分支(含标志跨循环传递)。
+用例覆盖原实现注释里记录的事故形态(末位截断漏记、预算超批)。
 """
 
 from __future__ import annotations
@@ -28,12 +27,11 @@ def candidate(rid: str, prompt: int, computed: int = 0) -> LwdPrefillCandidate:
         "cap",
         "free_seq",
         "chunk_unit",
-        "single_min",
         "want",
     ),
     [
         # cap < 1:空批
-        ([], [candidate("a", 100)], 0, 5, 8192, 0, {}),
+        ([], [candidate("a", 100)], 0, 5, 8192, {}),
         # 简单开新:FCFS 前缀
         (
             [],
@@ -41,7 +39,6 @@ def candidate(rid: str, prompt: int, computed: int = 0) -> LwdPrefillCandidate:
             200,
             5,
             8192,
-            0,
             {"a": 100, "b": 50},
         ),
         # 续传优先:running 未发完的先收尾,再开新
@@ -51,7 +48,6 @@ def candidate(rid: str, prompt: int, computed: int = 0) -> LwdPrefillCandidate:
             400,
             5,
             8192,
-            0,
             {"r": 200, "a": 100},
         ),
         # 续传剩余耗尽(computed == prompt):跳过
@@ -61,7 +57,6 @@ def candidate(rid: str, prompt: int, computed: int = 0) -> LwdPrefillCandidate:
             400,
             5,
             8192,
-            0,
             {"a": 10},
         ),
         # 末位截断:最后条目被剩余额度截尾,Σ == cap
@@ -71,7 +66,6 @@ def candidate(rid: str, prompt: int, computed: int = 0) -> LwdPrefillCandidate:
             150,
             5,
             8192,
-            0,
             {"a": 100, "b": 50},
         ),
         # 截断剩余额度为 0:该条目不入批
@@ -81,7 +75,6 @@ def candidate(rid: str, prompt: int, computed: int = 0) -> LwdPrefillCandidate:
             100,
             5,
             8192,
-            0,
             {"a": 100},
         ),
         # 截断块占预算:后续开新不超批(真机事故:漏记 used 超批 2x)
@@ -91,7 +84,6 @@ def candidate(rid: str, prompt: int, computed: int = 0) -> LwdPrefillCandidate:
             6000,
             5,
             8192,
-            0,
             {"a": 4000, "b": 2000},
         ),
         # 续传段截断
@@ -101,7 +93,6 @@ def candidate(rid: str, prompt: int, computed: int = 0) -> LwdPrefillCandidate:
             300,
             5,
             8192,
-            0,
             {"r": 300},
         ),
         # free_seq 钳制:开新名额耗尽即停
@@ -111,7 +102,6 @@ def candidate(rid: str, prompt: int, computed: int = 0) -> LwdPrefillCandidate:
             100,
             1,
             8192,
-            0,
             {"a": 10},
         ),
         # free_seq = 0:一个新请求都不开
@@ -121,7 +111,6 @@ def candidate(rid: str, prompt: int, computed: int = 0) -> LwdPrefillCandidate:
             100,
             0,
             8192,
-            0,
             {},
         ),
         # chunk_unit 切块:开新 c = min(prompt, C)
@@ -131,7 +120,6 @@ def candidate(rid: str, prompt: int, computed: int = 0) -> LwdPrefillCandidate:
             1000,
             5,
             30,
-            0,
             {"a": 30},
         ),
         # chunk_unit 切块:续传 c = min(剩余, C)
@@ -141,69 +129,26 @@ def candidate(rid: str, prompt: int, computed: int = 0) -> LwdPrefillCandidate:
             1000,
             5,
             40,
-            0,
             {"r": 30},
         ),
-        # single_prefill:达标请求在队首,独占整批
-        (
-            [],
-            [candidate("b", 9000), candidate("a", 100)],
-            20000,
-            5,
-            8192,
-            8000,
-            {"b": 8192},
-        ),
-        # single_prefill:达标请求在后,前面短请求收批,长请求留下一批
+        # 长请求与短请求正常合批(模型无关,无独占规则)
         (
             [],
             [candidate("a", 100), candidate("b", 9000)],
             20000,
             5,
             8192,
-            8000,
-            {"a": 100},
-        ),
-        # single_prefill:running 中段出现,当前批收口(短请求先行)
-        (
-            [candidate("s", 100), candidate("r", 9000)],
-            [candidate("a", 100)],
-            20000,
-            5,
-            8192,
-            8000,
-            {"s": 100},
-        ),
-        # single_prefill:续传段命中,标志跨进开新循环,本批不再装新
-        (
-            [candidate("r", 9000)],
-            [candidate("a", 100)],
-            20000,
-            5,
-            8192,
-            8000,
-            {"r": 8192},
-        ),
-        # single_prefill 关闭(阈值 0):长请求正常合批
-        (
-            [],
-            [candidate("a", 100), candidate("b", 9000)],
-            20000,
-            5,
-            8192,
-            0,
             {"a": 100, "b": 8192},
         ),
     ],
 )
-def test_pick_table(running, waiting, cap, free_seq, chunk_unit, single_min, want):
+def test_pick_table(running, waiting, cap, free_seq, chunk_unit, want):
     req_ids, got = lwd_pick_prefill_batch(
         running,
         waiting,
         cap=cap,
         free_seq=free_seq,
         chunk_unit=chunk_unit,
-        single_prefill_min_tokens=single_min,
     )
     assert got == want
     assert req_ids == list(want)  # 次序 = 入批次序
