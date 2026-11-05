@@ -294,9 +294,8 @@ stateDiagram-v2
 - 每次 token 交付都会进入清账入口（不只是首 token），所以 prefill→decode 的迁移以
   集合成员资格为门、每请求恰好一次：纯计数器会在每个 token 上重复自减变成负数，
   把全部流量钉死在一个引擎。
-- Routing load includes waiting requests and is used for balancing only.
-  Native `running` entries determine occupied slots; finishing or aborting
-  a request must release both its native state and its routing account.
+- 路由负载包含等待请求，仅用于负载均衡。已占用槽位数以原生 `running` 队列为准；
+  请求结束或被终止时，必须同时释放原生状态并清理对应的路由账本记录。
 - 迟到 c2e 撞上已完结请求的 stale 分支同样清账，封住进入账本的最后一个入口。
 
 ## 调度协商：谁决定请求归谁
@@ -352,15 +351,13 @@ flowchart TB
 闸门（每个账本，`is_gated` 判定）：
 
 - 在途续传豁免（先把在途 chunk 收完；也避免 `max_num_seqs=1` 的自锁）；
-- HOLD when native edge slots are full (`len(running) >= max_num_seqs`)
-  or this DP reaches its pending-chunk limit (default 10).
-- The edge has one native scheduler, so its running-slot limit is shared
-  across DP routes. A DP's pending-chunk gate only holds that DP.
-- Routing `load` must not determine slot occupancy: queued requests would
-  otherwise block their own first prefill. Admit at most
-  `max_num_seqs - len(running)` new requests in the selected DP's batch.
-  Host Staging keeps the current per-step token budget; cloud W2 controls
-  prefill against the cloud scheduler's available budget.
+- 原生边侧运行槽位已满（`len(running) >= max_num_seqs`），或该 DP 的 pending chunk
+  数达到其限额（默认 10）时 HOLD；
+- 边侧只有一个原生调度器，运行槽位上限由所有 DP 路由共享；某个 DP 达到 pending chunk
+  限额时，只阻塞该 DP；
+- 路由 `load` 不用于计算已占用运行槽位，否则等待请求会挡住自己的首次 prefill 准入。
+  选中 DP 的批次最多准入 `max_num_seqs - len(running)` 个新请求。
+  Host Staging 沿用当前每步 token 预算；云侧 W2 根据云侧调度器剩余预算限制 prefill。
 
 ## 云侧步（MoE DP）
 
