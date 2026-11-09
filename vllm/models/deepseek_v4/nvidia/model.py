@@ -65,6 +65,8 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     extract_layer_index,
     is_pp_missing_parameter,
+    lwd_role,
+    lwd_skips_module,
     make_layers,
     maybe_prefix,
     spec_decode_needs_target_embed,
@@ -887,7 +889,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.end_layer, config.mlp_layer_types.count("hash_moe")
         )
 
-        if get_pp_group().is_last_rank:
+        if get_pp_group().is_last_rank and not lwd_skips_module(
+            "model.norm", lwd_role()
+        ):
             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
