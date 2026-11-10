@@ -300,6 +300,14 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 continue
             recv_rows = self.lwd_recv_rows.get(request_id, 0)
             if scheduled > window.num_rows or window.start + scheduled > recv_rows:
+                schedule_impl = super(LwdBaseScheduler, self).schedule
+                lwd_logger.info(
+                    "[LWD] W2 schedule_impl=%s.%s balance_enabled=%s req=%s",
+                    schedule_impl.__module__,
+                    schedule_impl.__qualname__,
+                    getattr(self, "_balance_enabled", None),
+                    request_id,
+                )
                 raise RuntimeError(
                     f"[LWD] W2 violation req={request_id}: scheduled rows "
                     f"[{window.start}, {window.start + scheduled}) with "
