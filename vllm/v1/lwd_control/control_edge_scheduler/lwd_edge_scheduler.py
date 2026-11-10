@@ -146,7 +146,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # _get_mrope_input_positions (cache the method itself rather than
         # the model class so the semantics stay direct; validated on first
         # use, unsupported families fail fast).
-        self._lwd_mrope_positions_fn = None
+        self._lwd_mrope_positions_fn: Callable[..., tuple[torch.Tensor, int]] | None = (
+            None
+        )
         # Chunk unit C = min(remaining, C): taken from the local
         # long_prefill_token_threshold (native truncation boundary,
         # naturally reproduced on both sides); when unset (<=0), falls back
@@ -460,7 +462,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     request_id,
                 )
                 continue
-            if finished_now:
+            if finish_reason is not None:
                 # The ground truth of the cloud's stop decision lands here:
                 # native finish settles the account (KV/cache release and
                 # the finished_req_ids handover all go through the native
@@ -572,7 +574,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def lwd_edge_request_active(self, request_id: str) -> bool:
         if request_id in self._lwd_route or request_id in self.requests:
             return True
-        announced = getattr(self, "_lwd_announced_refills", set())
+        announced: set[tuple[int, int]] = getattr(self, "_lwd_announced_refills", set())
         return any(
             (account.dp_idx, seqno) in announced and request_id in request_ids
             for account in self._lwd_accounts
@@ -627,7 +629,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return
         if not self._lwd_request_has_mm(request):
             return
-        if self._lwd_mrope_positions_fn is None:
+        fn = self._lwd_mrope_positions_fn
+        if fn is None:
             from vllm.model_executor.models import ModelRegistry
 
             model_cls, _ = ModelRegistry.resolve_model_cls(
@@ -647,8 +650,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         mrope_features = [
             f for f in request.mm_features if f.modality != "prompt_embeds"
         ]
+        if TYPE_CHECKING:
+            assert request.prompt_token_ids is not None
         _t_mrope = time.monotonic()
-        positions, _delta = self._lwd_mrope_positions_fn(
+        positions, _delta = fn(
             input_tokens=list(request.prompt_token_ids),
             mm_features=mrope_features,
             config=self.vllm_config.model_config.hf_config,
@@ -804,7 +809,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
             return SchedulerOutput.make_empty()
 
-        start = meta.prompt_offsets[0]
+        # Refill outputs are queued as EMBED batches.
+        start = meta.prompt_offsets[0]  # type: ignore[union-attr]
         item = LwdRangeItem(
             request_id=request_id,
             offset=start,
@@ -870,8 +876,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 )
             )
             req_ids.append(request_id)
+            # Edge admission rejects client-provided prompt embeddings.
             token_slices.append(
-                list(request.prompt_token_ids[offset : offset + num_tokens])
+                list(request.prompt_token_ids[offset : offset + num_tokens])  # type: ignore[index]
             )
             prompt_offsets.append(offset)
             has_mrope.append(req_has_mrope)
@@ -974,6 +981,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 f"(request {request.request_id})"
             )
         sp = request.sampling_params
+        if TYPE_CHECKING:
+            assert sp is not None
         unsupported = [
             name
             for name, value in (
@@ -1013,6 +1022,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 f"(request {request.request_id})"
             )
         mm_config = self.vllm_config.model_config.multimodal_config
+        if TYPE_CHECKING:
+            assert mm_config is not None
         if mm_config.is_multimodal_pruning_enabled():
             raise ValueError(
                 "[LWD] prefill-only mode does not support multimodal "

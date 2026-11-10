@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+    from vllm.v1.lwd_control.lwd_comm.lwd_messages import LwdC2eNotify
     from vllm.v1.request import Request
 else:
     AuxOutputConnectorMetadata = object
@@ -67,6 +68,9 @@ class LwdEmbedBatch:
     channel of this DP connection. 0 keeps single-cloud behaviour."""
     aborted_req_ids: list[str] = field(default_factory=list)
     is_refill: bool = False
+
+    if TYPE_CHECKING:
+        lwd_prefix_nonce: int = field(init=False)
 
 
 @dataclass
@@ -298,6 +302,9 @@ class KVConnectorBlockState:
 
 @dataclass
 class SchedulerOutput:
+    if TYPE_CHECKING:
+        lwd_c2e_notify: list[LwdC2eNotify] = field(init=False)
+
     # list of the requests that are scheduled for the first time.
     # We cache the request's data in each worker process, so that we don't
     # need to re-send it every scheduling step.

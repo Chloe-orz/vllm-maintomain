@@ -14,7 +14,7 @@ the arrived-row high watermark is retained for readmission.
 from __future__ import annotations
 
 import itertools
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -42,7 +42,11 @@ from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.request import Request, RequestStatus
 
 if TYPE_CHECKING:
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
     from vllm.v1.engine import EngineCoreOutputs
+    from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
+        LwdPrefixReservations,
+    )
     from vllm.v1.outputs import ModelRunnerOutput
 
 LwdDownCarrier = tuple[torch.Tensor, list[str], int, int]
@@ -75,6 +79,9 @@ class _LwdRefillPending(NamedTuple):
 
 class LwdCloudScheduler(LwdBaseScheduler):
     """Mix all decode requests with prefill windows whose rows have arrived."""
+
+    if TYPE_CHECKING:
+        lwd_prefix_reservations: LwdPrefixReservations
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -155,6 +162,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         max_cache_hit_length = request.get_max_cache_hit_length(
             max(0, request.num_prompt_tokens - 1)
         )
+        groups: tuple[Sequence[KVCacheBlock], ...]
         if max_cache_hit_length <= 0:
             groups, h_prime = (), 0
         else:
@@ -375,8 +383,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
         elif (
             batch.batch_type is LwdBatchType.LWD_EMBED and batch.batch_meta is not None
         ):
-            existing = list(batch.batch_meta.aborted_req_ids or ())
-            batch.batch_meta.aborted_req_ids = existing + [
+            existing = list(batch.batch_meta.aborted_req_ids or ())  # type: ignore[union-attr]
+            batch.batch_meta.aborted_req_ids = existing + [  # type: ignore[union-attr]
                 request_id for request_id in pending if request_id not in existing
             ]
         else:

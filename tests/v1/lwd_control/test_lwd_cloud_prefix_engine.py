@@ -211,7 +211,9 @@ def test_async_output_update_never_hashes_or_caches_output_blocks(
     ],
 )
 def test_refill_done_bypasses_watermark_recording(
-    monkeypatch, done, expected_args
+    lwd_pre_recv: SimpleNamespace,
+    done: tuple[str, str] | tuple[str, str, int],
+    expected_args: tuple[str] | tuple[str, int],
 ) -> None:
     class DoneMq:
         def __init__(self) -> None:
@@ -225,10 +227,9 @@ def test_refill_done_bypasses_watermark_recording(
     engine = object.__new__(LwdCloudEngineCoreMixin)
     engine._lwd_done_mq = DoneMq()
     engine.scheduler = SimpleNamespace(lwd_refill_done=Mock())
-    from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
 
     record = Mock()
-    monkeypatch.setattr(lwd_pre_recv, "record_irecv_completions", record)
+    lwd_pre_recv.record_irecv_completions = record
 
     engine._lwd_drain_irecv_completions()
 

@@ -338,6 +338,8 @@ steps:
     - vllm/engine/
     - vllm/inputs/
     - vllm/lora/
+    - vllm/model_executor/model_loader/lwd_weight_filter.py
+    - vllm/model_executor/models/utils.py
     - vllm/multimodal/
     - vllm/outputs.py
     - vllm/platforms/
@@ -348,6 +350,9 @@ steps:
     - vllm/transformers_utils/
     - vllm/utils/
     - vllm/v1/
+    - scripts/lwd/split_lwd_checkpoint.py
+    - tests/distributed/test_lwd_parallel_groups.py
+    - tests/scripts/lwd/test_split_lwd_checkpoint.py
     - tests/v1
     - tests/watermarking
     - examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py
@@ -364,6 +369,9 @@ steps:
     - pytest -v -s -m 'cpu_test' v1/kv_connector/unit
     - pytest -v -s -m 'cpu_test' v1/ec_connector/unit
     - pytest -v -s -m 'cpu_test' v1/metrics
+    - pytest -v -s v1/lwd_control
+    - pytest -v -s distributed/test_lwd_parallel_groups.py
+    - pytest -v -s scripts/lwd/test_split_lwd_checkpoint.py
     - pytest -v -s watermarking
 
 - label: ":nvidia: (H200 MIG 18GB) Extract Hidden States Integration"

@@ -58,6 +58,10 @@ class StreamingUpdate:
 
 
 class Request:
+    if TYPE_CHECKING:
+        lwd_resume_cap_tokens: int
+        lwd_window_cap: int | None
+
     def __init__(
         self,
         request_id: str,
