@@ -210,7 +210,12 @@ _ROW_PREFIX_ALIASES: dict[str, tuple[str, ...]] = {
     "lm_head": ("lm_head.", "head.", "model.head."),
     "model.layers": ("layers.",),
     "model.norm": ("norm.",),
-    "model.mtp": ("mtp.",),
+    # QuaRot-quantized MTP checkpoints export the draft input rotation as a
+    # flat top-level ``rot.weight`` (no ``model.`` prefix): the cloud draft
+    # remaps it into the spec layer, the edge target discards ``rot.*`` via
+    # its weights mapper. It is draft input plumbing, so it rides the MTP
+    # row: cloud keeps, edge drops.
+    "model.mtp": ("mtp.", "rot."),
 }
 
 
