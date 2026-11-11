@@ -83,6 +83,11 @@ SHARD_TENSORS: dict[str, list[str]] = {
         "model.language_model.model.norm.weight",
         "model.norm.weight",
         "model.mtp.proj.weight",
+        # vllm-layout MTP spec layer (enorm + flat hc param) and the QuaRot
+        # top-level draft input rotation.
+        "model.layers.48.enorm.weight",
+        "model.layers.48.hc_attn_fn",
+        "rot.weight",
         "model.visual.merger.norm.weight",
         "hc_head_fn",
         "hc_head_base",
@@ -101,6 +106,11 @@ EXPECTED_OWNERSHIP: dict[str, frozenset[str]] = {
     "model.language_model.model.norm.weight": CLOUD_ONLY,
     "model.norm.weight": CLOUD_ONLY,
     "model.mtp.proj.weight": CLOUD_ONLY,
+    # MTP spec layer under the ``model.layers.{N}`` subtree (vllm layout) and
+    # the QuaRot top-level draft input rotation (rides the MTP row).
+    "model.layers.48.enorm.weight": CLOUD_ONLY,
+    "model.layers.48.hc_attn_fn": CLOUD_ONLY,
+    "rot.weight": CLOUD_ONLY,
     "model.visual.blk.0.attn_qkv.weight": EDGE_ONLY,
     "model.visual.merger.norm.weight": EDGE_ONLY,
     # DeepSeek-V4 flat hyper-connection head: both-roles special case
@@ -118,6 +128,9 @@ NATIVE_OWNERSHIP: dict[str, frozenset[str]] = {
     "layers.5.ffn.gate.tid2eid.weight": BOTH,
     "norm.weight": CLOUD_ONLY,
     "mtp.0.linear.weight": CLOUD_ONLY,
+    # QuaRot top-level draft input rotation: native layouts export it flat
+    # too (the shape real GLM/DeepSeek w8a8c8 checkpoints ship).
+    "rot.weight": CLOUD_ONLY,
     # DeepSeek-V4 flat hyper-connection head: both-roles special case
     "hc_head_fn": BOTH,
     "hc_head_base": BOTH,
@@ -291,6 +304,29 @@ def test_classify_covers_native_deepseek_layout(role: str) -> None:
     assert drop == set(weight_map) - expected_keep
 
 
+@pytest.mark.parametrize("role", ["edge", "cloud"])
+def test_quarot_mtp_rot_tensor_belongs_to_cloud(role: str) -> None:
+    """The QuaRot top-level ``rot.weight`` rides the MTP row in every layout.
+
+    QuaRot-quantized MTP checkpoints export the draft input rotation as a
+    flat top-level tensor (no ``model.`` prefix, in flat and native layouts
+    alike). The cloud draft consumes it (remapped into the spec layer); the
+    edge target discards ``rot.*`` via its weights mapper, so the edge slice
+    omits it.
+    """
+    table, _ = script.load_module_ownership()
+    weight_map = {"rot.weight": "x.safetensors"}
+    keep, drop, uncovered, attribution = script.classify_all(weight_map, role, table)
+    assert uncovered == []
+    assert attribution["table:model.mtp"] == ["rot.weight"]
+    if role == "cloud":
+        assert keep == {"rot.weight"}
+        assert drop == set()
+    else:
+        assert keep == set()
+        assert drop == {"rot.weight"}
+
+
 def test_keep_iff_all_matched_rows_owned() -> None:
     """A tensor matching two rows is kept only when the role owns every row.
 
@@ -445,6 +481,19 @@ def test_classification_mirrors_load_time_filter() -> None:
                 assert name in keep
                 if role == "edge":
                     assert weight_filter.lwd_should_skip_weight(name, role)
+                continue
+            if name == "rot.weight":
+                # QuaRot draft input rotation: the split routes it with the
+                # MTP row (edge drops it from the slice), while the load-time
+                # filter passes it through on both roles -- the edge target
+                # discards ``rot.*`` via its weights mapper and the cloud
+                # draft remaps it into the spec layer. Asymmetry by design,
+                # the same shape as the tid2eid exemption above.
+                if role == "edge":
+                    assert name in drop
+                else:
+                    assert name in keep
+                assert not weight_filter.lwd_should_skip_weight(name, role)
                 continue
             should_skip = weight_filter.lwd_should_skip_weight(name, role)
             assert (name in drop) == should_skip, (role, name)
