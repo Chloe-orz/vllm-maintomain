@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     VLLM_LOGGING_COLOR: str = "auto"
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
+    VLLM_LWD_DIAG: bool = False
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
@@ -810,6 +811,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if (val := float(os.getenv("VLLM_LOG_STATS_INTERVAL", "10."))) > 0.0
         else 10.0
     ),
+    # Enable LWD communication and scheduling diagnostics (0 or 1).
+    "VLLM_LWD_DIAG": lambda: os.getenv("VLLM_LWD_DIAG", "0") == "1",
     # Trace function calls
     # If set to 1, vllm will trace function calls
     # Useful for debugging

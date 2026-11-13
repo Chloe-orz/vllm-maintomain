@@ -31,6 +31,7 @@ import threading
 import time
 from collections import deque
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.v1.engine import (
     EngineCoreOutput,
@@ -84,6 +85,7 @@ LWD_C2E_META_QUEUE_MAX = 1000
 # 批队列在飞深度上限:派发(embed+unembed 合计)不收割的批数上限,
 # 突发积压时连续派发喂饱 worker(参照仓经验 >=4 才能维持流水对齐)
 LWD_EDGE_BATCH_QUEUE_DEPTH = 4
+LWD_DIAG_QUEUE_LOG_INTERVAL_S = 5.0
 
 
 class LwdEdgeEngineCore(EngineCoreProc):
@@ -123,6 +125,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
         # UNEMBED 批的 lwd_c2e_notifies 拿元数据,不直接读队列
         # (单消费者语义)
         self.lwd_c2e_meta_queue = queue.Queue(maxsize=LWD_C2E_META_QUEUE_MAX)
+        self._lwd_diag_enabled = envs.VLLM_LWD_DIAG
+        self._lwd_diag_next_queue_log = 0.0
         # 已派发待收割的批队列 (kind, payload, t_dispatch, future):
         # kind="unembed" payload=notify;kind="embed" payload=scheduler_output。
         # 派发不收割,队首 FIFO 收割——必须全局单队列:executor 的 FutureWrapper
@@ -567,6 +571,17 @@ class LwdEdgeEngineCore(EngineCoreProc):
         DISABLE_DOWN 诊断:通告只携带 token_ids(hidden=0)时跳过 worker
         派发,以 future=None 直通收割,不挂任何 recv。"""
         quota = LWD_EDGE_BATCH_QUEUE_DEPTH - len(self._lwd_batch_queue)
+        if self._lwd_diag_enabled and quota == 0:
+            pending = self.lwd_c2e_meta_queue.qsize()
+            now = time.monotonic()
+            if pending and now >= self._lwd_diag_next_queue_log:
+                n_emb, n_unemb = self._lwd_queue_mix()
+                logger.info(
+                    "[LWD][diag] down_dispatch_blocked pending=%d "
+                    "inflight_embed=%d inflight_unembed=%d ts=%.3f",
+                    pending, n_emb, n_unemb, now,
+                )
+                self._lwd_diag_next_queue_log = now + LWD_DIAG_QUEUE_LOG_INTERVAL_S
         notifies: list[tuple[LwdC2eNotify, float]] = []
         while len(notifies) < quota:
             try:
