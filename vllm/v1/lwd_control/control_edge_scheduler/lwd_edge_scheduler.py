@@ -50,6 +50,7 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_cloud_dp_account import (
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_picker import (
     LwdPrefillCandidate,
+    lwd_grammar_ready,
     lwd_pick_prefill_batch,
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
@@ -524,6 +525,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
             for r in [*self.kv_holding_waiting, *self.waiting]
             if self._lwd_dp_of(r.request_id) == dp_idx
+            and lwd_grammar_ready(
+                r, RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+            )
         ]
         req_ids, expected = lwd_pick_prefill_batch(
             running,
@@ -960,9 +964,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def _lwd_validate_request(self, request: Request) -> None:
         """Mode boundary validation (edge capability surface): reject
-        client-provided prompt_embeds/pooling/structured output/sampling
-        params not carried on the wire; violations raise ValueError and are
-        rejected before enqueueing."""
+        client-provided prompt_embeds/pooling/sampling params not carried
+        on the wire; violations raise ValueError and are rejected before
+        enqueueing."""
         if request.prompt_embeds is not None:
             raise ValueError(
                 f"[LWD] prefill-only mode does not accept client-provided "
@@ -973,11 +977,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if request.pooling_params is not None:
             raise ValueError(
                 "[LWD] prefill-only mode does not support pooling requests "
-                f"(request {request.request_id})"
-            )
-        if request.use_structured_output:
-            raise ValueError(
-                "[LWD] prefill-only mode does not support structured output "
                 f"(request {request.request_id})"
             )
         sp = request.sampling_params
