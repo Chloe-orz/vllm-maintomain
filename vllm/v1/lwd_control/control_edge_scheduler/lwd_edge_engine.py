@@ -31,7 +31,6 @@ import threading
 import time
 from collections import deque
 
-from vllm import envs
 from vllm.logger import init_logger
 from vllm.v1.engine import (
     EngineCoreOutput,
@@ -85,8 +84,6 @@ LWD_C2E_META_QUEUE_MAX = 1000
 # 批队列在飞深度上限:派发(embed+unembed 合计)不收割的批数上限,
 # 突发积压时连续派发喂饱 worker(参照仓经验 >=4 才能维持流水对齐)
 LWD_EDGE_BATCH_QUEUE_DEPTH = 4
-LWD_DIAG_QUEUE_LOG_INTERVAL_S = 5.0
-LWD_DIAG_DOWN_SEQNOS = (0, 1)
 
 
 class LwdEdgeEngineCore(EngineCoreProc):
@@ -125,11 +122,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         # 云->边唯一载荷队列:生产端接收线程,消费端引擎步;数据面经
         # UNEMBED 批的 lwd_c2e_notifies 拿元数据,不直接读队列
         # (单消费者语义)
-        self.lwd_c2e_meta_queue: queue.Queue[tuple[LwdC2eNotify, float]] = (
-            queue.Queue(maxsize=LWD_C2E_META_QUEUE_MAX)
-        )
-        self._lwd_diag_enabled = envs.VLLM_LWD_DIAG
-        self._lwd_diag_next_queue_log = 0.0
+        self.lwd_c2e_meta_queue = queue.Queue(maxsize=LWD_C2E_META_QUEUE_MAX)
         # 已派发待收割的批队列 (kind, payload, t_dispatch, future):
         # kind="unembed" payload=notify;kind="embed" payload=scheduler_output。
         # 派发不收割,队首 FIFO 收割——必须全局单队列:executor 的 FutureWrapper
@@ -255,16 +248,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 )
                 # 队列元素带到达时间戳:消费滞后(c2e_wait=到达→派发)
                 # 是"边消费不动 → 云 publisher 队满小睡"闭环的前置指标
-                arrived_at = time.monotonic()
-                self.lwd_c2e_meta_queue.put((msg, arrived_at))
+                self.lwd_c2e_meta_queue.put((msg, time.monotonic()))
                 self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
-                if self._lwd_diag_enabled and msg.down_seqno in LWD_DIAG_DOWN_SEQNOS:
-                    logger.info(
-                        "[LWD][diag] down_arrival engine=%d seqno=%d ts=%.6f",
-                        msg.engine_index,
-                        msg.down_seqno,
-                        arrived_at,
-                    )
             else:
                 logger.warning("[Lwd] drop unexpected POST_OUT frame %r", type(msg))
 
@@ -516,7 +501,6 @@ class LwdEdgeEngineCore(EngineCoreProc):
                     kind, self._lwd_batch_seqno(kind, payload), wait_ms,
                 )
         d_emb = 0
-        embed_stop = "no_requests"
         while (
             self._lwd_pending_refills
             and len(self._lwd_batch_queue) < LWD_EDGE_BATCH_QUEUE_DEPTH
@@ -534,18 +518,16 @@ class LwdEdgeEngineCore(EngineCoreProc):
                and self.scheduler.has_requests()):
             scheduler_output = self.scheduler.schedule()
             if not scheduler_output.num_scheduled_tokens:
-                embed_stop = "no_scheduled_tokens"
                 break
             future = self._lwd_dispatch_embed(scheduler_output)
             if future is None:
-                embed_stop = "notify_failed"
                 break
             self._lwd_batch_queue.append(
                 ("embed", scheduler_output, time.monotonic(), future)
             )
             prefill_work = True
             d_emb += 1
-        d_unemb = self._lwd_edge_consume_c2e(d_emb, embed_stop)
+        d_unemb = self._lwd_edge_consume_c2e()
         n_emb, n_unemb = self._lwd_queue_mix()
         if (prefill_work or outputs or h_emb or h_unemb
                 or d_emb or d_unemb):
@@ -579,33 +561,18 @@ class LwdEdgeEngineCore(EngineCoreProc):
         batch = getattr(payload, "lwd_batch", None)
         return str(getattr(batch, "seqno", "?")) if batch else "?"
 
-    def _lwd_edge_consume_c2e(self, dispatched_embed: int, embed_stop: str) -> int:
+    def _lwd_edge_consume_c2e(self) -> int:
         """消费 c2e 通告:派发 UNEMBED 批入批队列(异步收割)。
         云侧有活请求才产 meta(build_hidden_payload 空则返回 None)。
         DISABLE_DOWN 诊断:通告只携带 token_ids(hidden=0)时跳过 worker
         派发,以 future=None 直通收割,不挂任何 recv。"""
         quota = LWD_EDGE_BATCH_QUEUE_DEPTH - len(self._lwd_batch_queue)
-        if self._lwd_diag_enabled and quota == 0:
-            pending = self.lwd_c2e_meta_queue.qsize()
-            now = time.monotonic()
-            if pending and now >= self._lwd_diag_next_queue_log:
-                n_emb, n_unemb = self._lwd_queue_mix()
-                logger.info(
-                    "[LWD][diag] down_dispatch_blocked pending=%d "
-                    "inflight_embed=%d inflight_unembed=%d ts=%.3f",
-                    pending, n_emb, n_unemb, now,
-                )
-                self._lwd_diag_next_queue_log = now + LWD_DIAG_QUEUE_LOG_INTERVAL_S
         notifies: list[tuple[LwdC2eNotify, float]] = []
         while len(notifies) < quota:
             try:
                 notifies.append(self.lwd_c2e_meta_queue.get_nowait())
             except queue.Empty:
                 break
-        if self._lwd_diag_enabled:
-            self._lwd_log_down_dispatch_round(
-                notifies, dispatched_embed, quota, embed_stop
-            )
         for notify, t_arrive in notifies:
             if _lwd_disable_down_enabled() and notify.token_ids:
                 logger.info(
@@ -620,41 +587,6 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 ("unembed", notify, time.monotonic(), future)
             )
         return len(notifies)
-
-    def _lwd_log_down_dispatch_round(
-        self,
-        selected: list[tuple[LwdC2eNotify, float]],
-        dispatched_embed: int,
-        quota: int,
-        embed_stop: str,
-    ) -> None:
-        c2e_queue = self.lwd_c2e_meta_queue
-        # Capture notices that arrived during this round without dequeuing them.
-        # Release the queue lock before logging so the receive thread can continue.
-        with c2e_queue.mutex:
-            pending = [
-                (notify, arrived_at)
-                for notify, arrived_at in c2e_queue.queue
-                if notify.down_seqno in LWD_DIAG_DOWN_SEQNOS
-            ]
-        now = time.monotonic()
-        for status, notifies in (("selected", selected), ("pending", pending)):
-            for notify, arrived_at in notifies:
-                if notify.down_seqno not in LWD_DIAG_DOWN_SEQNOS:
-                    continue
-                logger.info(
-                    "[LWD][diag] down_dispatch_round engine=%d seqno=%d "
-                    "status=%s disp_emb=%d slots_before_unembed=%d embed_stop=%s "
-                    "arrival_ts=%.6f ts=%.6f",
-                    notify.engine_index,
-                    notify.down_seqno,
-                    status,
-                    dispatched_embed,
-                    quota,
-                    "queue_full" if quota == 0 else embed_stop,
-                    arrived_at,
-                    now,
-                )
 
     def _lwd_dispatch_embed(self, scheduler_output):
         """EMBED 批提交侧(唯一提交点,同步/异步共用):范围预告(发布
