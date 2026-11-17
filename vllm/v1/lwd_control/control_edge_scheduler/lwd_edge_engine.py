@@ -566,7 +566,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         云侧有活请求才产 meta(build_hidden_payload 空则返回 None)。
         DISABLE_DOWN 诊断:通告只携带 token_ids(hidden=0)时跳过 worker
         派发,以 future=None 直通收割,不挂任何 recv。"""
-        quota = max(1, LWD_EDGE_BATCH_QUEUE_DEPTH - len(self._lwd_batch_queue))
+        quota = LWD_EDGE_BATCH_QUEUE_DEPTH - len(self._lwd_batch_queue)
         notifies: list[tuple[LwdC2eNotify, float]] = []
         while len(notifies) < quota:
             try:
